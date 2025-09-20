@@ -3,6 +3,7 @@
 
 import itertools
 from collections.abc import Sequence
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 
 import cloudpickle
@@ -309,6 +310,12 @@ class LLM:
         self.request_counter = Counter()
         self.default_sampling_params: Union[dict[str, Any], None] = None
 
+        hf_config = getattr(self.llm_engine.model_config, "hf_config", None)
+        self._model_type = (getattr(hf_config, "model_type", None)
+                            if hf_config else None)
+        self._uses_harmony_chat = self._model_type == "gpt_oss"
+        self._harmony_utils = None
+
         if envs.VLLM_USE_V1:
             supported_tasks = self.llm_engine \
                 .get_supported_tasks()  # type: ignore
@@ -336,10 +343,101 @@ class LLM:
         else:
             self.llm_engine.tokenizer = get_cached_tokenizer(tokenizer)
 
+    def _get_harmony_utils(self):
+        if self._harmony_utils is None:
+            try:
+                from vllm.entrypoints import harmony_utils  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "gpt-oss chat support requires the optional dependency "
+                    "`openai-harmony`. Install it with "
+                    "`pip install openai-harmony`.") from exc
+            self._harmony_utils = harmony_utils
+        return self._harmony_utils
+
+    def _normalize_harmony_tools(
+            self, tools: Optional[list[dict[str,
+                                            Any]]]) -> Optional[list[Any]]:
+        if not tools:
+            return None
+        normalized: list[Any] = []
+        for tool in tools:
+            if isinstance(tool, dict):
+                tool_type = tool.get("type", "function")
+                if tool_type != "function":
+                    raise ValueError(
+                        f"Unsupported tool type for gpt-oss chat: {tool_type}")
+                func = tool.get("function", {})
+                name = func.get("name")
+                if not name:
+                    raise ValueError(
+                        "Tool definitions must include a function name.")
+                normalized.append(
+                    SimpleNamespace(
+                        name=name,
+                        description=func.get("description", ""),
+                        parameters=func.get("parameters"),
+                    ))
+            else:
+                normalized.append(tool)
+        return normalized
+
+    def _preprocess_chat_harmony(
+        self,
+        conversations: list[list[ChatCompletionMessageParam]],
+        *,
+        tools: Optional[list[dict[str, Any]]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> list[TokensPrompt]:
+        harmony_utils = self._get_harmony_utils()
+        normalized_tools = self._normalize_harmony_tools(tools)
+        prompts: list[TokensPrompt] = []
+        for msgs in conversations:
+            harmony_messages = [
+                harmony_utils.get_system_message(),
+                harmony_utils.get_developer_message(tools=normalized_tools),
+            ]
+            for message in msgs:
+                harmony_messages.extend(
+                    harmony_utils.parse_chat_input(message))
+            prompt_token_ids = harmony_utils.render_for_completion(
+                harmony_messages)
+            prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+            if mm_processor_kwargs is not None:
+                prompt["mm_processor_kwargs"] = mm_processor_kwargs
+            prompts.append(prompt)
+        return prompts
+
+    def _postprocess_harmony_outputs(self,
+                                     outputs: list[RequestOutput]) -> None:
+        harmony_utils = self._get_harmony_utils()
+        for output in outputs:
+            for completion in output.outputs:
+                token_ids = list(completion.token_ids)
+                reasoning, final, is_tool_call = (
+                    harmony_utils.parse_chat_output(token_ids))
+                completion.reasoning = reasoning
+                completion.is_tool_call = is_tool_call
+                if final is not None:
+                    completion.text = final
+
     def get_default_sampling_params(self) -> SamplingParams:
         if self.default_sampling_params is None:
-            self.default_sampling_params = (
-                self.llm_engine.model_config.get_diff_sampling_param())
+            params = self.llm_engine.model_config.get_diff_sampling_param()
+            params = dict(params) if params else {}
+            if self._uses_harmony_chat:
+                harmony_utils = self._get_harmony_utils()
+                stop_ids = list(params.get("stop_token_ids", []))
+                existing = set(stop_ids)
+                stop_tokens = (
+                    harmony_utils.get_stop_tokens_for_assistant_actions())
+                for token_id in stop_tokens:
+                    if token_id not in existing:
+                        stop_ids.append(token_id)
+                        existing.add(token_id)
+                if stop_ids:
+                    params["stop_token_ids"] = stop_ids
+            self.default_sampling_params = params or None
         if self.default_sampling_params:
             return SamplingParams.from_optional(**self.default_sampling_params)
         return SamplingParams()
@@ -755,6 +853,21 @@ class LLM:
                 cast(list[ChatCompletionMessageParam], messages)
             ]
 
+        if self._uses_harmony_chat:
+            if chat_template is not None:
+                logger.warning_once(
+                    "Ignoring chat_template for gpt-oss models; "
+                    "Harmony formatting is used instead.")
+            if chat_template_kwargs:
+                logger.warning_once(
+                    "chat_template_kwargs are ignored for gpt-oss models "
+                    "when using Harmony formatting.")
+            return self._preprocess_chat_harmony(
+                list_of_messages,
+                tools=tools,
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+
         tokenizer = self.get_tokenizer()
         model_config = self.llm_engine.get_model_config()
         resolved_content_format = resolve_chat_template_content_format(
@@ -897,12 +1010,15 @@ class LLM:
             mm_processor_kwargs=mm_processor_kwargs,
         )
 
-        return self.generate(
+        outputs = self.generate(
             prompts,
             sampling_params=sampling_params,
             use_tqdm=use_tqdm,
             lora_request=lora_request,
         )
+        if self._uses_harmony_chat:
+            self._postprocess_harmony_outputs(outputs)
+        return outputs
 
     def encode(
         self,
