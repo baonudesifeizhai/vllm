@@ -598,14 +598,12 @@ def set_inductor_config(config, runtime_shape):
     config["triton.unique_kernel_names"] = True
     config["triton.cudagraphs"] = True
 
-    # Enable RMSNorm full fusion (PyTorch 2.9+)
-    # This is the KEY feature for solving the 7-kernel issue
-    # Pattern: mean -> pow -> mul -> rsqrt (reduction + pointwise combo)
-    # Note: Inductor will safely ignore these on older PyTorch versions
+    # Enable fusion optimizations (PyTorch 2.9+)
+    # These help reduce kernel count for operations like RMSNorm
+    # Note: Full RMSNorm fusion may require future PyTorch versions
     if is_torch_equal_or_newer("2.9.0"):
-        config["enable_norm_fusion"] = True  # Full RMSNorm fusion
-        config["aggressive_fusion"] = True  # Aggressive operator fusion
-        config["epilogue_fusion"] = True  # Fuse epilogue operations
+        # Enable prologue fusion (confirmed to exist in 2.10 nightly)
+        config["prologue_fusion_enabled"] = True
 
     if isinstance(runtime_shape, int):
         # for a specific batchsize, tuning triton kernel parameters
