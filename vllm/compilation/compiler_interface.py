@@ -589,6 +589,24 @@ class InductorAdaptor(CompilerInterface):
 
 
 def set_inductor_config(config, runtime_shape):
+    # Enable pattern matching and fusion (PyTorch 2.5+)
+    # These are basic optimizations that work across versions
+    config["pattern_matcher"] = True  # Recognize fusible operation patterns
+    config["permute_fusion"] = True  # Fuse reshape/permute operations
+
+    # Triton-specific settings for better kernel generation (PyTorch 2.6+)
+    config["triton.unique_kernel_names"] = True
+    config["triton.cudagraphs"] = True
+
+    # Enable RMSNorm full fusion (PyTorch 2.9+)
+    # This is the KEY feature for solving the 7-kernel issue
+    # Pattern: mean -> pow -> mul -> rsqrt (reduction + pointwise combo)
+    # Note: Inductor will safely ignore these on older PyTorch versions
+    if is_torch_equal_or_newer("2.9.0"):
+        config["enable_norm_fusion"] = True  # Full RMSNorm fusion
+        config["aggressive_fusion"] = True  # Aggressive operator fusion
+        config["epilogue_fusion"] = True  # Fuse epilogue operations
+
     if isinstance(runtime_shape, int):
         # for a specific batchsize, tuning triton kernel parameters
         # can be beneficial
