@@ -878,15 +878,28 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_prefill_tokens, self.num_heads, self.v_head_dim
             )
 
-            # Call MLA backend's internal _forward_prefill method
+            # Call MLA backend's _forward_prefill with lifted parameters
             # This exposes GEMM operations to torch.compile for fusion
+            #
+            # Pass attn_metadata=None to avoid metadata mismatch with sliced inputs
+            # The backend will use query_start_loc and max_query_len instead
+
+            # Compute query_start_loc for lifted split
+            query_start_loc = torch.tensor(
+                [0, num_prefill_tokens],
+                dtype=torch.int32,
+                device=q_prefill.device,
+            )
+
             output_prefill = self.impl._forward_prefill(
-                q_prefill,
-                kv_c_prefill,
-                k_pe_prefill,
-                self_kv_cache,
-                attn_metadata,
-                self._k_scale,
+                q=q_prefill,
+                kv_c_normed=kv_c_prefill,
+                k_pe=k_pe_prefill,
+                kv_c_and_k_pe_cache=self_kv_cache,
+                attn_metadata=None,  # ← Pass None for lifted split
+                k_scale=self._k_scale,
+                query_start_loc=query_start_loc,
+                max_query_len=num_prefill_tokens,
             )
 
             # Write to output
