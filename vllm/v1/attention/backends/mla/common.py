@@ -1306,24 +1306,53 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         return attn_out
 
     def _run_prefill_new_tokens_fa(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata | None,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        # Optional parameters for lifted split (when prefill is None)
+        query_start_loc: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ):
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
             v=v,
-            cu_seqlens_q=prefill.query_start_loc,
-            cu_seqlens_k=prefill.query_start_loc,
-            max_seqlen_q=prefill.max_query_len,
-            max_seqlen_k=prefill.max_query_len,
+            cu_seqlens_q=prefill.query_start_loc if prefill else query_start_loc,
+            cu_seqlens_k=prefill.query_start_loc if prefill else query_start_loc,
+            max_seqlen_q=prefill.max_query_len if prefill else max_query_len,
+            max_seqlen_k=prefill.max_query_len if prefill else max_query_len,
             softmax_scale=self.scale,
             causal=True,
             return_softmax_lse=return_softmax_lse,
         )
 
     def _run_prefill_new_tokens_fi(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata | None,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        # Optional parameters for lifted split (when prefill is None)
+        query_start_loc: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ):
+        if prefill is None:
+            # Fallback to FlashAttention when prefill metadata is not available
+            # This is used in lifted split path
+            return self._run_prefill_new_tokens_fa(
+                prefill=None,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=return_softmax_lse,
+                query_start_loc=query_start_loc,
+                max_query_len=max_query_len,
+            )
+
         assert isinstance(prefill, FlashInferPrefillMetadata)
         assert prefill.prefill_main is not None
         ret = prefill.prefill_main.run(
@@ -1339,8 +1368,29 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         return ret
 
     def _run_prefill_new_tokens_cudnn(
-        self, prefill: MLACommonPrefillMetadata, q, k, v, return_softmax_lse
+        self,
+        prefill: MLACommonPrefillMetadata | None,
+        q,
+        k,
+        v,
+        return_softmax_lse,
+        # Optional parameters for lifted split (when prefill is None)
+        query_start_loc: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ):
+        if prefill is None:
+            # Fallback to FlashAttention when prefill metadata is not available
+            # This is used in lifted split path
+            return self._run_prefill_new_tokens_fa(
+                prefill=None,
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=return_softmax_lse,
+                query_start_loc=query_start_loc,
+                max_query_len=max_query_len,
+            )
+
         assert isinstance(prefill, CudnnPrefillMetadata)
         assert prefill.query_seq_lens is not None
         output, lse = cudnn_batch_prefill_with_kv_cache(
