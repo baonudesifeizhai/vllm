@@ -34,7 +34,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.models.vision import get_vit_attn_backend
 from vllm.platforms import current_platform
-from vllm.utils import GiB_bytes, direct_register_custom_op, is_torch_equal_or_newer
+from vllm.utils import direct_register_custom_op, is_torch_equal_or_newer
 
 FP8_DTYPE = current_platform.fp8_dtype()
 logger = init_logger(__name__)
@@ -878,39 +878,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 num_prefill_tokens, self.num_heads, self.v_head_dim
             )
 
-            # Call simplified attention kernel
-            # (creates partition boundary)
-            if hasattr(self.impl, "forward_prefill_only"):
-                output_prefill = self.impl.forward_prefill_only(
-                    self,
-                    q_prefill,
-                    k_nope_prefill,
-                    v_prefill,
-                    k_pe_prefill,
-                    self_kv_cache,
-                    attn_metadata,
-                )
-            else:
-                # Fallback to original implementation
-                # Create a view of output for prefill
-                prefill_output_shape = (
-                    num_prefill_tokens,
-                    self.num_heads * self.v_head_dim,
-                )
-                output_prefill = torch.empty(
-                    prefill_output_shape, dtype=q.dtype, device=q.device
-                )
-
-                # Call original forward with prefill-only inputs
-                self.impl.forward(
-                    self,
-                    q_prefill,
-                    kv_c_prefill,
-                    k_pe_prefill,
-                    self_kv_cache,
-                    attn_metadata,
-                    output=output_prefill,
-                )
+            # Call MLA backend's internal _forward_prefill method
+            # This exposes GEMM operations to torch.compile for fusion
+            output_prefill = self.impl._forward_prefill(
+                q_prefill,
+                kv_c_prefill,
+                k_pe_prefill,
+                self_kv_cache,
+                attn_metadata,
+                self._k_scale,
+            )
 
             # Write to output
             output_actual[:num_prefill_tokens] = output_prefill
@@ -942,48 +919,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 # Fallback: use original implementation
                 ql_nope_decode = q_nope_decode
 
-            # Call simplified attention kernel
-            # (creates partition boundary)
-            if hasattr(self.impl, "forward_decode_only"):
-                output_latent_decode = self.impl.forward_decode_only(
-                    self,
-                    ql_nope_decode,
-                    q_pe_decode,
-                    self_kv_cache,
-                    attn_metadata,
-                )
+            # Call MLA backend's internal decode method
+            # This exposes GEMM operations to torch.compile for fusion
+            decode_q = torch.cat([ql_nope_decode, q_pe_decode], dim=-1)
+            output_latent_decode, lse = self.impl._forward_decode(
+                decode_q, self_kv_cache, attn_metadata, self
+            )
 
-                # Project v back to normal space
-                # (visible to torch.compile)
-                if hasattr(self, "W_UV"):
-                    # [B, N, Lkv] @ [Lkv, N*V] -> [B, N*V]
-                    output_decode = torch.matmul(
-                        output_latent_decode.flatten(start_dim=1), self.W_UV
-                    )
-                else:
-                    output_decode = output_latent_decode
+            # Project v back to normal space
+            # (visible to torch.compile)
+            if hasattr(self, "W_UV"):
+                # [B, N, Lkv] @ [Lkv, N*V] -> [B, N*V]
+                output_decode = torch.matmul(
+                    output_latent_decode.flatten(start_dim=1), self.W_UV
+                )
             else:
-                # Fallback to original implementation
-                kv_c_decode = kv_c_normed[num_prefill_tokens:num_actual_tokens]
-                k_pe_decode = k_pe[num_prefill_tokens:num_actual_tokens]
-
-                decode_output_shape = (
-                    num_decode_tokens,
-                    self.num_heads * self.v_head_dim,
-                )
-                output_decode = torch.empty(
-                    decode_output_shape, dtype=q.dtype, device=q.device
-                )
-
-                self.impl.forward(
-                    self,
-                    q_decode,
-                    kv_c_decode,
-                    k_pe_decode,
-                    self_kv_cache,
-                    attn_metadata,
-                    output=output_decode,
-                )
+                output_decode = output_latent_decode
 
             # Write to output
             output_actual[num_prefill_tokens:num_actual_tokens] = output_decode
