@@ -387,6 +387,27 @@ class CompilationConfig:
     capture ignores all partitioning.
     """
 
+    enable_mla_lifted_split: bool = True
+    """Enable lifted prefill/decode split for MLA (Multi-head Latent Attention).
+    
+    When enabled (requires PyTorch 2.9+ and use_inductor_graph_partition=True),
+    the prefill/decode split is moved outside the unified MLA custom op, exposing
+    surrounding GEMM and pointwise operations to torch.compile. This enables:
+    
+    - Operator fusion: matmul+split, bmm+transpose can be fused
+    - Reduced Python overhead: More operations compiled into single kernels
+    - Better optimization: Inductor can optimize across operation boundaries
+    
+    Inductor automatically partitions on data-dependent ops (slicing with dynamic
+    indices), so no manual op registration is needed. The split happens naturally
+    at operations like q[:num_prefill] and q[num_prefill:].
+    
+    This must play nicely with piecewise cudagraphs, which works automatically
+    as Inductor creates partition boundaries at data-dependent operations.
+    
+    See Issue #26516 for implementation details.
+    """
+
     pass_config: PassConfig = field(default_factory=PassConfig)
     """Custom inductor passes, see PassConfig for more details"""
 

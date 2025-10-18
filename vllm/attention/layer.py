@@ -34,7 +34,7 @@ from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.model_executor.models.vision import get_vit_attn_backend
 from vllm.platforms import current_platform
-from vllm.utils import GiB_bytes, direct_register_custom_op
+from vllm.utils import GiB_bytes, direct_register_custom_op, is_torch_equal_or_newer
 
 FP8_DTYPE = current_platform.fp8_dtype()
 logger = init_logger(__name__)
@@ -676,6 +676,18 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # Keep defaults if allocation fails; not critical for init.
             pass
 
+        # Enable lifted split for MLA when using Inductor partition
+        # This exposes GEMM operations to torch.compile for fusion
+        self.enable_lifted_split = (
+            compilation_config.use_inductor_graph_partition
+            and getattr(compilation_config, "enable_mla_lifted_split", True)
+            and is_torch_equal_or_newer("2.9.0")
+        )
+
+        # Prepare weights for lifted split path
+        if self.enable_lifted_split:
+            self._prepare_lifted_weights(kv_b_proj)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -683,6 +695,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
+        # Use lifted split path if enabled
+        # (requires PyTorch 2.9+ and Inductor partition)
+        if (
+            self.enable_lifted_split
+            and self.use_direct_call
+            and output_shape is not None
+        ):
+            return self._forward_lifted_split(q, kv_c_normed, k_pe, output_shape)
+
+        # Original unified path (backward compatible)
         if self.use_direct_call:
             forward_context: ForwardContext = get_forward_context()
             attn_metadata = forward_context.attn_metadata
@@ -767,6 +789,225 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
+
+    def _prepare_lifted_weights(self, kv_b_proj: ColumnParallelLinear):
+        """Prepare weights for lifted split path.
+
+        Lifts weights from backend to this layer so GEMM operations
+        can be exposed to torch.compile for fusion.
+
+        Args:
+            kv_b_proj: The kv_b projection layer containing W_UK and W_UV
+        """
+        # Get transposed weight for matmul: [Lkv, N*(P+V)]
+        # kv_b_proj concatenates [W_UK; W_UV] per head
+        self.W_UK_UV = kv_b_proj.weight.t()
+
+        # For decode path, we need W_UK separately for bmm
+        # Shape: [N, P, Lkv] for batched matrix multiply
+        if hasattr(self.impl, "W_UK_T"):
+            self.W_UK_T = self.impl.W_UK_T
+
+        # For decode v-projection, we need W_UV
+        # Shape: [Lkv, N*V]
+        if hasattr(self.impl, "W_UV"):
+            self.W_UV = self.impl.W_UV
+
+    def _forward_lifted_split(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Forward pass with lifted prefill/decode split.
+
+        This implementation lifts the prefill/decode split outside the
+        unified custom op so surrounding GEMMs/pointwise operations become
+        visible to torch.compile, improving fusion and reducing Python overhead.
+
+        Inductor automatically partitions on data-dependent ops (slicing with
+        dynamic indices), so we don't need to manually register splitting ops.
+
+        Args:
+            q: Query tensor [num_tokens, num_heads, head_dim]
+            kv_c_normed: Compressed KV tensor [num_tokens, kv_lora_rank]
+            k_pe: Position embeddings for keys [num_tokens, 1, qk_rope_head_dim]
+            output_shape: Expected output shape
+
+        Returns:
+            Output tensor with attention applied
+        """
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.layer_name]
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+        # Calculate KV scales if needed
+        if self.calculate_kv_scales and getattr(
+            attn_metadata, "enable_kv_scales_calculation", False
+        ):
+            self.calc_kv_scales(q, kv_c_normed, k_pe)
+
+        # Create output buffer
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+
+        # Extract split information (scalars, no graph break)
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # Handle padding for CUDA graphs
+        q = q[:num_actual_tokens]
+        kv_c_normed = kv_c_normed[:num_actual_tokens]
+        k_pe = k_pe[:num_actual_tokens]
+        output_actual = output[:num_actual_tokens]
+
+        # ================================================================
+        # Inductor will automatically partition at data-dependent slices
+        # ================================================================
+
+        # === Prefill Path ===
+        # Inductor recognizes [:num_prefill_tokens] as data-dependent
+        # and creates a partition boundary here
+        if num_prefill_tokens > 0:
+            q_prefill = q[:num_prefill_tokens]
+            kv_c_prefill = kv_c_normed[:num_prefill_tokens]
+            k_pe_prefill = k_pe[:num_prefill_tokens]
+
+            # ====== These operations are now visible to torch.compile ======
+
+            # 1. Project compressed KV to [k_nope; v]
+            # Shape: [num_prefill, Lkv] @ [Lkv, N*(P+V)] -> [num_prefill, N*(P+V)]
+            kv_b_prefill = torch.matmul(kv_c_prefill, self.W_UK_UV)
+
+            # 2. Split into k_nope and v (can be fused with matmul above)
+            k_nope_size = self.num_heads * self.qk_nope_head_dim
+            v_size = self.num_heads * self.v_head_dim
+            k_nope_prefill, v_prefill = kv_b_prefill.split(
+                [k_nope_size, v_size], dim=-1
+            )
+
+            # 3. Reshape for attention
+            k_nope_prefill = k_nope_prefill.view(
+                num_prefill_tokens, self.num_heads, self.qk_nope_head_dim
+            )
+            v_prefill = v_prefill.view(
+                num_prefill_tokens, self.num_heads, self.v_head_dim
+            )
+
+            # Call simplified attention kernel
+            # (creates partition boundary)
+            if hasattr(self.impl, "forward_prefill_only"):
+                output_prefill = self.impl.forward_prefill_only(
+                    self,
+                    q_prefill,
+                    k_nope_prefill,
+                    v_prefill,
+                    k_pe_prefill,
+                    self_kv_cache,
+                    attn_metadata,
+                )
+            else:
+                # Fallback to original implementation
+                # Create a view of output for prefill
+                prefill_output_shape = (
+                    num_prefill_tokens,
+                    self.num_heads * self.v_head_dim,
+                )
+                output_prefill = torch.empty(
+                    prefill_output_shape, dtype=q.dtype, device=q.device
+                )
+
+                # Call original forward with prefill-only inputs
+                self.impl.forward(
+                    self,
+                    q_prefill,
+                    kv_c_prefill,
+                    k_pe_prefill,
+                    self_kv_cache,
+                    attn_metadata,
+                    output=output_prefill,
+                )
+
+            # Write to output
+            output_actual[:num_prefill_tokens] = output_prefill
+
+        # === Decode Path ===
+        # Inductor recognizes [num_prefill_tokens:] as data-dependent
+        # and creates another partition boundary here
+        if num_decode_tokens > 0:
+            q_decode = q[num_prefill_tokens:num_actual_tokens]
+
+            # ====== These operations are also visible to torch.compile ======
+
+            # 1. Split q into nope and pe components
+            q_nope_decode, q_pe_decode = q_decode.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+
+            # 2. Project q_nope to latent space (key operation for decode)
+            # Transpose for bmm: [B, N, P] -> [N, B, P]
+            q_nope_decode_t = q_nope_decode.transpose(0, 1)
+
+            # Batched matrix multiply: [N, B, P] @ [N, P, Lkv] -> [N, B, Lkv]
+            if hasattr(self, "W_UK_T"):
+                ql_nope_decode = torch.bmm(q_nope_decode_t, self.W_UK_T)
+
+                # Transpose back: [N, B, Lkv] -> [B, N, Lkv]
+                ql_nope_decode = ql_nope_decode.transpose(0, 1)
+            else:
+                # Fallback: use original implementation
+                ql_nope_decode = q_nope_decode
+
+            # Call simplified attention kernel
+            # (creates partition boundary)
+            if hasattr(self.impl, "forward_decode_only"):
+                output_latent_decode = self.impl.forward_decode_only(
+                    self,
+                    ql_nope_decode,
+                    q_pe_decode,
+                    self_kv_cache,
+                    attn_metadata,
+                )
+
+                # Project v back to normal space
+                # (visible to torch.compile)
+                if hasattr(self, "W_UV"):
+                    # [B, N, Lkv] @ [Lkv, N*V] -> [B, N*V]
+                    output_decode = torch.matmul(
+                        output_latent_decode.flatten(start_dim=1), self.W_UV
+                    )
+                else:
+                    output_decode = output_latent_decode
+            else:
+                # Fallback to original implementation
+                kv_c_decode = kv_c_normed[num_prefill_tokens:num_actual_tokens]
+                k_pe_decode = k_pe[num_prefill_tokens:num_actual_tokens]
+
+                decode_output_shape = (
+                    num_decode_tokens,
+                    self.num_heads * self.v_head_dim,
+                )
+                output_decode = torch.empty(
+                    decode_output_shape, dtype=q.dtype, device=q.device
+                )
+
+                self.impl.forward(
+                    self,
+                    q_decode,
+                    kv_c_decode,
+                    k_pe_decode,
+                    self_kv_cache,
+                    attn_metadata,
+                    output=output_decode,
+                )
+
+            # Write to output
+            output_actual[num_prefill_tokens:num_actual_tokens] = output_decode
+
+        return output
 
 
 def wait_for_kv_layer_from_connector(layer_name: str):
