@@ -1738,14 +1738,22 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: MLACommonMetadata,
+        attn_metadata: MLACommonMetadata | None,
         k_scale: torch.Tensor,
+        query_start_loc: torch.Tensor | None = None,
+        max_query_len: int | None = None,
     ) -> torch.Tensor:
         # TODO (zyongye): Prefill function here
-        assert attn_metadata.prefill is not None
-        assert self.dcp_world_size is not None
+        if attn_metadata is not None:
+            assert attn_metadata.prefill is not None
+            prefill_metadata = attn_metadata.prefill
+            has_context = prefill_metadata.chunked_context is not None
+        else:
+            # Lifted split path: no metadata, no context
+            prefill_metadata = None
+            has_context = False
 
-        has_context = attn_metadata.prefill.chunked_context is not None
+        assert self.dcp_world_size is not None
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
@@ -1754,11 +1762,13 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         output = self._run_prefill_new_tokens(
-            prefill=attn_metadata.prefill,
+            prefill=prefill_metadata,
             q=q,
             k=k,
             v=v,
             return_softmax_lse=has_context,
+            query_start_loc=query_start_loc,
+            max_query_len=max_query_len,
         )
 
         if has_context:
