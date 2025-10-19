@@ -1136,11 +1136,14 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
-        )
+        ).contiguous()
 
         W_UK, W_UV = kv_b_proj_weight.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
+        # Make splits contiguous to ensure proper stride for torch.compile
+        W_UK = W_UK.contiguous()
+        W_UV = W_UV.contiguous()
 
         if is_rocm_aiter_fp8bmm_enabled():
             W_K = W_UK.transpose(0, 1)  # 16 512 128
@@ -1466,11 +1469,14 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             self.kv_lora_rank,
             self.num_heads,
             self.qk_nope_head_dim + self.v_head_dim,
-        )
+        ).contiguous()
 
         W_UK, W_UV = kv_b_proj_weight.split(
             [self.qk_nope_head_dim, self.v_head_dim], dim=-1
         )
+        # Make splits contiguous to ensure proper stride for torch.compile
+        W_UK = W_UK.contiguous()
+        W_UV = W_UV.contiguous()
 
         if is_rocm_aiter_fp8bmm_enabled():
             W_K = W_UK.transpose(0, 1)  # 16 512 128
