@@ -1183,9 +1183,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 )
         else:
             # Convert from (L, N, V) to (N, L, V)
-            self.W_UV = W_UV.transpose(0, 1)
+            self.W_UV = W_UV.transpose(0, 1).contiguous()
             # Convert from (L, N, P) to (N, P, L)
-            self.W_UK_T = W_UK.permute(1, 2, 0)
+            # Use .contiguous() to ensure the tensor has contiguous memory layout
+            # This is critical for torch.compile to correctly infer the stride
+            self.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
