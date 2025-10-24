@@ -709,19 +709,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
     ) -> torch.Tensor:
+        forward_context: ForwardContext = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata[self.layer_name]
+        self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+
+        # Mirror Attention.forward scale calculation path
+        if self.calculate_kv_scales and getattr(
+            attn_metadata, "enable_kv_scales_calculation", False
+        ):
+            self.calc_kv_scales(q, kv_c_normed, k_pe)
+
         if self.use_direct_call:
-            forward_context: ForwardContext = get_forward_context()
-            attn_metadata = forward_context.attn_metadata
-            if isinstance(attn_metadata, dict):
-                attn_metadata = attn_metadata[self.layer_name]
-            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-
-            # Mirror Attention.forward scale calculation path
-            if self.calculate_kv_scales and getattr(
-                attn_metadata, "enable_kv_scales_calculation", False
-            ):
-                self.calc_kv_scales(q, kv_c_normed, k_pe)
-
+            # Direct backend call (original behavior)
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 self.impl.forward(
@@ -739,31 +740,120 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     self, q, kv_c_normed, k_pe, self_kv_cache, attn_metadata
                 )
         else:
-            if self.attn_backend.accept_output_buffer:
-                output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-                torch.ops.vllm.unified_mla_attention_with_output(
-                    q,
-                    kv_c_normed,
-                    k_pe,
-                    output,
-                    self.layer_name,
-                )
-                return output
-            else:
-                # We can still access forward context to check calculation flag
-                if self.calculate_kv_scales:
-                    forward_context = get_forward_context()
-                    attn_metadata = forward_context.attn_metadata
-                    if isinstance(attn_metadata, dict):
-                        attn_metadata = attn_metadata[self.layer_name]
-                    if getattr(attn_metadata, "enable_kv_scales_calculation", False):
-                        self.calc_kv_scales(q, kv_c_normed, k_pe)
-                return torch.ops.vllm.unified_mla_attention(
-                    q,
-                    kv_c_normed,
-                    k_pe,
-                    self.layer_name,
-                )
+            # Lifted split: expose BMMs to torch.compile
+            return self._forward_lifted_split(
+                q, kv_c_normed, k_pe, self_kv_cache, attn_metadata, output_shape
+            )
+
+    def _forward_lifted_split(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output_shape: torch.Size | None,
+    ) -> torch.Tensor:
+        """
+        Lifted split implementation per issue #26516.
+
+        Exposes K/V up-projection BMMs to torch.compile for fusion while
+        keeping attention kernels opaque to avoid Inductor miscompilation.
+        """
+        from vllm import _custom_ops as ops
+
+        output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+
+        # Slice to actual tokens (for CUDA graph padding)
+        q = q[:num_actual_tokens]
+        kv_c_normed = kv_c_normed[:num_actual_tokens]
+        k_pe = k_pe[:num_actual_tokens]
+        output = output[:num_actual_tokens]
+
+        # Write KV to cache (already a custom op, opaque)
+        if kv_cache.numel() > 0:
+            ops.concat_and_cache_mla(
+                kv_c_normed,
+                k_pe.squeeze(1),
+                kv_cache,
+                attn_metadata.slot_mapping.flatten(),
+                kv_cache_dtype=self.impl.kv_cache_dtype,
+                scale=self._k_scale,
+            )
+
+        # Prefill path - call backend directly (opaque)
+        if num_decode_tokens < num_actual_tokens:
+            output[num_decode_tokens:] = self.impl._forward_prefill(
+                q[num_decode_tokens:],
+                kv_c_normed[num_decode_tokens:],
+                k_pe[num_decode_tokens:],
+                kv_cache,
+                attn_metadata,
+                self._k_scale,
+            )
+
+        # Decode path - expose K up-projection BMM
+        if num_decode_tokens > 0:
+            q_decode = q[:num_decode_tokens]
+
+            # Split into nope and pe components
+            q_nope, q_pe = q_decode.split(
+                [self.impl.qk_nope_head_dim, self.impl.qk_rope_head_dim], dim=-1
+            )
+
+            # K up-projection BMM - exposed to torch.compile for fusion
+            # (B, N, P) -> (N, B, P)
+            q_nope_t = q_nope.transpose(0, 1)
+            # (N, B, P) x (N, P, L) -> (N, B, L)
+            ql_nope_t = torch.bmm(q_nope_t, self.impl.W_UK_T)
+            # (N, B, L) -> (B, N, L)
+            ql_nope = ql_nope_t.transpose(0, 1)
+
+            # Decode attention kernel (opaque - Triton kernel)
+            o_latent, _ = self.impl._forward_decode(
+                (ql_nope, q_pe), kv_cache, attn_metadata, self
+            )
+
+            # V up-projection - exposed via _v_up_proj (contains BMM)
+            self.impl._v_up_proj(o_latent, out=output[:num_decode_tokens])
+
+        return output
+
+    def _forward_legacy_unified_op(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        output_shape: torch.Size | None,
+    ) -> torch.Tensor:
+        """Legacy path using unified_mla_attention op (deprecated)."""
+        if self.attn_backend.accept_output_buffer:
+            output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+            torch.ops.vllm.unified_mla_attention_with_output(
+                q,
+                kv_c_normed,
+                k_pe,
+                output,
+                self.layer_name,
+            )
+            return output
+        else:
+            # We can still access forward context to check calculation flag
+            if self.calculate_kv_scales:
+                forward_context = get_forward_context()
+                attn_metadata = forward_context.attn_metadata
+                if isinstance(attn_metadata, dict):
+                    attn_metadata = attn_metadata[self.layer_name]
+                if getattr(attn_metadata, "enable_kv_scales_calculation", False):
+                    self.calc_kv_scales(q, kv_c_normed, k_pe)
+            return torch.ops.vllm.unified_mla_attention(
+                q,
+                kv_c_normed,
+                k_pe,
+                self.layer_name,
+            )
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(self.impl, "process_weights_after_loading"):
