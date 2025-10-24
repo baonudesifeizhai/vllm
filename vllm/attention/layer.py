@@ -797,6 +797,13 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 scale=self._k_scale,
             )
 
+        # Convert KV cache to FP8 view if needed
+        fp8_attention = self.impl.kv_cache_dtype.startswith("fp8")
+        if fp8_attention:
+            from vllm.platforms import current_platform
+
+            kv_cache = kv_cache.view(current_platform.fp8_dtype())
+
         # Prefill path - call backend directly (opaque)
         if num_decode_tokens < num_actual_tokens:
             output[num_decode_tokens:] = self.impl._forward_prefill(
@@ -808,27 +815,87 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 self._k_scale,
             )
 
-        # Decode path - expose K up-projection BMM
+        # Decode path - expose K up-projection BMM while preserving all backend logic
         if num_decode_tokens > 0:
             q_decode = q[:num_decode_tokens]
 
             # Split into nope and pe components
-            q_nope, q_pe = q_decode.split(
+            decode_q_nope, decode_q_pe = q_decode.split(
                 [self.impl.qk_nope_head_dim, self.impl.qk_rope_head_dim], dim=-1
             )
 
+            # Convert from (B, N, P) to (N, B, P)
+            decode_q_nope = decode_q_nope.transpose(0, 1)
+
+            # Padding for head dim if necessary (for underlying kernel)
+            if self.impl.q_pad_num_heads is not None:
+                B, N, L = decode_q_pe.shape
+                decode_pe_padded = decode_q_pe.new_empty(
+                    (B, self.impl.q_pad_num_heads, L)
+                )
+                decode_pe_padded.resize_((B, N, L))
+                decode_pe_padded.copy_(decode_q_pe)
+                decode_q_pe = decode_pe_padded
+
             # K up-projection BMM - exposed to torch.compile for fusion
-            # (B, N, P) -> (N, B, P)
-            q_nope_t = q_nope.transpose(0, 1)
+            N, B, P = decode_q_nope.shape
+            _, _, L = self.impl.W_UK_T.shape
+
+            if self.impl.q_pad_num_heads is not None:
+                decode_ql_nope = decode_q_nope.new_empty(
+                    (self.impl.q_pad_num_heads, B, L)
+                )
+                decode_ql_nope.resize_((N, B, L))
+            else:
+                decode_ql_nope = decode_q_nope.new_empty((N, B, L))
+
             # (N, B, P) x (N, P, L) -> (N, B, L)
-            ql_nope_t = torch.bmm(q_nope_t, self.impl.W_UK_T)
-            # (N, B, L) -> (B, N, L)
-            ql_nope = ql_nope_t.transpose(0, 1)
+            torch.bmm(decode_q_nope, self.impl.W_UK_T, out=decode_ql_nope)
+
+            # Convert from (N, B, L) to (B, N, L)
+            decode_ql_nope = decode_ql_nope.transpose(0, 1)
+
+            # FP8 quantization if enabled
+            fp8_attention = self.impl.kv_cache_dtype.startswith("fp8")
+            if fp8_attention:
+                ql_nope_shape = decode_ql_nope.shape
+                decode_ql_nope, _ = ops.scaled_fp8_quant(
+                    decode_ql_nope.reshape(
+                        [ql_nope_shape[0], ql_nope_shape[1] * ql_nope_shape[2]]
+                    ),
+                    self._q_scale,
+                )
+                decode_ql_nope = decode_ql_nope.reshape(ql_nope_shape)
+                q_pe_shape = decode_q_pe.shape
+                decode_q_pe, _ = ops.scaled_fp8_quant(
+                    decode_q_pe.reshape([q_pe_shape[0], q_pe_shape[1] * q_pe_shape[2]]),
+                    self._q_scale,
+                )
+                decode_q_pe = decode_q_pe.reshape(q_pe_shape)
+
+            # DCP aggregation if enabled
+            decode_q = (decode_ql_nope, decode_q_pe)
+            dcp_world_size = self.impl.dcp_world_size or 1
+            if dcp_world_size > 1:
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                assert not fp8_attention, "DCP not support fp8 kvcache now."
+                # Concatenate decode_ql_nope and decode_q_pe -> (B, N, L + P)
+                decode_q = torch.cat(decode_q, dim=-1)
+                # Do allgather in head dim
+                decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
             # Decode attention kernel (opaque - Triton kernel)
-            o_latent, _ = self.impl._forward_decode(
-                (ql_nope, q_pe), kv_cache, attn_metadata, self
+            o_latent, lse = self.impl._forward_decode(
+                decode_q, kv_cache, attn_metadata, self
             )
+
+            # DCP LSE correction if enabled
+            if dcp_world_size > 1:
+                from vllm.attention.ops.common import cp_lse_ag_out_rs
+                from vllm.distributed.parallel_state import get_dcp_group
+
+                o_latent = cp_lse_ag_out_rs(o_latent, lse, get_dcp_group())
 
             # V up-projection - exposed via _v_up_proj (contains BMM)
             self.impl._v_up_proj(o_latent, out=output[:num_decode_tokens])
