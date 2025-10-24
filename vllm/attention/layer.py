@@ -772,6 +772,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         from vllm import _custom_ops as ops
 
         output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
+
+        # During profile run, attn_metadata is None
+        if attn_metadata is None:
+            return output.fill_(0)
+
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
 
