@@ -706,6 +706,11 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.k_range = torch.tensor(envs.K_SCALE_CONSTANT, dtype=torch.float32)
         self.v_range = torch.tensor(envs.V_SCALE_CONSTANT, dtype=torch.float32)
 
+        # Determine whether to use lifted split based on compilation config
+        compilation_config = get_current_vllm_config().compilation_config
+        # Use lifted split when torch.compile is enabled
+        self.use_lifted_split = compilation_config.mode > 0
+
     def forward(
         self,
         q: torch.Tensor,
@@ -725,8 +730,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         ):
             self.calc_kv_scales(q, kv_c_normed, k_pe)
 
-        if self.use_direct_call:
-            # Direct backend call (original behavior)
+        if not self.use_lifted_split:
+            # Direct backend call (original behavior for eager mode)
             if self.attn_backend.accept_output_buffer:
                 output = torch.empty(output_shape, dtype=q.dtype, device=q.device)
                 self.impl.forward(
