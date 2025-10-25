@@ -550,8 +550,9 @@ class EagleProposer:
         )
 
         # Generate a mask for all valid tokens within those requests
-        valid_mask = (valid_sampled_token_ids_gpu != -1) & (
-            valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size
+        valid_mask = (
+            (valid_sampled_token_ids_gpu >= 0)
+            & (valid_sampled_token_ids_gpu < gpu_input_batch.vocab_size)
         )
 
         # Count the number of valid tokens in each request
