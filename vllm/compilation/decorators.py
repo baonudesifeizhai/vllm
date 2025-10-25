@@ -371,14 +371,20 @@ def _support_torch_compile(
                     if isinstance(arg, torch.Tensor):
                         # In case dims is specified with negative indexing
                         dims = [arg.ndim + dim if dim < 0 else dim for dim in dims]
-                        torch._dynamo.mark_dynamic(arg, dims)
+                        mark_dynamic = getattr(torch._dynamo, "maybe_mark_dynamic", None)
+                        if mark_dynamic is None:
+                            mark_dynamic = torch._dynamo.mark_dynamic
+                        mark_dynamic(arg, dims)
                     elif isinstance(arg, IntermediateTensors):
                         for tensor in arg.tensors.values():
                             # In case dims is specified with negative indexing
                             dims = [
                                 tensor.ndim + dim if dim < 0 else dim for dim in dims
                             ]
-                            torch._dynamo.mark_dynamic(tensor, dims)
+                            mark_dynamic = getattr(torch._dynamo, "maybe_mark_dynamic", None)
+                            if mark_dynamic is None:
+                                mark_dynamic = torch._dynamo.mark_dynamic
+                            mark_dynamic(tensor, dims)
                     else:
                         raise ValueError(
                             "Unsupported dynamic dimensions"
