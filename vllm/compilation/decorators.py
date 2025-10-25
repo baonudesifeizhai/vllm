@@ -202,7 +202,7 @@ def support_torch_compile(
                 list(inferred_dynamic_arg_dims.keys()),
             )
 
-        if len(inferred_dynamic_arg_dims) == 0:
+        if len(inferred_dynamic_arg_dims) == 0 and dynamic_arg_dims is None:
             raise ValueError(
                 "No dynamic dimensions found in the forward method of "
                 f"{cls}. Please provide dynamic_arg_dims explicitly."
