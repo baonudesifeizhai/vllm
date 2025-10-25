@@ -40,9 +40,7 @@ logger = init_logger(__name__)
 KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
-@support_torch_compile(
-    dynamic_arg_dims={"input_ids": 0, "hidden_states": 0, "inputs_embeds": 0}
-)
+@support_torch_compile(dynamic_arg_dims={"hidden_states": 0, "inputs_embeds": 0})
 class Qwen3NextMultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -229,9 +227,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         return loaded_params
 
 
-@support_torch_compile(
-    dynamic_arg_dims={"input_ids": 0, "hidden_states": 0, "inputs_embeds": 0}
-)
+@support_torch_compile(dynamic_arg_dims={"hidden_states": 0, "inputs_embeds": 0})
 class Qwen3NextMTP(nn.Module, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
