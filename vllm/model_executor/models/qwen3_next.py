@@ -991,7 +991,9 @@ class Qwen3NextModel(nn.Module):
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
+            from vllm.sequence import IntermediateTensors as _IntermediateTensors
+
+            return _IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm(hidden_states, residual)
