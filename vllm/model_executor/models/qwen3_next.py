@@ -918,7 +918,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-@support_torch_compile(dynamic_arg_dims={})
+@support_torch_compile(dynamic_arg_dims={}, enable_if=lambda cfg: False)
 class Qwen3NextModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
