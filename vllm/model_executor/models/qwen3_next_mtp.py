@@ -107,8 +107,8 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: "IntermediateTensors | None" = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
@@ -279,12 +279,16 @@ class Qwen3NextMTP(nn.Module, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
+        intermediate_tensors: "IntermediateTensors | None" = None,
         **kwargs: object,
     ):
         hidden_states = self.model(
-            input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+            input_ids=input_ids,
+            positions=positions,
+            hidden_states=hidden_states,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
         )
         return hidden_states
 
