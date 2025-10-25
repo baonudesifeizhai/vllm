@@ -1919,7 +1919,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the cudagraph wrapper.
-        if isinstance(self.model, (CUDAGraphWrapper, UBatchWrapper)):
+        if isinstance(self.model, CUDAGraphWrapper | UBatchWrapper):
             return self.model.unwrap()
         return self.model
 
@@ -2999,7 +2999,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             return None
 
         layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
-        if layer_ids and isinstance(layer_ids, (list, tuple)):
+        if layer_ids and isinstance(layer_ids, list | tuple):
             return tuple(layer_ids)
 
         return None

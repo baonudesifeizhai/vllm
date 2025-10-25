@@ -33,6 +33,43 @@ IGNORE_COMPILE_KEY = "_ignore_compile_vllm"
 _T = TypeVar("_T", bound=type[nn.Module])
 
 
+def _normalize_annotation_str(annotation: str) -> str:
+    return annotation.replace(" ", "").replace("typing.", "")
+
+
+_TENSOR_ANNOTATION_TYPES = (torch.Tensor, torch.Tensor | None)
+_TENSOR_ANNOTATION_STRINGS = {
+    _normalize_annotation_str(s)
+    for s in (
+        "torch.Tensor",
+        "torch.Tensor | None",
+        "Optional[torch.Tensor]",
+    )
+}
+_INTERMEDIATE_ANNOTATION_TYPES = (IntermediateTensors, IntermediateTensors | None)
+_INTERMEDIATE_ANNOTATION_STRINGS = {
+    _normalize_annotation_str(s)
+    for s in (
+        "IntermediateTensors",
+        "IntermediateTensors | None",
+        "Optional[IntermediateTensors]",
+    )
+}
+
+
+def _matches_annotation(
+    annotation: object,
+    *,
+    type_candidates: tuple[object, ...],
+    string_candidates: set[str],
+) -> bool:
+    if annotation in type_candidates:
+        return True
+    if isinstance(annotation, str):
+        return _normalize_annotation_str(annotation) in string_candidates
+    return False
+
+
 def ignore_torch_compile(cls: _T) -> _T:
     """
     A decorator to ignore support_torch_compile decorator
@@ -147,12 +184,16 @@ def support_torch_compile(
         if inferred_dynamic_arg_dims is None:
             inferred_dynamic_arg_dims = {}
             for k, v in sig.parameters.items():
-                if v.annotation in [
-                    torch.Tensor,
-                    torch.Tensor | None,
-                    IntermediateTensors,
-                    IntermediateTensors | None,
-                ]:
+                annotation = v.annotation
+                if _matches_annotation(
+                    annotation,
+                    type_candidates=_TENSOR_ANNOTATION_TYPES,
+                    string_candidates=_TENSOR_ANNOTATION_STRINGS,
+                ) or _matches_annotation(
+                    annotation,
+                    type_candidates=_INTERMEDIATE_ANNOTATION_TYPES,
+                    string_candidates=_INTERMEDIATE_ANNOTATION_STRINGS,
+                ):
                     inferred_dynamic_arg_dims[k] = 0
 
             logger.debug(

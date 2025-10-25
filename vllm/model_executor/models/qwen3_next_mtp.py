@@ -107,7 +107,7 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
@@ -274,7 +274,7 @@ class Qwen3NextMTP(nn.Module, SupportsPP):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):

@@ -969,7 +969,7 @@ class Qwen3NextModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if get_pp_group().is_first_rank:
@@ -1205,7 +1205,7 @@ class Qwen3NextForCausalLM(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
+        intermediate_tensors: "IntermediateTensors | None" = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
