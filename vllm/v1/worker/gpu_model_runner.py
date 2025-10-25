@@ -328,6 +328,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(self.sampler)
+        else:
+            # Drafter only exists on the last PP rank
+            self.drafter = None
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1346,7 +1349,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 else None,
             )
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and spec_decode_common_attn_metadata is None
+                and self.drafter
+            ):
                 if isinstance(self.drafter, EagleProposer):
                     if (
                         self.drafter.attn_layer_names[0]
@@ -2703,6 +2710,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
     ) -> list[list[int]] | torch.Tensor:
+        # Skip drafting if not on the last PP rank (drafter only exists there)
+        if not self.drafter:
+            return []
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if self.speculative_config.method == "ngram":
             assert isinstance(sampled_token_ids, list)
@@ -3478,7 +3489,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and self.speculative_config.use_eagle():
+            if (
+                self.speculative_config
+                and self.speculative_config.use_eagle()
+                and self.drafter
+            ):
                 assert isinstance(self.drafter, EagleProposer)
                 use_cudagraphs = (
                     cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
@@ -4566,7 +4581,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
+        if (
+            self.speculative_config
+            and self.speculative_config.use_eagle()
+            and self.drafter
+        ):
             assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache
             # group
