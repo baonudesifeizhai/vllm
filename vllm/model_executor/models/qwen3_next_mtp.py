@@ -121,7 +121,10 @@ class Qwen3NextMultiTokenPredictor(nn.Module):
             hidden_states = self.fc(hidden_states)
             residual = None
         else:
-            assert intermediate_tensors is not None
+            if intermediate_tensors is None:
+                intermediate_tensors = self.make_empty_intermediate_tensors(
+                    hidden_states.size(0), hidden_states.dtype, hidden_states.device
+                )
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
