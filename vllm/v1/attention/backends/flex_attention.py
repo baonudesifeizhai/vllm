@@ -38,32 +38,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-# Monkey patch flex attention block mask creation to dodge static shape caching.
-try:
-    import torch.nn.attention.flex_attention as _torch_flex_attention
-except ImportError:  # pragma: no cover
-    _torch_flex_attention = None
-else:
-    if not hasattr(_torch_flex_attention, "_vllm_dynamic_block_mask_patch"):
-        _original_create_block_mask = _torch_flex_attention.create_block_mask
-
-        def _vllm_create_block_mask_dynamic(*args, **kwargs):
-            kwargs["_compile"] = False
-            return _original_create_block_mask(*args, **kwargs)
-
-        _torch_flex_attention.create_block_mask = _vllm_create_block_mask_dynamic
-        _torch_flex_attention._vllm_dynamic_block_mask_patch = True
-
-
-if _torch_flex_attention is not None:
-    create_block_mask_compiled = _torch_flex_attention.create_block_mask
-else:
-
-    def create_block_mask_compiled(*args, **kwargs):
-        kwargs["_compile"] = False
-        return create_block_mask(*args, **kwargs)
-
-
+# FlexAttention's create_block_mask supports dynamic compilation control
+# via _compile parameter. We use torch.compile for flex_attention but keep
+# create_block_mask dynamic to handle varying sequence lengths in vLLM.
 flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
 
 
@@ -565,7 +542,8 @@ class FlexAttentionMetadata:
     def build_block_mask(self) -> BlockMask:
         mask_mod = self.get_mask_mod()
         kv_len = self.total_cache_tokens if self.causal else self.num_actual_tokens
-        return create_block_mask_compiled(
+        # Use _compile=False to handle dynamic sequence lengths in vLLM
+        return create_block_mask(
             mask_mod,
             None,
             None,
@@ -573,6 +551,7 @@ class FlexAttentionMetadata:
             kv_len,
             device=self.block_table.device,
             BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
+            _compile=False,
         )
 
     def __post_init__(self):
