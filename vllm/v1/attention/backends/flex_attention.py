@@ -38,9 +38,32 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-create_block_mask_compiled = torch.compile(
-    create_block_mask, fullgraph=True, mode="reduce-overhead"
-)
+# Monkey patch flex attention block mask creation to dodge static shape caching.
+try:
+    import torch.nn.attention.flex_attention as _torch_flex_attention
+except ImportError:  # pragma: no cover
+    _torch_flex_attention = None
+else:
+    if not hasattr(_torch_flex_attention, "_vllm_dynamic_block_mask_patch"):
+        _original_create_block_mask = _torch_flex_attention.create_block_mask
+
+        def _vllm_create_block_mask_dynamic(*args, **kwargs):
+            kwargs["_compile"] = False
+            return _original_create_block_mask(*args, **kwargs)
+
+        _torch_flex_attention.create_block_mask = _vllm_create_block_mask_dynamic
+        _torch_flex_attention._vllm_dynamic_block_mask_patch = True
+
+
+if _torch_flex_attention is not None:
+    create_block_mask_compiled = _torch_flex_attention.create_block_mask
+else:
+
+    def create_block_mask_compiled(*args, **kwargs):
+        kwargs["_compile"] = False
+        return create_block_mask(*args, **kwargs)
+
+
 flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
 
 
@@ -479,56 +502,6 @@ class FlexAttentionMetadata:
 
         return transformed_score_mod
 
-    def _build_block_mask_direct_bidirectional(self) -> BlockMask:
-        """Direct block mask construction for bidirectional attention (encoder-only).
-
-        For bidirectional attention in encoder-only models:
-        1. No KV cache is used (query and key/value come from the same input)
-        2. Each query token can attend to all key tokens in the same sequence
-        3. mask_mod handles filtering across different sequences
-
-        Unlike causal attention, we don't use paged KV cache or block tables.
-        Instead, we create a dense block mask where all blocks are visible,
-        and let mask_mod do the sequence boundary filtering.
-        """
-        # For encoder-only, kv length equals query length (no cache)
-        kv_len = self.num_actual_tokens
-
-        # Calculate number of blocks needed
-        num_q_blocks = cdiv(self.num_actual_tokens, self.q_block_size)
-        num_kv_blocks = cdiv(kv_len, self.kv_block_size)
-
-        # For bidirectional attention, all KV blocks are visible to all Q blocks
-        # Create a dense connectivity: each Q block can see all KV blocks
-        # Shape: [num_q_blocks, num_kv_blocks]
-        device = self.query_start_loc.device  # Use a tensor we know exists
-        kv_indices = torch.arange(num_kv_blocks, dtype=torch.int32, device=device)[
-            None, :
-        ].expand(num_q_blocks, -1)
-
-        kv_num_blocks = torch.full(
-            (num_q_blocks,),
-            num_kv_blocks,
-            dtype=torch.int32,
-            device=device,
-        )
-
-        block_mask_kwargs = {
-            "seq_lengths": (self.num_actual_tokens, kv_len),
-            "kv_num_blocks": kv_num_blocks[None, None],
-            "kv_indices": kv_indices[None, None],
-            "full_kv_num_blocks": None,
-            "full_kv_indices": None,
-            "BLOCK_SIZE": (self.q_block_size, self.kv_block_size),
-            "mask_mod": self.mask_mod,
-        }
-
-        # compute_q_blocks parameter is available in PyTorch 2.9+
-        if is_torch_equal_or_newer("2.9.0.dev0"):
-            block_mask_kwargs["compute_q_blocks"] = False
-
-        return BlockMask.from_kv_blocks(**block_mask_kwargs)
-
     def _build_block_mask_direct(self) -> BlockMask:
         """Direct block mask construction for standard causal attention.
 
@@ -615,14 +588,8 @@ class FlexAttentionMetadata:
         self.mask_mod = self.get_mask_mod()
         self.transformed_score_mod = self.get_transformed_score_mod()
 
-        # Use direct build for both causal and bidirectional attention
-        if self.direct_build:
-            if self.causal:
-                # Decoder: use optimized path for paged KV cache
-                self.block_mask = self._build_block_mask_direct()
-            else:
-                # Encoder-only: use optimized path for bidirectional attention
-                self.block_mask = self._build_block_mask_direct_bidirectional()
+        if self.direct_build and self.causal:
+            self.block_mask = self._build_block_mask_direct()
         else:
             self.block_mask = self.build_block_mask()
 
@@ -714,8 +681,10 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             total_cache_tokens=total_cache_tokens,
             decode_offset=offset_tensor,
             num_blocks_per_seq=num_blocks_per_seq,
-            # Enable direct build for both causal and bidirectional attention
-            direct_build=self.direct_build,
+            # FIXME(Isotr0py): direct build has issue to build bidirectional
+            # attention block mask for encoder-only models, disable it temporarily.
+            # see: https://github.com/vllm-project/vllm/pull/27329#issuecomment-3431484053
+            direct_build=(self.direct_build and common_attn_metadata.causal),
             q_block_size=self.q_block_size,
             kv_block_size=self.kv_block_size,
         )
