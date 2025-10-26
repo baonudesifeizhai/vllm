@@ -484,33 +484,33 @@ class FlexAttentionMetadata:
 
         For bidirectional attention in encoder-only models:
         1. No KV cache is used (query and key/value come from the same input)
-        2. Each query token can attend to all key tokens
-        3. Only need to mask across different sequences (doc_ids)
+        2. Each query token can attend to all key tokens in the same sequence
+        3. mask_mod handles filtering across different sequences
 
-        This constructs a simpler block mask where each query block
-        can potentially attend to all KV blocks, filtered by the mask_mod.
+        Unlike causal attention, we don't use paged KV cache or block tables.
+        Instead, we create a dense block mask where all blocks are visible,
+        and let mask_mod do the sequence boundary filtering.
         """
         # For encoder-only, kv length equals query length (no cache)
         kv_len = self.num_actual_tokens
+
+        # Calculate number of blocks needed
+        num_q_blocks = cdiv(self.num_actual_tokens, self.q_block_size)
         num_kv_blocks = cdiv(kv_len, self.kv_block_size)
 
-        # All KV blocks are potentially visible for each query block
-        # The mask_mod will handle sequence boundaries
-        num_q_blocks = cdiv(self.num_actual_tokens, self.q_block_size)
-
-        # Create indices for all KV blocks [0, 1, 2, ..., num_kv_blocks-1]
-        # Each query block can see all KV blocks (mask_mod will filter)
-        kv_indices = torch.arange(
-            num_kv_blocks, dtype=torch.int32, device=self.block_table.device
-        )
-        # Expand to [num_q_blocks, num_kv_blocks]
-        kv_indices = kv_indices[None, :].expand(num_q_blocks, -1)
+        # For bidirectional attention, all KV blocks are visible to all Q blocks
+        # Create a dense connectivity: each Q block can see all KV blocks
+        # Shape: [num_q_blocks, num_kv_blocks]
+        device = self.query_start_loc.device  # Use a tensor we know exists
+        kv_indices = torch.arange(num_kv_blocks, dtype=torch.int32, device=device)[
+            None, :
+        ].expand(num_q_blocks, -1)
 
         kv_num_blocks = torch.full(
             (num_q_blocks,),
             num_kv_blocks,
             dtype=torch.int32,
-            device=self.block_table.device,
+            device=device,
         )
 
         block_mask_kwargs = {
@@ -526,6 +526,7 @@ class FlexAttentionMetadata:
         # compute_q_blocks parameter is available in PyTorch 2.9+
         if is_torch_equal_or_newer("2.9.0.dev0"):
             block_mask_kwargs["compute_q_blocks"] = False
+
         return BlockMask.from_kv_blocks(**block_mask_kwargs)
 
     def _build_block_mask_direct(self) -> BlockMask:
@@ -614,11 +615,13 @@ class FlexAttentionMetadata:
         self.mask_mod = self.get_mask_mod()
         self.transformed_score_mod = self.get_transformed_score_mod()
 
+        # Use direct build for both causal and bidirectional attention
         if self.direct_build:
             if self.causal:
+                # Decoder: use optimized path for paged KV cache
                 self.block_mask = self._build_block_mask_direct()
             else:
-                # Use optimized direct build for encoder-only bidirectional attention
+                # Encoder-only: use optimized path for bidirectional attention
                 self.block_mask = self._build_block_mask_direct_bidirectional()
         else:
             self.block_mask = self.build_block_mask()
