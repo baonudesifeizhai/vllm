@@ -493,11 +493,11 @@ class FlexAttentionMetadata:
         # For encoder-only, kv length equals query length (no cache)
         kv_len = self.num_actual_tokens
         num_kv_blocks = cdiv(kv_len, self.kv_block_size)
-        
+
         # All KV blocks are potentially visible for each query block
         # The mask_mod will handle sequence boundaries
         num_q_blocks = cdiv(self.num_actual_tokens, self.q_block_size)
-        
+
         # Create indices for all KV blocks [0, 1, 2, ..., num_kv_blocks-1]
         # Each query block can see all KV blocks (mask_mod will filter)
         kv_indices = torch.arange(
@@ -505,12 +505,14 @@ class FlexAttentionMetadata:
         )
         # Expand to [num_q_blocks, num_kv_blocks]
         kv_indices = kv_indices[None, :].expand(num_q_blocks, -1)
-        
+
         kv_num_blocks = torch.full(
-            (num_q_blocks,), num_kv_blocks, dtype=torch.int32,
-            device=self.block_table.device
+            (num_q_blocks,),
+            num_kv_blocks,
+            dtype=torch.int32,
+            device=self.block_table.device,
         )
-        
+
         block_mask_kwargs = {
             "seq_lengths": (self.num_actual_tokens, kv_len),
             "kv_num_blocks": kv_num_blocks[None, None],
@@ -520,7 +522,7 @@ class FlexAttentionMetadata:
             "BLOCK_SIZE": (self.q_block_size, self.kv_block_size),
             "mask_mod": self.mask_mod,
         }
-        
+
         # compute_q_blocks parameter is available in PyTorch 2.9+
         if is_torch_equal_or_newer("2.9.0.dev0"):
             block_mask_kwargs["compute_q_blocks"] = False
