@@ -487,22 +487,31 @@ class FlexAttentionMetadata:
         """
         # For encoder-only, kv length equals query length (no cache)
         kv_len = self.num_actual_tokens
-        num_kv_blocks = cdiv(kv_len, self.kv_block_size)
-
         device = self.query_start_loc.device
 
-        # Use full_kv_indices for dense (full attention) pattern
-        # All KV blocks [0, 1, 2, ..., num_kv_blocks-1] are visible
-        full_kv_indices = torch.arange(num_kv_blocks, dtype=torch.int32, device=device)
+        # For full bidirectional attention: all Q blocks see all KV blocks
+        num_q_blocks = cdiv(self.num_actual_tokens, self.q_block_size)
+        num_kv_blocks = cdiv(kv_len, self.kv_block_size)
+        
+        # HACK: from_kv_blocks infers KV length from max(kv_indices) * block_size
+        # To get correct kv_len for non-cache scenarios, we use a virtual block ID
+        # that maps to the correct length
+        max_virtual_block_id = num_kv_blocks - 1
+
+        # Each Q block sees a single "virtual block" that covers all KV tokens
+        # Use the maximum block ID so from_kv_blocks calculates the right KV length
+        kv_indices = torch.full(
+            (num_q_blocks, 1), max_virtual_block_id, dtype=torch.int32, device=device
+        )
+
+        kv_num_blocks = torch.ones((num_q_blocks,), dtype=torch.int32, device=device)
 
         block_mask_kwargs = {
             "seq_lengths": (self.num_actual_tokens, kv_len),
-            "kv_num_blocks": None,  # Use full_* parameters instead
-            "kv_indices": None,
-            "full_kv_num_blocks": torch.tensor(
-                [num_kv_blocks], dtype=torch.int32, device=device
-            )[None, None],
-            "full_kv_indices": full_kv_indices[None, None],
+            "kv_num_blocks": kv_num_blocks[None, None],
+            "kv_indices": kv_indices[None, None],
+            "full_kv_num_blocks": None,
+            "full_kv_indices": None,
             "BLOCK_SIZE": (self.q_block_size, self.kv_block_size),
             "mask_mod": self.mask_mod,
         }
