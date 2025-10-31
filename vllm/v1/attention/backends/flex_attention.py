@@ -1020,7 +1020,9 @@ class FlexAttentionImpl(AttentionImpl):
         assert attn_metadata.block_mask is not None
         block_m, block_n = attn_metadata.block_mask.BLOCK_SIZE
 
-        kernel_options = get_kernel_options(query, block_m, block_n, False)
+        kernel_options = get_kernel_options(
+            query, block_m, block_n, attn_metadata.direct_build
+        )
 
         # Align the cached block_mask with the actual query/KV lengths.
         actual_q_len = query.size(-2)
