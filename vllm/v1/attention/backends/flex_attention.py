@@ -489,14 +489,14 @@ class FlexAttentionMetadata:
         """Process blocks for a single request.
 
         Args:
-            req_idx: Request index in the batch
-            page_to_block_ratio: Ratio between page size and block size
-            max_blocks_per_seq: Maximum number of blocks per sequence (for M param)
+            req_idx: Request index in the batch.
+            page_to_block_ratio: Ratio between page size and block size.
+            max_blocks_per_seq: Maximum number of logical blocks any request needs.
 
         Returns:
-            (kv_indices, kv_num_blocks) for this request
+            Tuple of (kv_indices, kv_num_blocks) for this request.
         """
-        # Get token range for this request
+        # Determine token range for this request.
         token_start = int(self.query_start_loc[req_idx].item())
         if req_idx < self.num_reqs - 1:
             token_end = int(self.query_start_loc[req_idx + 1].item())
@@ -504,61 +504,49 @@ class FlexAttentionMetadata:
             token_end = int(self.num_actual_tokens)
         seq_len = token_end - token_start
 
-        # Handle empty sequences
+        device = self.block_table.device
+
         if seq_len == 0:
-            # Return empty tensors with correct shape (width = max_blocks_per_seq)
             empty_indices = torch.full(
-                (0, max_blocks_per_seq),
-                -1,
-                dtype=torch.int32,
-                device=self.block_table.device,
+                (0, max_blocks_per_seq), -1, dtype=torch.int32, device=device
             )
-            empty_num_blocks = torch.zeros(
-                0, dtype=torch.int32, device=self.block_table.device
-            )
+            empty_num_blocks = torch.zeros(0, dtype=torch.int32, device=device)
             return empty_indices, empty_num_blocks
 
-        # Get actual blocks needed for this request's sequence length
         num_blocks_needed = int(self.num_blocks_per_seq[req_idx].item())
         seq_blocks = self.block_table[req_idx, :num_blocks_needed]
 
-        # Expand to per-token blocks (each token sees all blocks up to seq_len)
         seq_used_pages = seq_blocks.unsqueeze(0).repeat(seq_len, 1)
-
-        # Pad to multiple of q_block_size
         seq_used_pages_padded = pad_to_multiple(
             seq_used_pages, multiple=self.q_block_size, dim=0
         )
 
-        # Reshape into q-blocks, let PyTorch infer the second dimension
         num_q_blocks = seq_used_pages_padded.shape[0] // self.q_block_size
         seq_used_pages_reshaped = seq_used_pages_padded.reshape(num_q_blocks, -1)
         seq_used_pages_reshaped = seq_used_pages_reshaped // page_to_block_ratio
 
-        # Get unique blocks per q-block and pad to max_blocks_per_seq
-        # This avoids allocating huge scatter table in unique_static_unsorted
-        kv_indices_list = []
-        for q_block_idx in range(num_q_blocks):
-            # Get unique non-zero blocks for this q-block
-            blocks_in_qblock = seq_used_pages_reshaped[q_block_idx]
-            unique_blocks = torch.unique(blocks_in_qblock[blocks_in_qblock > 0])
-            
-            # Pad to max_blocks_per_seq
-            num_unique = len(unique_blocks)
-            padded_blocks = torch.full(
-                (max_blocks_per_seq,),
-                -1,
-                dtype=torch.int32,
-                device=unique_blocks.device
-            )
-            padded_blocks[:num_unique] = unique_blocks.int()
-            kv_indices_list.append(padded_blocks)
-        
-        kv_indices = torch.stack(kv_indices_list, dim=0) if kv_indices_list else torch.empty(
-            0, max_blocks_per_seq, dtype=torch.int32, device=self.block_table.device
+        kv_indices = torch.full(
+            (num_q_blocks, max_blocks_per_seq), -1, dtype=torch.int32, device=device
+        )
+        kv_num_blocks = torch.zeros(
+            num_q_blocks, dtype=torch.int32, device=device
         )
 
-        kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
+        for q_block_idx in range(num_q_blocks):
+            blocks_in_qblock = seq_used_pages_reshaped[q_block_idx]
+            valid_blocks = blocks_in_qblock[blocks_in_qblock >= 0]
+            if valid_blocks.numel() == 0:
+                continue
+
+            unique_blocks = torch.unique(valid_blocks, sorted=False)
+            if unique_blocks.numel() == 0:
+                continue
+
+            unique_blocks = unique_blocks.to(torch.int32)
+            count = min(unique_blocks.numel(), max_blocks_per_seq)
+            if count > 0:
+                kv_indices[q_block_idx, :count] = unique_blocks[:count]
+                kv_num_blocks[q_block_idx] = count
 
         return kv_indices, kv_num_blocks
 
