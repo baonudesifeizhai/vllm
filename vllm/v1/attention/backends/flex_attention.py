@@ -555,7 +555,7 @@ class FlexAttentionMetadata:
         1. For each request, extract its token range and block table entries
         2. Deduplicate blocks within that request only
         3. Concatenate results across all requests
-        4. Use per-request max_seq_len instead of total_cache_tokens
+        4. Use total_cache_tokens for KV dimension to match key_tensor size
 
         """
         page_to_block_ratio = self.kv_block_size // self.block_size
@@ -565,6 +565,12 @@ class FlexAttentionMetadata:
                 f"({self.block_size}) to be equal to the kv_block_size "
                 f"({self.kv_block_size}). Please check your model's "
                 f"configuration."
+            )
+
+        # Handle zero-token case (warmup/dummy run)
+        if self.num_actual_tokens == 0:
+            return self._build_dense_block_mask(
+                1, self.total_cache_tokens, self.mask_mod
             )
 
         # Use max blocks per sequence (logical blocks), not total GPU cache blocks
@@ -597,12 +603,11 @@ class FlexAttentionMetadata:
                 0, dtype=torch.int32, device=self.block_table.device
             )
 
+        # Use total_cache_tokens to match key_tensor size (entire physical KV cache)
+        # block_mask._adjust() will later trim to actual_kv_len in forward()
+        kv_extent = max(1, self.total_cache_tokens)
         block_mask_kwargs = {
-            # Use actual tokens and max_seq_len per request, not total_cache_tokens
-            "seq_lengths": (
-                max(1, int(self.num_actual_tokens)),
-                max(1, int(self.max_seq_len)),
-            ),
+            "seq_lengths": (max(1, int(self.num_actual_tokens)), kv_extent),
             "kv_num_blocks": kv_num_blocks[None, None],
             "kv_indices": kv_indices[None, None],
             "full_kv_num_blocks": None,
