@@ -576,8 +576,9 @@ class FlexAttentionMetadata:
         # Handle zero-token case (warmup/dummy run)
         if self.num_actual_tokens == 0:
             # Use None for mask_mod to avoid accessing empty doc_ids
+            # Use max_seq_len to avoid huge mask that causes Triton compilation failure
             return self._build_dense_block_mask(
-                1, self.total_cache_tokens, None
+                1, max(1, int(self.max_seq_len)), None
             )
 
         # Use max blocks per sequence (logical blocks), not total GPU cache blocks
@@ -610,9 +611,9 @@ class FlexAttentionMetadata:
                 0, dtype=torch.int32, device=self.block_table.device
             )
 
-        # Use total_cache_tokens to match key_tensor size (entire physical KV cache)
-        # block_mask._adjust() will later trim to actual_kv_len in forward()
-        kv_extent = max(1, self.total_cache_tokens)
+        # Use max_seq_len (batch max sequence length) instead of total_cache_tokens
+        # This avoids creating huge masks that cause Triton compilation failure
+        kv_extent = max(1, int(self.max_seq_len))
         block_mask_kwargs = {
             "seq_lengths": (max(1, int(self.num_actual_tokens)), kv_extent),
             "kv_num_blocks": kv_num_blocks[None, None],
@@ -1005,7 +1006,13 @@ class FlexAttentionImpl(AttentionImpl):
                 key_tensor = key_tensor[:, :, : attn_metadata.max_seq_len, :]
                 value_tensor = value_tensor[:, :, : attn_metadata.max_seq_len, :]
             else:
+                # For decoder self-attention, trim to actual tokens for query
+                # and max_seq_len for KV (to match block_mask when using direct_build)
                 query = query[:, :, :num_actual_tokens, :]
+                if attn_metadata.direct_build:
+                    # Trim key/value to max_seq_len to match block_mask's kv_extent
+                    key_tensor = key_tensor[:, :, : attn_metadata.max_seq_len, :]
+                    value_tensor = value_tensor[:, :, : attn_metadata.max_seq_len, :]
 
         # Doesn't work for now -> constraint violation
         # torch._dynamo.try_mark_dynamic(query, 2)
@@ -1017,12 +1024,12 @@ class FlexAttentionImpl(AttentionImpl):
 
         # Align the cached block_mask with the actual query/KV lengths.
         actual_q_len = query.size(-2)
-        actual_kv_len = key_tensor.size(-2)
+        actual_kv_len = key_tensor.size(-2)  # Already trimmed to max_seq_len if direct_build
 
         # Use pre-built block mask with correct physical block IDs
         block_mask = attn_metadata.block_mask
 
-        # Only adjust if dimensions don't match
+        # Adjust if needed (usually no-op after our trimming)
         if block_mask.seq_lengths != (actual_q_len, actual_kv_len):
             block_mask = block_mask._adjust(actual_q_len, actual_kv_len)
 
