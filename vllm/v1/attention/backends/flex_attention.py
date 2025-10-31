@@ -480,25 +480,82 @@ class FlexAttentionMetadata:
 
         return transformed_score_mod
 
+    def _process_single_sequence_blocks(
+        self,
+        req_idx: int,
+        page_to_block_ratio: int,
+        max_blocks_per_seq: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Process blocks for a single request.
+
+        Args:
+            req_idx: Request index in the batch
+            page_to_block_ratio: Ratio between page size and block size
+            max_blocks_per_seq: Maximum number of blocks per sequence (for M param)
+
+        Returns:
+            (kv_indices, kv_num_blocks) for this request
+        """
+        # Get token range for this request
+        token_start = int(self.query_start_loc[req_idx].item())
+        if req_idx < self.num_reqs - 1:
+            token_end = int(self.query_start_loc[req_idx + 1].item())
+        else:
+            token_end = int(self.num_actual_tokens)
+        seq_len = token_end - token_start
+
+        # Handle empty sequences
+        if seq_len == 0:
+            # Return empty tensors with correct shape
+            empty_indices = torch.empty(
+                0,
+                max_blocks_per_seq,
+                dtype=torch.int32,
+                device=self.block_table.device,
+            )
+            empty_num_blocks = torch.empty(
+                0, dtype=torch.int32, device=self.block_table.device
+            )
+            return empty_indices, empty_num_blocks
+
+        # Get actual blocks needed for this request's sequence length
+        num_blocks_needed = int(self.num_blocks_per_seq[req_idx].item())
+        seq_blocks = self.block_table[req_idx, :num_blocks_needed]
+
+        # Expand to per-token blocks (each token sees all blocks up to seq_len)
+        seq_used_pages = seq_blocks.unsqueeze(0).repeat(seq_len, 1)
+
+        # Pad to multiple of q_block_size
+        seq_used_pages_padded = pad_to_multiple(
+            seq_used_pages, multiple=self.q_block_size, dim=0
+        )
+
+        # Reshape into q-blocks
+        num_q_blocks = seq_used_pages_padded.shape[0] // self.q_block_size
+        seq_used_pages_reshaped = seq_used_pages_padded.reshape(num_q_blocks, -1)
+        seq_used_pages_reshaped = seq_used_pages_reshaped // page_to_block_ratio
+
+        # Deduplicate blocks, using max_blocks_per_seq as the upper bound
+        kv_indices = unique_static_unsorted(
+            seq_used_pages_reshaped.long(), M=max_blocks_per_seq
+        ).to(torch.int32)
+
+        kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
+
+        return kv_indices, kv_num_blocks
+
     def _build_block_mask_direct(self) -> BlockMask:
-        """Direct block mask construction for standard causal attention.
+        """Direct block mask construction for batch inference.
 
-        This method constructs the block mask directly using
-        BlockMask.from_kv_blocks which is much more efficient than the
-        generic create_block_mask approach.
+        This method constructs the block mask by processing each request
+        independently to avoid cross-request block contamination, which
+        causes IMA errors in batch inference.
 
-        The direct path works as follows:
-        1. For each query token, fetch blocks from block_table using max_seq_len
-           (this fetches more blocks than needed for shorter sequences)
-        2. Group query tokens into chunks of q_block_size
-        3. For each group, deduplicate the blocks using unique_static_unsorted
-        4. Create BlockMask using the deduplicated block indices
-
-        Over-estimation occurs when a group of q_block_size tokens contains
-        multiple sequence IDs (doc_ids). In this case, we fetch ALL blocks for
-        each sequence represented in the group, even though individual query
-        tokens may only need a subset of those blocks based on causal masking
-        and their position.
+        The process:
+        1. For each request, extract its token range and block table entries
+        2. Deduplicate blocks within that request only
+        3. Concatenate results across all requests
+        4. Use per-request max_seq_len instead of total_cache_tokens
 
         """
         page_to_block_ratio = self.kv_block_size // self.block_size
@@ -510,23 +567,42 @@ class FlexAttentionMetadata:
                 f"configuration."
             )
 
-        used_pages = self.block_table[
-            self.doc_ids, : cdiv(self.max_seq_len, self.block_size)
-        ]
-        used_pages_padded = pad_to_multiple(
-            used_pages, multiple=self.q_block_size, dim=0
-        )
-        used_pages_padded = used_pages_padded.reshape(
-            used_pages_padded.shape[0] // self.q_block_size, -1
-        )
-        used_pages_padded = used_pages_padded // page_to_block_ratio
-        kv_indices = unique_static_unsorted(
-            (used_pages_padded.long()), M=self.num_blocks
-        ).to(torch.int32)
+        # Use max blocks per sequence (logical blocks), not total GPU cache blocks
+        max_blocks_per_seq = max(1, int(self.num_blocks_per_seq.max().item()))
 
-        kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
+        # Process each request independently
+        all_kv_indices = []
+        all_kv_num_blocks = []
+
+        for req_idx in range(self.num_reqs):
+            kv_indices, kv_num_blocks = self._process_single_sequence_blocks(
+                req_idx, page_to_block_ratio, max_blocks_per_seq
+            )
+            all_kv_indices.append(kv_indices)
+            all_kv_num_blocks.append(kv_num_blocks)
+
+        # Concatenate results
+        if all_kv_indices:
+            kv_indices = torch.cat(all_kv_indices, dim=0)
+            kv_num_blocks = torch.cat(all_kv_num_blocks, dim=0)
+        else:
+            # Fallback for empty batch
+            kv_indices = torch.empty(
+                0,
+                max_blocks_per_seq,
+                dtype=torch.int32,
+                device=self.block_table.device,
+            )
+            kv_num_blocks = torch.empty(
+                0, dtype=torch.int32, device=self.block_table.device
+            )
+
         block_mask_kwargs = {
-            "seq_lengths": (self.num_actual_tokens, self.total_cache_tokens),
+            # Use actual tokens and max_seq_len per request, not total_cache_tokens
+            "seq_lengths": (
+                max(1, int(self.num_actual_tokens)),
+                max(1, int(self.max_seq_len)),
+            ),
             "kv_num_blocks": kv_num_blocks[None, None],
             "kv_indices": kv_indices[None, None],
             "full_kv_num_blocks": None,
@@ -713,11 +789,10 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             total_cache_tokens=total_cache_tokens,
             decode_offset=offset_tensor,
             num_blocks_per_seq=num_blocks_per_seq,
-            # FIXME(Isotr0py): direct build has issue to build bidirectional
-            # attention block mask for encoder-only models, disable it temporarily.
-            # see: https://github.com/vllm-project/vllm/pull/27329#issuecomment-3431484053
-            # direct_build=(self.direct_build and common_attn_metadata.causal),
-            direct_build=False,
+            # Enable direct_build for causal attention (decoder) to use per-request
+            # block mask construction, which fixes batch IMA issues.
+            # Bidirectional (encoder) attention still uses build_block_mask().
+            direct_build=(self.direct_build and common_attn_metadata.causal),
             q_block_size=self.q_block_size,
             kv_block_size=self.kv_block_size,
         )
@@ -932,10 +1007,10 @@ class FlexAttentionImpl(AttentionImpl):
         actual_q_len = query.size(-2)
         actual_kv_len = key_tensor.size(-2)
 
-        block_mask = attn_metadata._build_dense_block_mask(
-            actual_q_len, actual_kv_len, attn_metadata.mask_mod
-        )
+        # Use pre-built block mask with correct physical block IDs
+        block_mask = attn_metadata.block_mask
 
+        # Only adjust if dimensions don't match
         if block_mask.seq_lengths != (actual_q_len, actual_kv_len):
             block_mask = block_mask._adjust(actual_q_len, actual_kv_len)
 
