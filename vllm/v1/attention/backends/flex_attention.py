@@ -506,11 +506,9 @@ class FlexAttentionMetadata:
 
         # Handle empty sequences
         if seq_len == 0:
-            # Return empty tensors with correct shape
-            # Width should be q_block_size * max_blocks_per_seq
-            target_width = self.q_block_size * max_blocks_per_seq
+            # Return empty tensors with correct shape (width = max_blocks_per_seq)
             empty_indices = torch.full(
-                (0, target_width),
+                (0, max_blocks_per_seq),
                 -1,
                 dtype=torch.int32,
                 device=self.block_table.device,
@@ -537,30 +535,30 @@ class FlexAttentionMetadata:
         seq_used_pages_reshaped = seq_used_pages_padded.reshape(num_q_blocks, -1)
         seq_used_pages_reshaped = seq_used_pages_reshaped // page_to_block_ratio
 
-        # Deduplicate blocks, using num_blocks (total GPU blocks) as upper bound
-        # M must be >= max value in seq_used_pages_reshaped (physical block IDs)
-        kv_indices = unique_static_unsorted(
-            seq_used_pages_reshaped.long(), M=self.num_blocks
-        ).to(torch.int32)
+        # Get unique blocks per q-block and pad to max_blocks_per_seq
+        # This avoids allocating huge scatter table in unique_static_unsorted
+        kv_indices_list = []
+        for q_block_idx in range(num_q_blocks):
+            # Get unique non-zero blocks for this q-block
+            blocks_in_qblock = seq_used_pages_reshaped[q_block_idx]
+            unique_blocks = torch.unique(blocks_in_qblock[blocks_in_qblock > 0])
+            
+            # Pad to max_blocks_per_seq
+            num_unique = len(unique_blocks)
+            padded_blocks = torch.full(
+                (max_blocks_per_seq,),
+                -1,
+                dtype=torch.int32,
+                device=unique_blocks.device
+            )
+            padded_blocks[:num_unique] = unique_blocks.int()
+            kv_indices_list.append(padded_blocks)
+        
+        kv_indices = torch.stack(kv_indices_list, dim=0) if kv_indices_list else torch.empty(
+            0, max_blocks_per_seq, dtype=torch.int32, device=self.block_table.device
+        )
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
-
-        # Pad kv_indices to uniform width for concatenation
-        # After reshape, width = q_block_size * num_blocks_needed
-        # So max width = q_block_size * max_blocks_per_seq
-        target_width = self.q_block_size * max_blocks_per_seq
-        current_width = kv_indices.shape[1]
-        if current_width < target_width:
-            padding = torch.full(
-                (kv_indices.shape[0], target_width - current_width),
-                -1,  # Use -1 as padding (ignored value)
-                dtype=kv_indices.dtype,
-                device=kv_indices.device,
-            )
-            kv_indices = torch.cat([kv_indices, padding], dim=1)
-        elif current_width > target_width:
-            # Truncate if somehow larger
-            kv_indices = kv_indices[:, :target_width]
 
         return kv_indices, kv_num_blocks
 
@@ -589,8 +587,9 @@ class FlexAttentionMetadata:
 
         # Handle zero-token case (warmup/dummy run)
         if self.num_actual_tokens == 0:
+            # Use None for mask_mod to avoid accessing empty doc_ids
             return self._build_dense_block_mask(
-                1, self.total_cache_tokens, self.mask_mod
+                1, self.total_cache_tokens, None
             )
 
         # Use max blocks per sequence (logical blocks), not total GPU cache blocks
@@ -613,9 +612,8 @@ class FlexAttentionMetadata:
             kv_num_blocks = torch.cat(all_kv_num_blocks, dim=0)
         else:
             # Fallback for empty batch (shouldn't happen, but be safe)
-            target_width = self.q_block_size * max_blocks_per_seq
             kv_indices = torch.full(
-                (0, target_width),
+                (0, max_blocks_per_seq),
                 -1,
                 dtype=torch.int32,
                 device=self.block_table.device,
