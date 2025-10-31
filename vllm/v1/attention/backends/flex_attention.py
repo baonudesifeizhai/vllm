@@ -507,13 +507,15 @@ class FlexAttentionMetadata:
         # Handle empty sequences
         if seq_len == 0:
             # Return empty tensors with correct shape
-            empty_indices = torch.empty(
-                0,
-                max_blocks_per_seq,
+            # Width should be q_block_size * max_blocks_per_seq
+            target_width = self.q_block_size * max_blocks_per_seq
+            empty_indices = torch.full(
+                (0, target_width),
+                -1,
                 dtype=torch.int32,
                 device=self.block_table.device,
             )
-            empty_num_blocks = torch.empty(
+            empty_num_blocks = torch.zeros(
                 0, dtype=torch.int32, device=self.block_table.device
             )
             return empty_indices, empty_num_blocks
@@ -521,16 +523,6 @@ class FlexAttentionMetadata:
         # Get actual blocks needed for this request's sequence length
         num_blocks_needed = int(self.num_blocks_per_seq[req_idx].item())
         seq_blocks = self.block_table[req_idx, :num_blocks_needed]
-
-        # Pad seq_blocks to max_blocks_per_seq for uniform shape across requests
-        if num_blocks_needed < max_blocks_per_seq:
-            padding = torch.full(
-                (max_blocks_per_seq - num_blocks_needed,),
-                0,  # Use 0 as padding, will be ignored by unique_static_unsorted
-                dtype=seq_blocks.dtype,
-                device=seq_blocks.device,
-            )
-            seq_blocks = torch.cat([seq_blocks, padding], dim=0)
 
         # Expand to per-token blocks (each token sees all blocks up to seq_len)
         seq_used_pages = seq_blocks.unsqueeze(0).repeat(seq_len, 1)
@@ -540,7 +532,7 @@ class FlexAttentionMetadata:
             seq_used_pages, multiple=self.q_block_size, dim=0
         )
 
-        # Reshape into q-blocks: [num_q_blocks, max_blocks_per_seq]
+        # Reshape into q-blocks, let PyTorch infer the second dimension
         num_q_blocks = seq_used_pages_padded.shape[0] // self.q_block_size
         seq_used_pages_reshaped = seq_used_pages_padded.reshape(num_q_blocks, -1)
         seq_used_pages_reshaped = seq_used_pages_reshaped // page_to_block_ratio
@@ -552,6 +544,23 @@ class FlexAttentionMetadata:
         ).to(torch.int32)
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
+
+        # Pad kv_indices to uniform width for concatenation
+        # After reshape, width = q_block_size * num_blocks_needed
+        # So max width = q_block_size * max_blocks_per_seq
+        target_width = self.q_block_size * max_blocks_per_seq
+        current_width = kv_indices.shape[1]
+        if current_width < target_width:
+            padding = torch.full(
+                (kv_indices.shape[0], target_width - current_width),
+                -1,  # Use -1 as padding (ignored value)
+                dtype=kv_indices.dtype,
+                device=kv_indices.device,
+            )
+            kv_indices = torch.cat([kv_indices, padding], dim=1)
+        elif current_width > target_width:
+            # Truncate if somehow larger
+            kv_indices = kv_indices[:, :target_width]
 
         return kv_indices, kv_num_blocks
 
@@ -603,14 +612,15 @@ class FlexAttentionMetadata:
             kv_indices = torch.cat(all_kv_indices, dim=0)
             kv_num_blocks = torch.cat(all_kv_num_blocks, dim=0)
         else:
-            # Fallback for empty batch
-            kv_indices = torch.empty(
-                0,
-                max_blocks_per_seq,
+            # Fallback for empty batch (shouldn't happen, but be safe)
+            target_width = self.q_block_size * max_blocks_per_seq
+            kv_indices = torch.full(
+                (0, target_width),
+                -1,
                 dtype=torch.int32,
                 device=self.block_table.device,
             )
-            kv_num_blocks = torch.empty(
+            kv_num_blocks = torch.zeros(
                 0, dtype=torch.int32, device=self.block_table.device
             )
 
