@@ -522,6 +522,16 @@ class FlexAttentionMetadata:
         num_blocks_needed = int(self.num_blocks_per_seq[req_idx].item())
         seq_blocks = self.block_table[req_idx, :num_blocks_needed]
 
+        # Pad seq_blocks to max_blocks_per_seq for uniform shape across requests
+        if num_blocks_needed < max_blocks_per_seq:
+            padding = torch.full(
+                (max_blocks_per_seq - num_blocks_needed,),
+                0,  # Use 0 as padding, will be ignored by unique_static_unsorted
+                dtype=seq_blocks.dtype,
+                device=seq_blocks.device,
+            )
+            seq_blocks = torch.cat([seq_blocks, padding], dim=0)
+
         # Expand to per-token blocks (each token sees all blocks up to seq_len)
         seq_used_pages = seq_blocks.unsqueeze(0).repeat(seq_len, 1)
 
@@ -530,14 +540,15 @@ class FlexAttentionMetadata:
             seq_used_pages, multiple=self.q_block_size, dim=0
         )
 
-        # Reshape into q-blocks
+        # Reshape into q-blocks: [num_q_blocks, max_blocks_per_seq]
         num_q_blocks = seq_used_pages_padded.shape[0] // self.q_block_size
         seq_used_pages_reshaped = seq_used_pages_padded.reshape(num_q_blocks, -1)
         seq_used_pages_reshaped = seq_used_pages_reshaped // page_to_block_ratio
 
-        # Deduplicate blocks, using max_blocks_per_seq as the upper bound
+        # Deduplicate blocks, using num_blocks (total GPU blocks) as upper bound
+        # M must be >= max value in seq_used_pages_reshaped (physical block IDs)
         kv_indices = unique_static_unsorted(
-            seq_used_pages_reshaped.long(), M=max_blocks_per_seq
+            seq_used_pages_reshaped.long(), M=self.num_blocks
         ).to(torch.int32)
 
         kv_num_blocks = (kv_indices >= 0).sum(dim=-1).to(torch.int32)
