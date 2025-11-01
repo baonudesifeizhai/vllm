@@ -746,6 +746,30 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         seq_lens = common_attn_metadata.seq_lens
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        # Clamp the KV extent to the actual cache usage to avoid generating
+        # enormous block masks when the engine pre-allocates the entire cache
+        # (e.g., during CUDA graph warmup).
+        max_cached_tokens = (
+            int(common_attn_metadata.num_computed_tokens_cpu.max().item())
+            if common_attn_metadata.num_computed_tokens_cpu.numel() > 0
+            else 0
+        )
+        effective_max_seq_len = max(
+            1,
+            int(common_attn_metadata.max_query_len),
+            max_cached_tokens,
+        )
+        if common_attn_metadata.max_seq_len > 0:
+            effective_max_seq_len = min(
+                effective_max_seq_len, int(common_attn_metadata.max_seq_len)
+            )
+
+        seq_lens = torch.clamp(seq_lens, max=effective_max_seq_len)
+        seq_lens_cpu = torch.clamp(
+            common_attn_metadata.seq_lens_cpu, max=effective_max_seq_len
+        )
+        max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 1
+
         num_blocks_per_seq = cdiv(seq_lens, self.block_size)
 
         use_cascade = common_prefix_len > 0
