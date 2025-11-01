@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlexAttention."""
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -584,6 +585,18 @@ class FlexAttentionMetadata:
         # Use max blocks per sequence (logical blocks), not total GPU cache blocks
         max_blocks_per_seq = max(1, int(self.num_blocks_per_seq.max().item()))
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                (
+                    "FlexAttentionMetadata._build_block_mask_direct: num_reqs=%d, "
+                    "max_blocks_per_seq=%d, max_seq_len=%d, total_cache_tokens=%d"
+                ),
+                self.num_reqs,
+                max_blocks_per_seq,
+                self.max_seq_len,
+                self.total_cache_tokens,
+            )
+
         # Process each request independently
         all_kv_indices = []
         all_kv_num_blocks = []
@@ -771,6 +784,20 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         max_seq_len = int(seq_lens.max().item()) if seq_lens.numel() > 0 else 1
 
         num_blocks_per_seq = cdiv(seq_lens, self.block_size)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                (
+                    "FlexAttentionMetadataBuilder.build: original_max_seq_len=%d, "
+                    "effective_max_seq_len=%d, final_max_seq_len=%d, "
+                    "max_seq_lens=%d, max_blocks_per_seq=%d"
+                ),
+                original_max_seq_len,
+                effective_max_seq_len,
+                max_seq_len,
+                int(seq_lens.max().item()) if seq_lens.numel() else 0,
+                int(num_blocks_per_seq.max().item()) if num_blocks_per_seq.numel() else 0,
+            )
 
         use_cascade = common_prefix_len > 0
         cu_prefix_query_lens = None
