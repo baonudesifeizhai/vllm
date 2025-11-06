@@ -38,6 +38,8 @@ from collections.abc import Callable, Iterable
 from itertools import islice
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -47,6 +49,7 @@ from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk_bias
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -229,6 +232,83 @@ class FlashMLP(nn.Module):
         return x
 
 
+@triton.jit
+def compute_identity_kernel(
+    top_k: int,
+    hidden_states_ptr: tl.tensor,
+    expert_scales_ptr: tl.tensor,
+    num_tokens: int,
+    output_ptr: tl.tensor,
+    hidden_dim: int,
+    scales_stride: int,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    pid = tl.program_id(0)
+
+    batch_id = pid // (hidden_dim // BLOCK_SIZE)
+    dim_offset = pid % (hidden_dim // BLOCK_SIZE) * BLOCK_SIZE
+
+    if batch_id >= num_tokens or dim_offset >= hidden_dim:
+        return
+
+    h = tl.load(
+        hidden_states_ptr
+        + batch_id * hidden_dim
+        + dim_offset
+        + tl.arange(0, BLOCK_SIZE),
+        mask=(dim_offset + tl.arange(0, BLOCK_SIZE)) < hidden_dim,
+    )
+
+    result = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for i in range(top_k):
+        scale = tl.load(expert_scales_ptr + batch_id * scales_stride + i)
+        result += h * scale
+
+    tl.store(
+        output_ptr + batch_id * hidden_dim + dim_offset + tl.arange(0, BLOCK_SIZE),
+        result,
+        mask=(dim_offset + tl.arange(0, BLOCK_SIZE)) < hidden_dim,
+    )
+
+
+def zero_experts_compute_triton(
+    expert_indices: torch.Tensor,
+    expert_scales: torch.Tensor,
+    num_experts: int,
+    zero_expert_type: str,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Compute the contribution from zero experts (identity experts)."""
+    top_k = expert_indices.size(-1)
+
+    if zero_expert_type == "identity":
+        zero_expert_mask = expert_indices < num_experts
+        zero_expert_scales = expert_scales.clone()
+        zero_expert_scales[zero_expert_mask] = 0.0
+
+    normal_expert_mask = expert_indices >= num_experts
+    expert_indices[normal_expert_mask] = 0
+    expert_scales[normal_expert_mask] = 0.0
+
+    output = torch.zeros_like(hidden_states).to(hidden_states.device)
+    hidden_dim = hidden_states.size(-1)
+    num_tokens = hidden_states.size(0)
+
+    grid = lambda meta: (num_tokens * (hidden_dim // meta["BLOCK_SIZE"]),)
+    compute_identity_kernel[grid](
+        top_k,
+        hidden_states,
+        zero_expert_scales,
+        num_tokens,
+        output,
+        hidden_dim,
+        zero_expert_scales.stride(0),
+        BLOCK_SIZE=256,
+    )
+
+    return output
+
+
 class LongcatRouter(nn.Module):
     def __init__(
         self,
@@ -292,6 +372,9 @@ class LongcatMoe(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        self.top_k = top_k
+        self.num_experts = num_experts
+
         self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
@@ -303,8 +386,6 @@ class LongcatMoe(nn.Module):
             renormalize=False,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
-            zero_expert_num=self.zero_expert_num,
-            zero_expert_type=self.zero_expert_type,
             enable_eplb=self.enable_eplb,
             routed_scaling_factor=config.routed_scaling_factor,
         )
@@ -314,9 +395,40 @@ class LongcatMoe(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         router_logits = self.router(hidden_states.to(self.rounter_params_dtype))
+
+        # Compute zero expert contribution if needed
+        zero_expert_result = None
+        if self.zero_expert_num > 0 and self.zero_expert_type is not None:
+            # Compute topk for zero expert calculation
+            topk_weights, topk_ids = fused_topk_bias(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                e_score_correction_bias=self.router.e_score_correction_bias.data,
+                topk=self.top_k,
+                renormalize=False,
+            )
+
+            # Apply routed scaling factor if present
+            if self.routed_scaling_factor is not None:
+                topk_weights = topk_weights * self.routed_scaling_factor
+
+            # Compute zero expert result
+            zero_expert_result = zero_experts_compute_triton(
+                expert_indices=topk_ids,
+                expert_scales=topk_weights,
+                num_experts=self.num_experts,
+                zero_expert_type=self.zero_expert_type,
+                hidden_states=hidden_states,
+            )
+
+        # Call experts with regular routing
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
+
+        # Add zero expert contribution
+        if zero_expert_result is not None:
+            final_hidden_states = final_hidden_states + zero_expert_result
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
