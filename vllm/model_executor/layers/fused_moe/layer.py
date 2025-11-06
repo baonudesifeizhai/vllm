@@ -1407,7 +1407,7 @@ class FusedMoE(CustomOp):
             )
 
             if not isinstance(
-                self.quant_method, (UnquantizedFusedMoEMethod, ModelOptFp8MoEMethod)
+                self.quant_method, UnquantizedFusedMoEMethod | ModelOptFp8MoEMethod
             ):
                 raise NotImplementedError(
                     "is_act_and_mul=False is supported only for unquantized "
