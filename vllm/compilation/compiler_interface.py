@@ -219,6 +219,10 @@ class InductorStandaloneAdaptor(CompilerInterface):
         current_config = {}
         if compiler_config is not None:
             current_config.update(compiler_config)
+
+        if "compile_ranges" in current_config and "ranges" not in current_config:
+            current_config["ranges"] = current_config.pop("compile_ranges")
+
         set_inductor_config(current_config, runtime_shape)
         set_functorch_config()
 
@@ -229,20 +233,15 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         from torch._inductor import standalone_compile
 
-        # Issue #28868: Extract ranges from current_config and pass it to
-        # options['ranges'] so Inductor can constrain compilation on symints
+        # Issue #28868: Pass ranges to Inductor via config_patches
+        # standalone_compile uses **options to pass to compile_fx, so ranges
+        # must be in config_patches (current_config), not at top level of options
+        # compile_fx accepts ranges in config_patches (PyTorch 2.10+)
         compiled_graph = standalone_compile(
             graph,
             example_inputs,
             dynamic_shapes=dynamic_shapes,
-            options={
-                "config_patches": current_config,
-                **(
-                    {"ranges": current_config["ranges"]}
-                    if "ranges" in current_config
-                    else {}
-                ),
-            },
+            options={"config_patches": current_config},
         )
 
         # Save the compiled artifact to disk in the specified path
@@ -333,6 +332,9 @@ class InductorAdaptor(CompilerInterface):
         current_config = {}
         if compiler_config is not None:
             current_config.update(compiler_config)
+
+        if "compile_ranges" in current_config and "ranges" not in current_config:
+            current_config["ranges"] = current_config.pop("compile_ranges")
 
         # disable remote cache
         current_config["fx_graph_cache"] = True
