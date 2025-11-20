@@ -237,9 +237,11 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         from torch._inductor import standalone_compile
 
-        # Issue #28868: Pass ranges to Inductor via options
+        # Issue #28868: Pass ranges to Inductor
         # standalone_compile uses **options to pass to compile_fx
-        # ranges should be at top level of options, not in config_patches
+        # According to the test, ranges should be at top level of options
+        # PyTorch's standalone_compile may extract ranges from options before
+        # passing to compile_fx, or handle it through ShapeEnv
         options = {"config_patches": current_config}
         if ranges is not None:
             options["ranges"] = ranges
