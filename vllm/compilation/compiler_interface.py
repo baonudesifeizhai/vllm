@@ -229,11 +229,20 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         from torch._inductor import standalone_compile
 
+        # Issue #28868: Extract ranges from current_config and pass it to
+        # options['ranges'] so Inductor can constrain compilation on symints
         compiled_graph = standalone_compile(
             graph,
             example_inputs,
             dynamic_shapes=dynamic_shapes,
-            options={"config_patches": current_config},
+            options={
+                "config_patches": current_config,
+                **(
+                    {"ranges": current_config["ranges"]}
+                    if "ranges" in current_config
+                    else {}
+                ),
+            },
         )
 
         # Save the compiled artifact to disk in the specified path
