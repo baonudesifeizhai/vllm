@@ -239,18 +239,19 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         # Issue #28868: Pass ranges to Inductor
         # standalone_compile uses **options to pass to compile_fx
-        # According to the test, ranges should be at top level of options
-        # PyTorch's standalone_compile may extract ranges from options before
-        # passing to compile_fx, or handle it through ShapeEnv
-        options = {"config_patches": current_config}
+        # Since compile_fx doesn't accept ranges as a direct parameter,
+        # we need to put ranges in config_patches
+        # PyTorch's standalone_compile/compile_fx may extract ranges from config_patches
+        # before calling config.patch, or handle it through ShapeEnv
+        options_config = current_config.copy()
         if ranges is not None:
-            options["ranges"] = ranges
+            options_config["ranges"] = ranges
 
         compiled_graph = standalone_compile(
             graph,
             example_inputs,
             dynamic_shapes=dynamic_shapes,
-            options=options,
+            options={"config_patches": options_config},
         )
 
         # Save the compiled artifact to disk in the specified path
