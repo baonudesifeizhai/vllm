@@ -134,8 +134,9 @@ class AlwaysHitShapeEnv:
     until it works.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, ranges: dict[str, tuple[int, int]] | None = None) -> None:
         self.guards: list[Any] = []
+        self.ranges = ranges
 
     def evaluate_guards_expression(self, *args, **kwargs):
         return True
@@ -240,19 +241,68 @@ class InductorStandaloneAdaptor(CompilerInterface):
         # Issue #28868: Pass ranges to Inductor
         # standalone_compile uses **options to pass to compile_fx
         # Since compile_fx doesn't accept ranges as a direct parameter,
-        # we need to put ranges in config_patches
-        # PyTorch's standalone_compile/compile_fx may extract ranges from config_patches
-        # before calling config.patch, or handle it through ShapeEnv
+        # and config.patch will fail if ranges is in config_patches,
+        # we need to monkey-patch compile_fx to extract ranges and pass to ShapeEnv
         options_config = current_config.copy()
         if ranges is not None:
             options_config["ranges"] = ranges
 
-        compiled_graph = standalone_compile(
-            graph,
-            example_inputs,
-            dynamic_shapes=dynamic_shapes,
-            options={"config_patches": options_config},
-        )
+            # Monkey-patch compile_fx to extract ranges from config_patches
+            # and pass it to ShapeEnv before config.patch is called
+            from torch._inductor.compile_fx import compile_fx as original_compile_fx
+
+            def compile_fx_with_ranges_extraction(*args, **kwargs):
+                # Extract ranges from config_patches before passing to compile_fx
+                config_patches = kwargs.get("config_patches", {})
+                extracted_ranges = None
+                if isinstance(config_patches, dict) and "ranges" in config_patches:
+                    # Remove ranges from config_patches to avoid AttributeError
+                    extracted_ranges = config_patches.pop("ranges")
+
+                # Monkey-patch _get_shape_env to pass ranges to ShapeEnv
+                if extracted_ranges is not None:
+                    original_get_shape_env = None
+                    try:
+                        from torch._inductor.codecache import FxGraphCache
+                        original_get_shape_env = FxGraphCache._get_shape_env
+                    except (ImportError, AttributeError):
+                        pass
+
+                    def _get_shape_env_with_ranges(*args, **kwargs):
+                        if original_get_shape_env is not None:
+                            # Try to call original, but if it fails, use AlwaysHitShapeEnv
+                            try:
+                                return original_get_shape_env(*args, **kwargs)
+                            except Exception:
+                                pass
+                        return AlwaysHitShapeEnv(ranges=extracted_ranges)
+
+                    # Patch _get_shape_env to use ranges
+                    with patch(
+                        "torch._inductor.codecache.FxGraphCache._get_shape_env",
+                        _get_shape_env_with_ranges,
+                    ):
+                        return original_compile_fx(*args, **kwargs)
+                else:
+                    return original_compile_fx(*args, **kwargs)
+
+            with patch(
+                "torch._inductor.compile_fx.compile_fx",
+                compile_fx_with_ranges_extraction,
+            ):
+                compiled_graph = standalone_compile(
+                    graph,
+                    example_inputs,
+                    dynamic_shapes=dynamic_shapes,
+                    options={"config_patches": options_config},
+                )
+        else:
+            compiled_graph = standalone_compile(
+                graph,
+                example_inputs,
+                dynamic_shapes=dynamic_shapes,
+                options={"config_patches": options_config},
+            )
 
         # Save the compiled artifact to disk in the specified path
         assert key is not None
@@ -441,8 +491,9 @@ class InductorAdaptor(CompilerInterface):
             # see https://github.com/pytorch/pytorch/blob/9f5ebf3fc609105a74eab4ccc24932d6353ff566/torch/_inductor/codecache.py#L1221 # noqa
             return
 
+        # Issue #28868: Pass ranges to ShapeEnv
         def _get_shape_env() -> AlwaysHitShapeEnv:
-            return AlwaysHitShapeEnv()
+            return AlwaysHitShapeEnv(ranges=ranges)
 
         with ExitStack() as stack:
             # hijack to get the compiled graph itself
