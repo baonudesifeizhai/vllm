@@ -220,8 +220,12 @@ class InductorStandaloneAdaptor(CompilerInterface):
         if compiler_config is not None:
             current_config.update(compiler_config)
 
+        # Issue #28868: Extract ranges from current_config before passing to config_patches
+        # ranges is not a torch._inductor.config attribute, so it cannot be in config_patches
+        # Support both "compile_ranges" and "ranges" for compatibility
         if "compile_ranges" in current_config and "ranges" not in current_config:
             current_config["ranges"] = current_config.pop("compile_ranges")
+        ranges = current_config.pop("ranges", None)
 
         set_inductor_config(current_config, runtime_shape)
         set_functorch_config()
@@ -233,15 +237,18 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         from torch._inductor import standalone_compile
 
-        # Issue #28868: Pass ranges to Inductor via config_patches
-        # standalone_compile uses **options to pass to compile_fx, so ranges
-        # must be in config_patches (current_config), not at top level of options
-        # compile_fx accepts ranges in config_patches (PyTorch 2.10+)
+        # Issue #28868: Pass ranges to Inductor via options
+        # standalone_compile uses **options to pass to compile_fx
+        # ranges should be at top level of options, not in config_patches
+        options = {"config_patches": current_config}
+        if ranges is not None:
+            options["ranges"] = ranges
+
         compiled_graph = standalone_compile(
             graph,
             example_inputs,
             dynamic_shapes=dynamic_shapes,
-            options={"config_patches": current_config},
+            options=options,
         )
 
         # Save the compiled artifact to disk in the specified path
@@ -333,8 +340,12 @@ class InductorAdaptor(CompilerInterface):
         if compiler_config is not None:
             current_config.update(compiler_config)
 
+        # Issue #28868: Extract ranges from current_config before passing to config_patches
+        # ranges is not a torch._inductor.config attribute, so it cannot be in config_patches
+        # Support both "compile_ranges" and "ranges" for compatibility
         if "compile_ranges" in current_config and "ranges" not in current_config:
             current_config["ranges"] = current_config.pop("compile_ranges")
+        ranges = current_config.pop("ranges", None)
 
         # disable remote cache
         current_config["fx_graph_cache"] = True
@@ -494,11 +505,19 @@ class InductorAdaptor(CompilerInterface):
                     torch._functorch.config.patch(enable_remote_autograd_cache=False)
                 )
 
+            # Issue #28868: Pass ranges to Inductor
+            # For compile_fx, ranges needs to be in config_patches
+            # PyTorch's compile_fx may extract ranges from config_patches before calling config.patch
+            # So we put ranges back in config_patches for compile_fx
+            compile_fx_config = current_config.copy()
+            if ranges is not None:
+                compile_fx_config["ranges"] = ranges
+
             compiled_graph = compile_fx(
                 graph,
                 example_inputs,
                 inner_compile=hijacked_compile_fx_inner,
-                config_patches=current_config,
+                config_patches=compile_fx_config,
             )
 
         # Turn off the checks if we disable the compilation cache.
