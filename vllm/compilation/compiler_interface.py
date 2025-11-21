@@ -164,6 +164,53 @@ def get_inductor_factors() -> list[Any]:
     return factors
 
 
+def _setup_ranges_shape_env_patches(
+    stack: ExitStack, ranges: dict[str, tuple[int, int]] | None
+) -> None:
+    """
+    Issue #28868: Set up patches to pass ranges to Inductor through ShapeEnv.
+
+    This function patches _get_shape_env methods to return AlwaysHitShapeEnv
+    with ranges, so that ranges can be passed to Inductor without causing
+    AttributeError when config.patch tries to access config.ranges.
+
+    Args:
+        stack: ExitStack to manage the patches
+        ranges: Dictionary of range constraints, e.g. {"seq_len": (512, 8192)}.
+                If None, returns AlwaysHitShapeEnv() without ranges.
+    """
+
+    def _get_shape_env() -> AlwaysHitShapeEnv:
+        return AlwaysHitShapeEnv(ranges=ranges)
+
+    # Patch FxGraphCache._get_shape_env
+    try:
+        from torch._inductor.codecache import FxGraphCache  # noqa: F401
+
+        stack.enter_context(
+            patch(
+                "torch._inductor.codecache.FxGraphCache._get_shape_env",
+                _get_shape_env,
+            )
+        )
+    except (ImportError, AttributeError):
+        pass
+
+    # Patch AOTAutogradCache._get_shape_env if it exists
+    try:
+        from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+
+        if hasattr(AOTAutogradCache, "_get_shape_env"):
+            stack.enter_context(
+                patch(
+                    "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
+                    _get_shape_env,
+                )
+            )
+    except (ImportError, AttributeError):
+        pass
+
+
 def is_compile_cache_enabled(
     vllm_additional_inductor_config: dict[str, Any],
 ) -> bool:
@@ -221,9 +268,10 @@ class InductorStandaloneAdaptor(CompilerInterface):
         if compiler_config is not None:
             current_config.update(compiler_config)
 
-        # Issue #28868: Extract ranges from current_config before passing to config_patches
-        # ranges is not a torch._inductor.config attribute, so it cannot be in config_patches
-        # Support both "compile_ranges" and "ranges" for compatibility
+        # Issue #28868: Extract ranges from current_config before passing to
+        # config_patches. ranges is not a torch._inductor.config attribute, so
+        # it cannot be in config_patches. Support both "compile_ranges" and
+        # "ranges" for compatibility.
         if "compile_ranges" in current_config and "ranges" not in current_config:
             current_config["ranges"] = current_config.pop("compile_ranges")
         ranges = current_config.pop("ranges", None)
@@ -238,65 +286,14 @@ class InductorStandaloneAdaptor(CompilerInterface):
 
         from torch._inductor import standalone_compile
 
-        # Issue #28868: Pass ranges to Inductor
-        # standalone_compile uses **options to pass to compile_fx
-        # Since compile_fx doesn't accept ranges as a direct parameter,
-        # and config.patch will fail if ranges is in config_patches,
-        # we need to monkey-patch compile_fx to extract ranges and pass to ShapeEnv
+        # Issue #28868: Pass ranges to Inductor through ShapeEnv
+        # ranges cannot be in config_patches because config.patch will fail
+        # Instead, we pass ranges through ShapeEnv using patches
         options_config = current_config.copy()
-        if ranges is not None:
-            options_config["ranges"] = ranges
 
-            # Monkey-patch compile_fx to extract ranges from config_patches
-            # and pass it to ShapeEnv before config.patch is called
-            from torch._inductor.compile_fx import compile_fx as original_compile_fx
+        with ExitStack() as stack:
+            _setup_ranges_shape_env_patches(stack, ranges)
 
-            def compile_fx_with_ranges_extraction(*args, **kwargs):
-                # Extract ranges from config_patches before passing to compile_fx
-                config_patches = kwargs.get("config_patches", {})
-                extracted_ranges = None
-                if isinstance(config_patches, dict) and "ranges" in config_patches:
-                    # Remove ranges from config_patches to avoid AttributeError
-                    extracted_ranges = config_patches.pop("ranges")
-
-                # Monkey-patch _get_shape_env to pass ranges to ShapeEnv
-                if extracted_ranges is not None:
-                    original_get_shape_env = None
-                    try:
-                        from torch._inductor.codecache import FxGraphCache
-                        original_get_shape_env = FxGraphCache._get_shape_env
-                    except (ImportError, AttributeError):
-                        pass
-
-                    def _get_shape_env_with_ranges(*args, **kwargs):
-                        if original_get_shape_env is not None:
-                            # Try to call original, but if it fails, use AlwaysHitShapeEnv
-                            try:
-                                return original_get_shape_env(*args, **kwargs)
-                            except Exception:
-                                pass
-                        return AlwaysHitShapeEnv(ranges=extracted_ranges)
-
-                    # Patch _get_shape_env to use ranges
-                    with patch(
-                        "torch._inductor.codecache.FxGraphCache._get_shape_env",
-                        _get_shape_env_with_ranges,
-                    ):
-                        return original_compile_fx(*args, **kwargs)
-                else:
-                    return original_compile_fx(*args, **kwargs)
-
-            with patch(
-                "torch._inductor.compile_fx.compile_fx",
-                compile_fx_with_ranges_extraction,
-            ):
-                compiled_graph = standalone_compile(
-                    graph,
-                    example_inputs,
-                    dynamic_shapes=dynamic_shapes,
-                    options={"config_patches": options_config},
-                )
-        else:
             compiled_graph = standalone_compile(
                 graph,
                 example_inputs,
@@ -393,9 +390,10 @@ class InductorAdaptor(CompilerInterface):
         if compiler_config is not None:
             current_config.update(compiler_config)
 
-        # Issue #28868: Extract ranges from current_config before passing to config_patches
-        # ranges is not a torch._inductor.config attribute, so it cannot be in config_patches
-        # Support both "compile_ranges" and "ranges" for compatibility
+        # Issue #28868: Extract ranges from current_config before passing to
+        # config_patches. ranges is not a torch._inductor.config attribute, so
+        # it cannot be in config_patches. Support both "compile_ranges" and
+        # "ranges" for compatibility.
         if "compile_ranges" in current_config and "ranges" not in current_config:
             current_config["ranges"] = current_config.pop("compile_ranges")
         ranges = current_config.pop("ranges", None)
@@ -491,10 +489,6 @@ class InductorAdaptor(CompilerInterface):
             # see https://github.com/pytorch/pytorch/blob/9f5ebf3fc609105a74eab4ccc24932d6353ff566/torch/_inductor/codecache.py#L1221 # noqa
             return
 
-        # Issue #28868: Pass ranges to ShapeEnv
-        def _get_shape_env() -> AlwaysHitShapeEnv:
-            return AlwaysHitShapeEnv(ranges=ranges)
-
         with ExitStack() as stack:
             # hijack to get the compiled graph itself
             if original_load_name is not None:
@@ -508,24 +502,9 @@ class InductorAdaptor(CompilerInterface):
                 )
             )
 
-            # for providing a dummy shape environment
-            stack.enter_context(
-                patch(
-                    "torch._inductor.codecache.FxGraphCache._get_shape_env",
-                    _get_shape_env,
-                )
-            )
-
-            from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
-
-            # torch 2.8+ on main uses _get_shape_env in AOTAutogradCache
-            if hasattr(AOTAutogradCache, "_get_shape_env"):
-                stack.enter_context(
-                    patch(
-                        "torch._functorch._aot_autograd.autograd_cache.AOTAutogradCache._get_shape_env",
-                        _get_shape_env,
-                    )
-                )
+            # Issue #28868: Set up patches to pass ranges through ShapeEnv
+            # This will set up AlwaysHitShapeEnv with or without ranges
+            _setup_ranges_shape_env_patches(stack, ranges)
 
             # for forcing the graph to be cached
             stack.enter_context(
@@ -560,12 +539,10 @@ class InductorAdaptor(CompilerInterface):
                 )
 
             # Issue #28868: Pass ranges to Inductor
-            # For compile_fx, ranges needs to be in config_patches
-            # PyTorch's compile_fx may extract ranges from config_patches before calling config.patch
-            # So we put ranges back in config_patches for compile_fx
+            # ranges cannot be in config_patches because config.patch will fail
+            # Instead, we pass ranges through ShapeEnv (already patched above)
             compile_fx_config = current_config.copy()
-            if ranges is not None:
-                compile_fx_config["ranges"] = ranges
+            # Note: ranges is NOT in config_patches, it's passed through ShapeEnv
 
             compiled_graph = compile_fx(
                 graph,
