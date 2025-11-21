@@ -13,6 +13,8 @@ import torch
 import torch._inductor.compile_fx
 import torch.fx as fx
 
+import sympy
+
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
@@ -137,6 +139,92 @@ class AlwaysHitShapeEnv:
     def __init__(self, ranges: dict[str, tuple[int, int]] | None = None) -> None:
         self.guards: list[Any] = []
         self.ranges = ranges
+        # Issue #28868: var_to_range is a dict mapping sympy.Symbol to (min, max) tuple
+        # Inductor accesses shape_env.var_to_range to get range constraints
+        # We need to support lookup by Symbol name since Inductor may use different Symbol instances
+        self._ranges_by_name: dict[str, tuple[int, int]] = {}
+        self._symbol_cache: dict[str, sympy.Symbol] = {}
+        if ranges is not None:
+            # Store ranges by name for lookup
+            # User format: {"seq_len": [512, 8192]} or {"seq_len": (512, 8192)}
+            for name, value in ranges.items():
+                # Convert list to tuple if needed
+                if isinstance(value, list) and len(value) >= 2:
+                    range_tuple = (int(value[0]), int(value[1]))
+                elif isinstance(value, tuple) and len(value) >= 2:
+                    range_tuple = (int(value[0]), int(value[1]))
+                else:
+                    continue
+                self._ranges_by_name[name] = range_tuple
+                # Pre-create Symbol for this name
+                self._symbol_cache[name] = sympy.Symbol(name, integer=True)
+
+    @property
+    def var_to_range(self) -> dict[sympy.Symbol, tuple[int, int]]:
+        """
+        Issue #28868: Return var_to_range dict for Inductor to use ranges.
+        This property is accessed by Inductor to get range constraints.
+        We return a dict-like object that supports lookup by Symbol or Symbol name.
+        """
+        # Return a dict-like object that can look up ranges by Symbol or Symbol name
+        class VarToRangeDict:
+            def __init__(
+                self,
+                ranges_by_name: dict[str, tuple[int, int]],
+                symbol_cache: dict[str, sympy.Symbol],
+            ):
+                self._ranges_by_name = ranges_by_name
+                self._symbol_cache = symbol_cache
+                # Cache for Symbol -> range mapping
+                self._cache: dict[sympy.Symbol, tuple[int, int]] = {}
+
+            def __getitem__(self, key: sympy.Symbol) -> tuple[int, int]:
+                # Check cache first
+                if key in self._cache:
+                    return self._cache[key]
+                # Look up by Symbol name
+                if hasattr(key, "name") and key.name in self._ranges_by_name:
+                    range_val = self._ranges_by_name[key.name]
+                    self._cache[key] = range_val
+                    return range_val
+                # If not found, raise KeyError
+                raise KeyError(f"Symbol {key} (name={getattr(key, 'name', 'unknown')}) not found in ranges")
+
+            def __contains__(self, key: sympy.Symbol) -> bool:
+                return hasattr(key, "name") and key.name in self._ranges_by_name
+
+            def get(
+                self, key: sympy.Symbol, default: tuple[int, int] | None = None
+            ) -> tuple[int, int] | None:
+                try:
+                    return self[key]
+                except KeyError:
+                    return default
+
+            def items(self):
+                # Return items using cached Symbols
+                for name, range_val in self._ranges_by_name.items():
+                    symbol = self._symbol_cache.get(name, sympy.Symbol(name, integer=True))
+                    yield symbol, range_val
+
+            def keys(self):
+                # Return cached Symbols
+                for name in self._ranges_by_name.keys():
+                    yield self._symbol_cache.get(name, sympy.Symbol(name, integer=True))
+
+            def values(self):
+                return self._ranges_by_name.values()
+
+            def __iter__(self):
+                return self.keys()
+
+            def __len__(self):
+                return len(self._ranges_by_name)
+
+            def __repr__(self):
+                return f"VarToRangeDict({self._ranges_by_name})"
+
+        return VarToRangeDict(self._ranges_by_name, self._symbol_cache)
 
     def evaluate_guards_expression(self, *args, **kwargs):
         return True
