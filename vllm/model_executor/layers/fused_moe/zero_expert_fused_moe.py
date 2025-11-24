@@ -154,15 +154,16 @@ class ZeroExpertFusedMoE(FusedMoE):
         # Restore original zero_expert_num
         object.__setattr__(self, "zero_expert_num", original_zero_expert_num)
 
+        # Ensure fused_out is a single Tensor, not a tuple
+        # (torch.ops.vllm.moe_forward may return tuple if it sees zero_expert_num > 0
+        # at compile time, even though we temporarily set it to 0)
+        if isinstance(fused_out, tuple):
+            fused_out, _ = fused_out
+
         # Combine results
+        # Both zero_expert_result and fused_out are computed from the same hidden_states,
+        # so they should be on the same device. No device alignment needed.
         if zero_expert_result is not None:
-            # Ensure zero_expert_result is on the same device as fused_out
-            # (important for expert parallel where fused_out may be on different devices)
-            # Also ensure they have the same dtype
-            if zero_expert_result.device != fused_out.device:
-                zero_expert_result = zero_expert_result.to(fused_out.device)
-            if zero_expert_result.dtype != fused_out.dtype:
-                zero_expert_result = zero_expert_result.to(dtype=fused_out.dtype)
             fused_out = fused_out + zero_expert_result
 
         # Clear memoization after use
