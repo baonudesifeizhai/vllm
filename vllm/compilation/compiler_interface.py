@@ -227,6 +227,10 @@ class InductorStandaloneAdaptor(CompilerInterface):
         else:
             dynamic_shapes = "from_tracing_context"
 
+        compile_ranges = _get_compile_ranges_from_tracing_context()
+        if compile_ranges:
+            current_config["compile_ranges"] = compile_ranges
+
         from torch._inductor import standalone_compile
 
         compiled_graph = standalone_compile(
@@ -483,6 +487,10 @@ class InductorAdaptor(CompilerInterface):
                     torch._functorch.config.patch(enable_remote_autograd_cache=False)
                 )
 
+            compile_ranges = _get_compile_ranges_from_tracing_context()
+            if compile_ranges:
+                current_config["compile_ranges"] = compile_ranges
+
             compiled_graph = compile_fx(
                 graph,
                 example_inputs,
@@ -620,6 +628,34 @@ def set_inductor_config(config, runtime_shape):
 
 def set_functorch_config():
     torch._functorch.config.bundled_autograd_cache = False
+
+
+def _get_compile_ranges_from_tracing_context() -> dict[str, Any] | None:
+    """
+    Extract compile ranges from the current Dynamo tracing context.
+
+    When torch.compile is used with ranges, the range information is stored
+    in the shape environment. This function extracts that information so it can
+    be passed to Inductor to constrain symints during compilation.
+
+    Returns:
+        A dictionary mapping variable names to (lower, upper) range tuples,
+        or None if ranges are not available.
+    """
+    from torch._guards import detect_fake_mode
+
+    fake_mode = detect_fake_mode()
+    if fake_mode is None:
+        return None
+
+    shape_env = fake_mode.shape_env
+    var_to_range = shape_env.var_to_range
+
+    ranges = {
+        str(var): (range_info.lower, range_info.upper)
+        for var, range_info in var_to_range.items()
+    }
+    return ranges if ranges else None
 
 
 class EagerAdaptor(CompilerInterface):
