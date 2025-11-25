@@ -50,10 +50,17 @@ class ZeroExpertFusedMoE(FusedMoE):
             # Use router's bias if:
             # 1. User didn't provide bias, or
             # 2. User provided full bias (same size as router)
-            if user_bias is None or user_bias.shape[0] == router_bias.shape[0]:
-                kwargs["e_score_correction_bias"] = router_bias[:num_real_experts]
+        if user_bias is None or user_bias.shape[0] == router_bias.shape[0]:
+            kwargs["e_score_correction_bias"] = router_bias[:num_real_experts]
+
+        # Pass zero_expert_num=0 to super().__init__() to prevent torch.ops.vllm.moe_forward
+        # from compiling with zero_expert_num > 0, which would cause it to always return tuple.
+        # We handle zero experts ourselves in forward().
+        kwargs["zero_expert_num"] = 0
+        kwargs["zero_expert_type"] = None
 
         super().__init__(**kwargs)
+        # Store the actual zero_expert_num and zero_expert_type for our own use
         self.zero_expert_num = zero_expert_num
         self.zero_expert_type = zero_expert_type
         self._router = router  # Full router (includes zero experts)
@@ -121,6 +128,11 @@ class ZeroExpertFusedMoE(FusedMoE):
                 self, "e_score_correction_bias", self._router.e_score_correction_bias
             )
 
+        # Temporarily disable custom_routing_function for the first routing computation
+        # (it requires memoized results which don't exist yet)
+        original_custom_routing_function = self.custom_routing_function
+        object.__setattr__(self, "custom_routing_function", None)
+
         # Compute routing once (using full logits to include zero experts)
         # This ensures zero experts can be properly identified in topk_ids
         # select_experts now returns (topk_weights, topk_ids, zero_expert_result)
@@ -128,6 +140,9 @@ class ZeroExpertFusedMoE(FusedMoE):
             hidden_states=hidden_states,
             router_logits=router_logits,  # Full logits (includes zero experts)
         )
+
+        # Restore custom_routing_function for reuse in super().forward()
+        object.__setattr__(self, "custom_routing_function", original_custom_routing_function)
 
         # Restore original bias
         object.__setattr__(self, "e_score_correction_bias", original_bias)
