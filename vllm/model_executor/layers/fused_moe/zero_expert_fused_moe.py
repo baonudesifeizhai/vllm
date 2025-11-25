@@ -61,8 +61,10 @@ class ZeroExpertFusedMoE(FusedMoE):
 
         super().__init__(**kwargs)
         # Store the actual zero_expert_num and zero_expert_type for our own use
-        self.zero_expert_num = zero_expert_num
-        self.zero_expert_type = zero_expert_type
+        # Use a different attribute name to avoid affecting FusedMoE's zero_expert_num
+        # which must remain 0 for torch.ops.vllm.moe_forward to work correctly
+        self._actual_zero_expert_num = zero_expert_num
+        self._actual_zero_expert_type = zero_expert_type
         self._router = router  # Full router (includes zero experts)
 
         # Memoization state for routing results
@@ -89,9 +91,9 @@ class ZeroExpertFusedMoE(FusedMoE):
     ) -> torch.Tensor | None:
         """Compute zero expert results using pre-computed routing."""
         if (
-            self.zero_expert_num is None
-            or self.zero_expert_num <= 0
-            or self.zero_expert_type is None
+            self._actual_zero_expert_num is None
+            or self._actual_zero_expert_num <= 0
+            or self._actual_zero_expert_type is None
         ):
             return None
 
@@ -133,15 +135,26 @@ class ZeroExpertFusedMoE(FusedMoE):
         original_custom_routing_function = self.custom_routing_function
         object.__setattr__(self, "custom_routing_function", None)
 
+        # Temporarily set zero_expert_num and zero_expert_type to actual values
+        # so that select_experts can compute zero_expert_result
+        # (but we'll set them back to 0 before calling super().forward())
+        original_zero_expert_num = self.zero_expert_num
+        original_zero_expert_type = self.zero_expert_type
+        object.__setattr__(self, "zero_expert_num", self._actual_zero_expert_num)
+        object.__setattr__(self, "zero_expert_type", self._actual_zero_expert_type)
+
         # Compute routing once (using full logits to include zero experts)
         # This ensures zero experts can be properly identified in topk_ids
         # select_experts now returns (topk_weights, topk_ids, zero_expert_result)
-        print(f"[ZeroExpertFusedMoE.forward] Before select_experts: zero_expert_num={self.zero_expert_num}")
         topk_weights, topk_ids, zero_expert_result = self.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,  # Full logits (includes zero experts)
         )
-        print(f"[ZeroExpertFusedMoE.forward] After select_experts: zero_expert_result is None: {zero_expert_result is None}")
+
+        # Restore zero_expert_num and zero_expert_type to 0/None before calling super().forward()
+        # This ensures torch.ops.vllm.moe_forward doesn't see zero_expert_num > 0
+        object.__setattr__(self, "zero_expert_num", original_zero_expert_num)
+        object.__setattr__(self, "zero_expert_type", original_zero_expert_type)
 
         # Restore custom_routing_function for reuse in super().forward()
         object.__setattr__(self, "custom_routing_function", original_custom_routing_function)
@@ -156,31 +169,21 @@ class ZeroExpertFusedMoE(FusedMoE):
         # Slice router_logits for real experts only
         router_logits_sliced = router_logits[..., : self.logical_num_experts]
 
-        # Temporarily set zero_expert_num to 0 to prevent FusedMoE from
-        # trying to handle zero experts (we handle them ourselves)
-        original_zero_expert_num = self.zero_expert_num
-        print(f"[ZeroExpertFusedMoE.forward] Before super().forward(): original_zero_expert_num={original_zero_expert_num}, setting to 0")
-        object.__setattr__(self, "zero_expert_num", 0)
-        print(f"[ZeroExpertFusedMoE.forward] After setting zero_expert_num=0: self.zero_expert_num={self.zero_expert_num}")
+        # zero_expert_num should already be 0 (from original_zero_expert_num restored above)
+        # but we double-check to ensure FusedMoE doesn't try to handle zero experts
 
         # Compute real expert results (will reuse memoized routing via
         # custom_routing_function)
+        # zero_expert_num is already 0 (restored after select_experts), so FusedMoE won't handle zero experts
         fused_out = super().forward(
             hidden_states=hidden_states,
             router_logits=router_logits_sliced,
         )
-        print(f"[ZeroExpertFusedMoE.forward] After super().forward(): fused_out type={type(fused_out)}, is_tuple={isinstance(fused_out, tuple)}")
-        if isinstance(fused_out, tuple):
-            print(f"[ZeroExpertFusedMoE.forward] fused_out is tuple, len={len(fused_out)}")
-
-        # Restore original zero_expert_num
-        object.__setattr__(self, "zero_expert_num", original_zero_expert_num)
 
         # Ensure fused_out is a single Tensor, not a tuple
         # (torch.ops.vllm.moe_forward may return tuple if it sees zero_expert_num > 0
         # at compile time, even though we temporarily set it to 0)
         if isinstance(fused_out, tuple):
-            print(f"[ZeroExpertFusedMoE.forward] Unpacking tuple: fused_out[0].shape={fused_out[0].shape if len(fused_out) > 0 else 'N/A'}")
             fused_out, _ = fused_out
 
         # Combine results

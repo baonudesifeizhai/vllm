@@ -1708,13 +1708,9 @@ class FusedMoE(CustomOp):
                 fused_output = self.forward_impl(hidden_states, router_logits)
                 assert not isinstance(fused_output, tuple)
             else:
-                print(f"[FusedMoE.forward_native] Before torch.ops.vllm.moe_forward: zero_expert_num={self.zero_expert_num}, layer_name={self.layer_name}")
                 fused_output = torch.ops.vllm.moe_forward(
                     hidden_states, router_logits, self.layer_name
                 )
-                print(f"[FusedMoE.forward_native] After torch.ops.vllm.moe_forward: fused_output type={type(fused_output)}, is_tuple={isinstance(fused_output, tuple)}")
-                if isinstance(fused_output, tuple):
-                    print(f"[FusedMoE.forward_native] fused_output is tuple, len={len(fused_output)}")
             if self.zero_expert_num is not None and self.zero_expert_num > 0:
                 assert isinstance(fused_output, tuple)
                 fused_output, zero_expert_result = fused_output
@@ -1726,7 +1722,6 @@ class FusedMoE(CustomOp):
                 # if it was compiled with zero_expert_num > 0, even though
                 # zero_expert_num is now 0 at runtime. Unpack the tuple if needed.
                 if isinstance(fused_output, tuple):
-                    print(f"[FusedMoE.forward_native] Defensive check: unpacking tuple in else branch (zero_expert_num={self.zero_expert_num})")
                     fused_output, _ = fused_output
                 return reduce_output(fused_output)[..., :og_hidden_states]
         else:
