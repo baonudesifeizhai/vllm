@@ -180,12 +180,6 @@ class ZeroExpertFusedMoE(FusedMoE):
             router_logits=router_logits_sliced,
         )
 
-        # Ensure fused_out is a single Tensor, not a tuple
-        # (torch.ops.vllm.moe_forward may return tuple if it sees zero_expert_num > 0
-        # at compile time, even though we temporarily set it to 0)
-        if isinstance(fused_out, tuple):
-            fused_out, _ = fused_out
-
         # Combine results
         # Both zero_expert_result and fused_out are computed from the same hidden_states,
         # so they should be on the same device. No device alignment needed.
