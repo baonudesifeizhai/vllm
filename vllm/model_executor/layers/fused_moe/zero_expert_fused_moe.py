@@ -101,7 +101,7 @@ class ZeroExpertFusedMoE(FusedMoE):
             expert_indices=topk_ids.clone(),
             expert_scales=topk_weights.clone(),
             num_experts=self.logical_num_experts,
-            zero_expert_type=self.zero_expert_type,
+            zero_expert_type=self._actual_zero_expert_type,
             hidden_states=hidden_states,
         )
 

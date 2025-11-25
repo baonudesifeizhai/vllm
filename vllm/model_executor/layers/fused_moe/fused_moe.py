@@ -780,12 +780,6 @@ def zero_experts_compute_triton(
     zero_expert_type: str,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor:
-    # Ensure all inputs are on the same device as hidden_states
-    # (important for expert parallel where tensors may be on different devices)
-    target_device = hidden_states.device
-    expert_indices = expert_indices.to(device=target_device)
-    expert_scales = expert_scales.to(device=target_device)
-
     N = expert_indices.numel()
     top_k = expert_indices.size(-1)
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
