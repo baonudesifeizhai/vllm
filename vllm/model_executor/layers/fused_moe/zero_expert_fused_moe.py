@@ -136,10 +136,12 @@ class ZeroExpertFusedMoE(FusedMoE):
         # Compute routing once (using full logits to include zero experts)
         # This ensures zero experts can be properly identified in topk_ids
         # select_experts now returns (topk_weights, topk_ids, zero_expert_result)
+        print(f"[ZeroExpertFusedMoE.forward] Before select_experts: zero_expert_num={self.zero_expert_num}")
         topk_weights, topk_ids, zero_expert_result = self.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,  # Full logits (includes zero experts)
         )
+        print(f"[ZeroExpertFusedMoE.forward] After select_experts: zero_expert_result is None: {zero_expert_result is None}")
 
         # Restore custom_routing_function for reuse in super().forward()
         object.__setattr__(self, "custom_routing_function", original_custom_routing_function)
@@ -157,7 +159,9 @@ class ZeroExpertFusedMoE(FusedMoE):
         # Temporarily set zero_expert_num to 0 to prevent FusedMoE from
         # trying to handle zero experts (we handle them ourselves)
         original_zero_expert_num = self.zero_expert_num
+        print(f"[ZeroExpertFusedMoE.forward] Before super().forward(): original_zero_expert_num={original_zero_expert_num}, setting to 0")
         object.__setattr__(self, "zero_expert_num", 0)
+        print(f"[ZeroExpertFusedMoE.forward] After setting zero_expert_num=0: self.zero_expert_num={self.zero_expert_num}")
 
         # Compute real expert results (will reuse memoized routing via
         # custom_routing_function)
@@ -165,6 +169,9 @@ class ZeroExpertFusedMoE(FusedMoE):
             hidden_states=hidden_states,
             router_logits=router_logits_sliced,
         )
+        print(f"[ZeroExpertFusedMoE.forward] After super().forward(): fused_out type={type(fused_out)}, is_tuple={isinstance(fused_out, tuple)}")
+        if isinstance(fused_out, tuple):
+            print(f"[ZeroExpertFusedMoE.forward] fused_out is tuple, len={len(fused_out)}")
 
         # Restore original zero_expert_num
         object.__setattr__(self, "zero_expert_num", original_zero_expert_num)
@@ -173,6 +180,7 @@ class ZeroExpertFusedMoE(FusedMoE):
         # (torch.ops.vllm.moe_forward may return tuple if it sees zero_expert_num > 0
         # at compile time, even though we temporarily set it to 0)
         if isinstance(fused_out, tuple):
+            print(f"[ZeroExpertFusedMoE.forward] Unpacking tuple: fused_out[0].shape={fused_out[0].shape if len(fused_out) > 0 else 'N/A'}")
             fused_out, _ = fused_out
 
         # Combine results
