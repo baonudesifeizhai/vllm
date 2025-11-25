@@ -1718,6 +1718,11 @@ class FusedMoE(CustomOp):
                     ..., :og_hidden_states
                 ]
             else:
+                # Defensive check: torch.ops.vllm.moe_forward may return tuple
+                # if it was compiled with zero_expert_num > 0, even though
+                # zero_expert_num is now 0 at runtime. Unpack the tuple if needed.
+                if isinstance(fused_output, tuple):
+                    fused_output, _ = fused_output
                 return reduce_output(fused_output)[..., :og_hidden_states]
         else:
             if current_platform.is_tpu():
@@ -2024,6 +2029,11 @@ class FusedMoE(CustomOp):
                 assert isinstance(final_hidden_states, torch.Tensor)
                 return (combine_output(final_hidden_states), zero_expert_result)
             else:
+                # Defensive check: quant_method.apply may return tuple
+                # if it was compiled with zero_expert_num > 0, even though
+                # zero_expert_num is now 0 at runtime. Unpack the tuple if needed.
+                if isinstance(final_hidden_states, tuple):
+                    final_hidden_states, _ = final_hidden_states
                 return combine_output(final_hidden_states)
 
     @classmethod
