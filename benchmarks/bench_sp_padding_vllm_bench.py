@@ -16,7 +16,6 @@ Configuration:
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -155,34 +154,6 @@ def run_vllm_bench_latency(
         return None
 
 
-def clear_compile_cache():
-    """Clear vLLM and torch compile caches to ensure fair comparison."""
-    import shutil
-    
-    # Clear vLLM compile cache
-    vllm_cache = os.path.expanduser("~/.cache/vllm")
-    if os.path.exists(vllm_cache):
-        try:
-            shutil.rmtree(vllm_cache)
-            print(f"Cleared vLLM compile cache: {vllm_cache}")
-        except Exception as e:
-            print(f"Warning: Could not clear vLLM cache: {e}")
-    
-    # Clear torch inductor cache (cross-platform)
-    user = os.getenv("USER", os.getenv("USERNAME", "user"))
-    if sys.platform == "win32":
-        torch_cache = os.path.join(os.getenv("TEMP", os.getenv("TMP", "/tmp")), f"torchinductor_{user}")
-    else:
-        torch_cache = os.path.expanduser(f"/tmp/torchinductor_{user}")
-    
-    if os.path.exists(torch_cache):
-        try:
-            shutil.rmtree(torch_cache)
-            print(f"Cleared torch inductor cache: {torch_cache}")
-        except Exception as e:
-            print(f"Warning: Could not clear torch cache: {e}")
-
-
 def run_test_pair(
     model: str,
     input_len_base: int,
@@ -194,7 +165,6 @@ def run_test_pair(
     load_format: str = "auto",
     output_dir: str = "bench_results",
     gpu_memory_utilization: float = 0.85,
-    clear_cache: bool = False,
     **extra_args
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
     """Run a test pair: base vs base+1 token counts."""
@@ -202,11 +172,6 @@ def run_test_pair(
     output_dir_path.mkdir(exist_ok=True, parents=True)
     
     model_safe = model.replace("/", "_").replace("-", "_")
-    
-    # Clear cache before first run if requested
-    if clear_cache:
-        print("\nClearing compile caches before benchmark...")
-        clear_compile_cache()
     
     # Test base (e.g., 1024)
     base_json = output_dir_path / f"{model_safe}_len{input_len_base}.json"
@@ -223,11 +188,6 @@ def run_test_pair(
         gpu_memory_utilization=gpu_memory_utilization,
         **extra_args
     )
-    
-    # Clear cache before second run to ensure fair comparison
-    if clear_cache:
-        print("\nClearing compile caches before second benchmark...")
-        clear_compile_cache()
     
     # Test base+1 (e.g., 1025)
     base_plus_one_json = output_dir_path / f"{model_safe}_len{input_len_base + 1}.json"
@@ -321,11 +281,6 @@ def main():
         action="store_true",
         help="Run all test cases from #27700 feedback"
     )
-    parser.add_argument(
-        "--clear-cache",
-        action="store_true",
-        help="Clear compile cache before each benchmark run (ensures fair comparison)"
-    )
     
     args = parser.parse_args()
     
@@ -364,7 +319,6 @@ def main():
                 load_format=args.load_format,
                 output_dir=args.output_dir,
                 gpu_memory_utilization=args.gpu_memory_utilization,
-                clear_cache=args.clear_cache,
             )
             
             if result_base and result_base_plus_one:
@@ -435,7 +389,6 @@ def main():
                 enforce_eager=args.enforce_eager,
                 load_format=args.load_format,
                 output_dir=args.output_dir,
-                clear_cache=args.clear_cache,
             )
             
             if result_base and result_base_plus_one:
