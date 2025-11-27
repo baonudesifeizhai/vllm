@@ -34,6 +34,7 @@ def run_vllm_bench_latency(
     enforce_eager: bool = False,
     load_format: str = "auto",
     output_json: Optional[str] = None,
+    gpu_memory_utilization: float = 0.95,
     **extra_args
 ) -> Optional[Dict]:
     """Run vllm bench latency and parse results."""
@@ -46,6 +47,7 @@ def run_vllm_bench_latency(
         "--output-len", str(output_len),
         "--batch-size", str(batch_size),
         "--tensor-parallel-size", str(tensor_parallel_size),
+        "--gpu-memory-utilization", str(gpu_memory_utilization),
         "--num-iters", str(num_iters),
         "--num-iters-warmup", str(num_iters_warmup),
         "--load-format", load_format,
@@ -162,6 +164,7 @@ def run_test_pair(
     enforce_eager: bool = False,
     load_format: str = "auto",
     output_dir: str = "bench_results",
+    gpu_memory_utilization: float = 0.95,
     **extra_args
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
     """Run a test pair: base vs base+1 token counts."""
@@ -182,6 +185,7 @@ def run_test_pair(
         enforce_eager=enforce_eager,
         load_format=load_format,
         output_json=str(base_json),
+        gpu_memory_utilization=gpu_memory_utilization,
         **extra_args
     )
     
@@ -197,6 +201,7 @@ def run_test_pair(
         enforce_eager=enforce_eager,
         load_format=load_format,
         output_json=str(base_plus_one_json),
+        gpu_memory_utilization=gpu_memory_utilization,
         **extra_args
     )
     
@@ -260,6 +265,12 @@ def main():
         help="Model load format (auto, dummy, etc.)"
     )
     parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.95,
+        help="GPU memory utilization (default: 0.95 for 70B model on 8 A6000)"
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         default="bench_results",
@@ -307,6 +318,7 @@ def main():
                 enforce_eager=args.enforce_eager,
                 load_format=args.load_format,
                 output_dir=args.output_dir,
+                gpu_memory_utilization=args.gpu_memory_utilization,
             )
             
             if result_base and result_base_plus_one:
