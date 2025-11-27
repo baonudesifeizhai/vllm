@@ -262,7 +262,7 @@ def main():
     if args.run_all:
         # Test cases from #27700 feedback
         test_cases = [
-            ("meta-llama/Llama-3.1-70B-Instruct-FP8", 1024),
+            ("RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8", 1024),
             ("meta-llama/Llama-3.1-70B-Instruct", 1024),
             ("meta-llama/Llama-3.1-70B-Instruct", 512),
         ]
