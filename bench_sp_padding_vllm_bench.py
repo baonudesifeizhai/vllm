@@ -83,24 +83,38 @@ def run_vllm_bench_latency(
     sys.stdout.flush()
     
     try:
-        result = subprocess.run(
+        # Run with real-time output to stdout/stderr
+        # Also capture output for parsing
+        process = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            check=False
+            bufsize=1,
+            universal_newlines=True
         )
         
-        if result.returncode != 0:
-            print(f"ERROR: Command failed with return code {result.returncode}")
-            print(f"STDOUT:\n{result.stdout}")
-            print(f"STDERR:\n{result.stderr}")
+        # Collect output lines for parsing
+        output_lines = []
+        for line in process.stdout:
+            print(line, end='')  # Real-time output
+            sys.stdout.flush()
+            output_lines.append(line)
+        
+        process.wait()
+        returncode = process.returncode
+        stdout = ''.join(output_lines)
+        stderr = ''  # Combined with stdout
+        
+        if returncode != 0:
+            print(f"\nERROR: Command failed with return code {returncode}")
             return None
         
         # Parse output for avg latency
         avg_latency = None
         percentiles = {}
         
-        for line in result.stdout.split('\n'):
+        for line in output_lines:
             if "Avg latency:" in line:
                 try:
                     avg_latency = float(line.split(":")[1].strip().split()[0])
@@ -130,8 +144,8 @@ def run_vllm_bench_latency(
         return {
             "avg_latency": avg_latency,
             "percentiles": percentiles,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
+            "stdout": stdout,
+            "stderr": stderr,
         }
     except Exception as e:
         print(f"ERROR: Exception while running command: {e}")
