@@ -34,7 +34,7 @@ def run_vllm_bench_latency(
     enforce_eager: bool = False,
     load_format: str = "auto",
     output_json: Optional[str] = None,
-    gpu_memory_utilization: float = 0.95,
+    gpu_memory_utilization: float = 0.85,
     **extra_args
 ) -> Optional[Dict]:
     """Run vllm bench latency and parse results."""
@@ -164,7 +164,7 @@ def run_test_pair(
     enforce_eager: bool = False,
     load_format: str = "auto",
     output_dir: str = "bench_results",
-    gpu_memory_utilization: float = 0.95,
+    gpu_memory_utilization: float = 0.85,
     **extra_args
 ) -> Tuple[Optional[Dict], Optional[Dict]]:
     """Run a test pair: base vs base+1 token counts."""
@@ -267,8 +267,8 @@ def main():
     parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
-        default=0.95,
-        help="GPU memory utilization (default: 0.95 for 70B model on 8 A6000)"
+        default=0.85,
+        help="GPU memory utilization (default: 0.85, lower for CUDA graph capture)"
     )
     parser.add_argument(
         "--output-dir",
