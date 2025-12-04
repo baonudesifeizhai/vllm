@@ -342,18 +342,18 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         # This pass is therefore only applied when the sequence dimension is
         # concrete:
         # 1. In full-graph compilation mode (no Dynamo splitting ops are used).
-        #   For this case we always pad num_tokens to be a multiple of
-        #   tensor_parallel_size, so there's no need to check shape % tp_size == 0.
         # 2. For specific shape provided during compilation (e.g., from
-        #    `compile_sizes`), which must be divisible by the tensor-parallel
-        #    size.
+        #    `compile_sizes`).
+        #
+        # Note: We now support uneven distribution via reduce_scatterv/all_gatherv,
+        # so shape % tp_size == 0 is no longer required.
         if (
             not self.compilation_config.splitting_ops
             or self.compilation_config.use_inductor_graph_partition
         ):
             return True
-        tp_size = get_tensor_model_parallel_world_size()
-        return shape is not None and shape % tp_size == 0
+        # Allow any concrete shape (no longer require divisibility by tp_size)
+        return shape is not None
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph):
