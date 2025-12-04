@@ -362,6 +362,18 @@ def main(args: argparse.Namespace):
     # Initialize LLM
     engine_args = EngineArgs.from_cli_args(args)
 
+    # Force enable Sequence Parallelism if TP > 1
+    from vllm.config.compilation import PassConfig
+
+    if args.tensor_parallel_size > 1:
+        print(f"Force enabling Sequence Parallelism (TP={args.tensor_parallel_size})")
+        if engine_args.compilation_config is None:
+            engine_args.compilation_config = CompilationConfig()
+        if engine_args.compilation_config.pass_config is None:
+            engine_args.compilation_config.pass_config = PassConfig()
+        engine_args.compilation_config.pass_config.enable_sp = True
+        print("=" * 80)
+
     # FIX: 在 EngineArgs 对象上关掉 CUDAGraph，再 asdict
     if args.disable_cudagraph_for_profiling and args.enable_profiling:
         print("Note: Disabling CUDAGraph for accurate kernel profiling")
