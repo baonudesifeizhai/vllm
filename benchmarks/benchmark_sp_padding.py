@@ -26,7 +26,7 @@ import torch
 import torch.profiler
 
 from vllm import LLM, SamplingParams
-from vllm.config.compilation import CompilationConfig, CUDAGraphMode  # FIX: 提前导入
+from vllm.config.compilation import CompilationConfig, CUDAGraphMode
 from vllm.engine.arg_utils import EngineArgs
 
 
@@ -190,7 +190,7 @@ def run_benchmark(
         detokenize=False,
     )
 
-    # Warmup（包含 compile / graph capture）
+    # Warmup (includes compile and graph capture)
     for _ in range(warmup_iters):
         llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
 
@@ -203,7 +203,7 @@ def run_benchmark(
     profiler_result = None
 
     for iter_idx in range(measure_iters):
-        # 只在最后一次迭代做 profiling（避免把 compile 也录进去）
+        # Only profile in last iteration (avoid recording compile time)
         should_profile = (
             enable_profiling
             and iter_idx == measure_iters - 1
@@ -213,7 +213,7 @@ def run_benchmark(
         if should_profile:
             Path(profile_dir).mkdir(parents=True, exist_ok=True)
 
-            # 用 with，上下文里只跑一次 generate
+            # Use context manager, run generate once
             with torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -224,7 +224,7 @@ def run_benchmark(
                 with_stack=False,
                 with_flops=False,
             ) as prof:
-                # 计时 + 生成
+                # Time and generate
                 start_wall = time.perf_counter()
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -234,7 +234,7 @@ def run_benchmark(
                 torch.cuda.synchronize()
                 end_wall = time.perf_counter()
 
-                # profiler 这一步很重要
+                # Profiler step is important
                 prof.step()
 
             latency_cuda_ms = start_event.elapsed_time(end_event)
@@ -242,7 +242,7 @@ def run_benchmark(
             latencies_cuda.append(latency_cuda_ms)
             latencies_wall.append(latency_wall_ms)
 
-            # 导出 trace
+            # Export trace
             trace_file = f"{profile_dir}/trace_{num_tokens}tokens.json"
             try:
                 prof.export_chrome_trace(trace_file)
@@ -250,7 +250,7 @@ def run_benchmark(
             except Exception as e:
                 print(f"    Warning: Failed to export trace: {e}")
 
-            # 解析 kernel 统计
+            # Parse kernel stats
             try:
                 profiler_result = analyze_profiler_results(prof, num_tokens)
             except Exception as e:
@@ -258,7 +258,7 @@ def run_benchmark(
                 profiler_result = None
 
         else:
-            # 普通测时，不启用 profiler
+            # Normal timing, no profiler
             if torch.cuda.is_available():
                 start_wall = time.perf_counter()
                 start_event = torch.cuda.Event(enable_timing=True)
@@ -281,7 +281,7 @@ def run_benchmark(
                 latencies_cuda.append(latency_ms)
                 latencies_wall.append(latency_ms)
 
-    # 用 wall time 做主要分析（方便看 compile + runtime 整体差异）
+    # Use wall time for main analysis (easier to see compile + runtime diff)
     latencies = np.array(latencies_wall)
     latencies_cuda_arr = np.array(latencies_cuda)
 
@@ -374,7 +374,7 @@ def main(args: argparse.Namespace):
         engine_args.compilation_config.pass_config.enable_sp = True
         print("=" * 80)
 
-    # FIX: 在 EngineArgs 对象上关掉 CUDAGraph，再 asdict
+    # FIX: Disable CUDAGraph on EngineArgs object before asdict
     if args.disable_cudagraph_for_profiling and args.enable_profiling:
         print("Note: Disabling CUDAGraph for accurate kernel profiling")
         if engine_args.compilation_config is None:

@@ -138,14 +138,6 @@ def reduce_scatter(
     size_along_dim = tensor.shape[dim]
     if size_along_dim % world_size != 0:
         # Use uneven distribution to avoid padding overhead
-        import os
-
-        if int(os.getenv("VLLM_TRACE_SP", "0")):
-            print(
-                f"[SP] reduce_scatter: size={size_along_dim}, "
-                f"ws={world_size}, using reduce_scatterv"
-            )
-
         base_chunk = size_along_dim // world_size
         remainder = size_along_dim % world_size
 
@@ -196,10 +188,6 @@ def all_gather(
         return group._all_gather_out_place(tensor, dim)
     else:
         # Uneven: use all_gatherv
-        import os
-
-        if int(os.getenv("VLLM_TRACE_SP", "0")):
-            print(f"[SP] all_gather: sizes={sizes}, using all_gatherv")
         total_size = sum(sizes)
         output_shape = list(tensor.shape)
         output_shape[dim] = total_size
@@ -614,7 +602,15 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.reduce_scatterv(input_, dim, sizes)
+
+        # Create output tensor based on this rank's size
+        rank = self.rank
+        output_shape = list(input_.shape)
+        output_shape[dim] = sizes[rank]
+        output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+
+        self.device_communicator.reduce_scatterv(output, input_, sizes)
+        return output
 
     def _reduce_scatter_out_place(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         if self.device_communicator is None:
