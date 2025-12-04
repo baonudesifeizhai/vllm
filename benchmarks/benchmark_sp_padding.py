@@ -131,14 +131,19 @@ def main():
     results = {}
     tp_size = args.tensor_parallel_size
 
-    for num_tokens in test_token_counts:
-        print(f"\nTesting {num_tokens} tokens...")
+    # Interleave tests to reduce caching effects
+    # Test each size multiple times in a mixed order
+    test_order = []
+    for _ in range(3):  # Repeat 3 times
+        test_order.extend(test_token_counts)
 
-        is_multiple = (num_tokens % tp_size) == 0
-        padding = (tp_size - (num_tokens % tp_size)) % tp_size
+    print("\nRunning tests in interleaved order (3 rounds)...")
+    print("=" * 80)
 
-        print(f"  Divisible by {tp_size}: {is_multiple}")
-        print(f"  Padding needed: {padding} tokens")
+    raw_results = {tokens: [] for tokens in test_token_counts}
+
+    for num_tokens in test_order:
+        print(f"\n[Round] Testing {num_tokens} tokens...")
 
         result = run_benchmark(
             llm=llm,
@@ -147,14 +152,32 @@ def main():
             warmup_iters=args.warmup_iters,
         )
 
+        raw_results[num_tokens].append(result["mean_ms"])
+        print(f"  Result: {result['mean_ms']:.2f} ms")
+
+    # Aggregate results
+    print("\n" + "=" * 80)
+    print("AGGREGATING RESULTS")
+    print("=" * 80)
+
+    for num_tokens in test_token_counts:
+        is_multiple = (num_tokens % tp_size) == 0
+        padding = (tp_size - (num_tokens % tp_size)) % tp_size
+
+        times = np.array(raw_results[num_tokens])
+
         results[num_tokens] = {
             "is_multiple": is_multiple,
             "padding": padding,
-            **result,
+            "mean_ms": float(np.mean(times)),
+            "std_ms": float(np.std(times)),
+            "min_ms": float(np.min(times)),
+            "max_ms": float(np.max(times)),
         }
 
-        print(f"  Mean: {result['mean_ms']:.2f} ms")
-        print(f"  Std:  {result['std_ms']:.2f} ms")
+        mean = results[num_tokens]["mean_ms"]
+        std = results[num_tokens]["std_ms"]
+        print(f"{num_tokens} tokens: {mean:.2f} ± {std:.2f} ms")
 
     # Analysis
     print("\n" + "=" * 80)
