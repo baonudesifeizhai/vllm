@@ -80,8 +80,8 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark SP padding overhead")
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1)
+
+    # Add benchmark-specific arguments first
     parser.add_argument(
         "--test-token-counts",
         type=str,
@@ -91,6 +91,7 @@ def main():
     parser.add_argument("--num-iters", type=int, default=10)
     parser.add_argument("--warmup-iters", type=int, default=3)
 
+    # Add EngineArgs (includes --model, --tensor-parallel-size, etc.)
     parser = EngineArgs.add_cli_args(parser)
     args = parser.parse_args()
 
