@@ -375,18 +375,23 @@ def main(args: argparse.Namespace):
     llm_kwargs = dataclasses.asdict(engine_args)
     llm = LLM(**llm_kwargs)
 
-    # Check SP status
+    # Check SP status from vllm_config
     sp_enabled = False
+    compilation_config = None
+    cudagraph_mode = None
+
     with contextlib.suppress(AttributeError):
-        config = llm.llm_engine.model_config.compilation_config
-        sp_enabled = config.pass_config.enable_sequence_parallelism
+        if hasattr(llm.llm_engine, "vllm_config"):
+            compilation_config = llm.llm_engine.vllm_config.compilation_config
+            if compilation_config and compilation_config.pass_config:
+                sp_enabled = compilation_config.pass_config.enable_sp or False
+            if compilation_config:
+                cudagraph_mode = compilation_config.cudagraph_mode
+
     print(f"Sequence Parallelism: {'ENABLED' if sp_enabled else 'DISABLED'}")
     print("=" * 80)
 
-    # Show CUDAGraph status（基于最终 config）
-    cudagraph_mode = getattr(
-        llm.llm_engine.model_config.compilation_config, "cudagraph_mode", None
-    )
+    # Show CUDAGraph status
     status = "DISABLED" if cudagraph_mode == CUDAGraphMode.NONE else "ENABLED"
     print(f"CUDAGraph: {status}")
     print("=" * 80)
