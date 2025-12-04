@@ -375,8 +375,8 @@ def main(args: argparse.Namespace):
         print("=" * 80)
 
     # FIX: Disable CUDAGraph on EngineArgs object before asdict
-    if args.disable_cudagraph_for_profiling and args.enable_profiling:
-        print("Note: Disabling CUDAGraph for accurate kernel profiling")
+    if args.disable_cudagraph_for_profiling:
+        print("Note: Disabling CUDAGraph for benchmark")
         if engine_args.compilation_config is None:
             engine_args.compilation_config = CompilationConfig(
                 cudagraph_mode=CUDAGraphMode.NONE
