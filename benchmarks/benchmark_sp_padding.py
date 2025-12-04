@@ -14,7 +14,6 @@ Usage:
         --num-iters 10
 """
 
-import argparse
 import time
 
 import numpy as np
@@ -23,6 +22,7 @@ import torch
 from vllm import LLM, SamplingParams
 from vllm.config.compilation import CompilationConfig, PassConfig
 from vllm.engine.arg_utils import EngineArgs
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 def run_benchmark(
@@ -79,7 +79,7 @@ def run_benchmark(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark SP padding overhead")
+    parser = FlexibleArgumentParser(description="Benchmark SP padding overhead")
 
     # Add benchmark-specific arguments first
     parser.add_argument(
