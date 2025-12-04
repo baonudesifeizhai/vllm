@@ -43,12 +43,17 @@ def run_benchmark(
         ignore_eos=True,
     )
 
-    # Warmup
+    # Warmup - more aggressive for stability
     for _ in range(warmup_iters):
         llm.generate(prompts, sampling_params=sampling_params, use_tqdm=False)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
+    # Additional sync before measurement
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+        # Clear any residual state
+        torch.cuda.empty_cache()
 
     # Measurement
     latencies = []
