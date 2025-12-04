@@ -133,7 +133,24 @@ def reduce_scatter(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._reduce_scatter_out_place(tensor, dim)
+
+    # Check if size is divisible by world_size
+    size_along_dim = tensor.shape[dim]
+    if size_along_dim % world_size != 0:
+        # Use uneven distribution to avoid padding overhead
+        base_chunk = size_along_dim // world_size
+        remainder = size_along_dim % world_size
+
+        # Distribute: first (world_size - remainder) ranks get base_chunk,
+        # last remainder ranks get (base_chunk + 1)
+        sizes = [base_chunk] * world_size
+        for i in range(remainder):
+            sizes[world_size - remainder + i] += 1
+
+        return group.reduce_scatterv(tensor, dim=dim, sizes=sizes)
+    else:
+        # Use efficient uniform reduce_scatter
+        return group._reduce_scatter_out_place(tensor, dim)
 
 
 def reduce_scatter_fake(
@@ -151,7 +168,34 @@ def all_gather(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
-    return group._all_gather_out_place(tensor, dim)
+
+    # Check if we need uneven distribution
+    # We need to infer sizes from the current rank's tensor size
+    my_size = tensor.shape[dim]
+
+    # Gather sizes from all ranks to determine if we need uneven distribution
+    size_tensor = torch.tensor([my_size], dtype=torch.long, device=tensor.device)
+    size_list = [
+        torch.zeros(1, dtype=torch.long, device=tensor.device)
+        for _ in range(world_size)
+    ]
+    torch.distributed.all_gather(size_list, size_tensor, group=group.device_group)
+    sizes = [int(s.item()) for s in size_list]
+
+    # Check if sizes are uniform
+    if len(set(sizes)) == 1:
+        # Uniform: use efficient all_gather
+        return group._all_gather_out_place(tensor, dim)
+    else:
+        # Uneven: use all_gatherv
+        total_size = sum(sizes)
+        output_shape = list(tensor.shape)
+        output_shape[dim] = total_size
+        output = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+        if group.device_communicator is None:
+            raise ValueError("No device communicator found")
+        group.device_communicator.all_gatherv(output, tensor, sizes, dim=dim)
+        return output
 
 
 def all_gather_fake(

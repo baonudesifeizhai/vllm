@@ -778,48 +778,27 @@ def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
 
+    # all_gather needs the sequence length to be divisible by tp_size
     seq_len = x.size(0)
-
-    # Use uneven distribution to avoid padding overhead
-    # This matches the reduce_scatterv implementation in parallel_state.py
-    base_chunk = seq_len // tp_size
     remainder = seq_len % tp_size
-
     if remainder != 0:
-        # Distribute: last remainder ranks get (base_chunk + 1)
-        if tp_rank >= tp_size - remainder:
-            chunk_size = base_chunk + 1
-            # Calculate offset for this rank
-            offset_before = (tp_size - remainder) * base_chunk
-            offset_within = (tp_rank - (tp_size - remainder)) * (base_chunk + 1)
-            start = offset_before + offset_within
-        else:
-            chunk_size = base_chunk
-            start = tp_rank * base_chunk
+        pad_len = tp_size - remainder
+        y = nn.functional.pad(x, (0, 0, 0, pad_len))
     else:
-        # Even distribution
-        chunk_size = base_chunk
-        start = tp_rank * base_chunk
+        y = x
 
-    return torch.narrow(x, 0, start, chunk_size)
+    chunk = y.shape[0] // tp_size
+    start = tp_rank * chunk
+    return torch.narrow(y, 0, start, chunk)
 
 
 def sequence_parallel_chunk_impl_fake(x: torch.Tensor) -> torch.Tensor:
+    from vllm.utils.math_utils import cdiv
+
     tp_size = get_tensor_model_parallel_world_size()
-    tp_rank = get_tensor_model_parallel_rank()
-
-    seq_len = x.size(0)
-    base_chunk = seq_len // tp_size
-    remainder = seq_len % tp_size
-
-    # Calculate this rank's chunk size
-    if remainder != 0 and tp_rank >= tp_size - remainder:
-        chunk_size = base_chunk + 1
-    else:
-        chunk_size = base_chunk
-
+    seq_len = cdiv(x.size(0), tp_size)
     shape = list(x.shape)
-    shape[0] = chunk_size
+    shape[0] = seq_len
     out = torch.empty(shape, dtype=x.dtype, device=x.device)
     return out
 
