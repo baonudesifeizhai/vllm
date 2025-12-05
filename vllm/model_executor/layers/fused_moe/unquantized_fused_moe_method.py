@@ -405,14 +405,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         else:
             return result
 
-    @staticmethod
-    def _combine_zero_expert(
-        result: torch.Tensor, zero_expert_result: torch.Tensor | None
-    ) -> torch.Tensor:
-        if zero_expert_result is not None:
-            result = result + zero_expert_result
-        return result
-
     def forward_cpu(
         self,
         layer: "FusedMoE",  # type: ignore[name-defined] # noqa: F821

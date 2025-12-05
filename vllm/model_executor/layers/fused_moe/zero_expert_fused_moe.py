@@ -65,8 +65,8 @@ class ZeroExpertFusedMoE(FusedMoE):
 
         # Expose zero_expert_num and zero_expert_type as attributes for
         # compatibility with quantization methods that check these attributes
-        self.zero_expert_num = zero_expert_num
-        self.zero_expert_type = zero_expert_type
+        self.zero_expert_num = 0
+        self.zero_expert_type = None
 
         # Memoization state for routing results
         self._memoized_topk_weights: torch.Tensor | None = None
