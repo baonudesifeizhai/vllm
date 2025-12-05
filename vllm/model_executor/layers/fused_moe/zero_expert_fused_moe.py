@@ -172,13 +172,15 @@ class ZeroExpertFusedMoE(FusedMoE):
         # Slice router_logits for real experts only
         router_logits_sliced = router_logits[..., : self.logical_num_experts]
 
-        # Compute real expert results (will reuse memoized routing via
-        # custom_routing_function)
-        # zero_expert_num is already 0, so FusedMoE won't handle zero experts
-        fused_out = super().forward(
-            hidden_states=hidden_states,
-            router_logits=router_logits_sliced,
-        )
+        # Temporarily set zero_expert_num=0 so that quantization methods
+        # don't return tuple (ZeroExpertFusedMoE handles zero experts itself)
+        with self._temporarily_set_attrs(zero_expert_num=0, zero_expert_type=None):
+            # Compute real expert results (will reuse memoized routing via
+            # custom_routing_function)
+            fused_out = super().forward(
+                hidden_states=hidden_states,
+                router_logits=router_logits_sliced,
+            )
 
         # Combine results
         # Both zero_expert_result and fused_out are computed from the same
