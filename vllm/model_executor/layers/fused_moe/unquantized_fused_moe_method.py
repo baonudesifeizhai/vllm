@@ -393,6 +393,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 expert_map=expert_map,
             )
 
+        # ZeroExpertFusedMoE handles zero experts itself; always return Tensor.
+        if hasattr(layer, "_actual_zero_expert_num"):
+            return self._combine_zero_expert(result, zero_expert_result)
+
         if layer.zero_expert_num != 0 and layer.zero_expert_type is not None:
             assert not isinstance(result, tuple), (
                 "Shared + zero experts are mutually exclusive not yet supported"
@@ -400,6 +404,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             return result, zero_expert_result
         else:
             return result
+
+    @staticmethod
+    def _combine_zero_expert(
+        result: torch.Tensor, zero_expert_result: torch.Tensor | None
+    ) -> torch.Tensor:
+        if zero_expert_result is not None:
+            result = result + zero_expert_result
+        return result
 
     def forward_cpu(
         self,

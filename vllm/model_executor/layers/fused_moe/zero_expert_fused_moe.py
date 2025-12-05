@@ -96,14 +96,17 @@ class ZeroExpertFusedMoE(FusedMoE):
         sets the attribute without triggering nn.Module's custom __setattr__,
         allowing Dynamo to trace the code successfully.
         """
-        originals = {key: getattr(self, key) for key in attrs}
+        originals = {key: getattr(self, key, None) for key in attrs}
         try:
             for key, value in attrs.items():
                 object.__setattr__(self, key, value)
             yield
         finally:
-            for key, value in originals.items():
-                object.__setattr__(self, key, value)
+            for key, original_value in originals.items():
+                if original_value is not None:
+                    object.__setattr__(self, key, original_value)
+                elif hasattr(self, key):
+                    delattr(self, key)
 
     def _compute_zero_expert_result(
         self,
@@ -172,15 +175,13 @@ class ZeroExpertFusedMoE(FusedMoE):
         # Slice router_logits for real experts only
         router_logits_sliced = router_logits[..., : self.logical_num_experts]
 
-        # Temporarily set zero_expert_num=0 so that quantization methods
-        # don't return tuple (ZeroExpertFusedMoE handles zero experts itself)
-        with self._temporarily_set_attrs(zero_expert_num=0, zero_expert_type=None):
-            # Compute real expert results (will reuse memoized routing via
-            # custom_routing_function)
-            fused_out = super().forward(
-                hidden_states=hidden_states,
-                router_logits=router_logits_sliced,
-            )
+        # Compute real expert results (will reuse memoized routing via
+        # custom_routing_function)
+        # zero_expert_num is already 0, so FusedMoE won't handle zero experts
+        fused_out = super().forward(
+            hidden_states=hidden_states,
+            router_logits=router_logits_sliced,
+        )
 
         # Combine results
         # Both zero_expert_result and fused_out are computed from the same
