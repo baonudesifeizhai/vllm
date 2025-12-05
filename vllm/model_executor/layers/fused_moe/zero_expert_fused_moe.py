@@ -63,6 +63,11 @@ class ZeroExpertFusedMoE(FusedMoE):
         self._actual_zero_expert_type = zero_expert_type
         self._router = router  # Full router (includes zero experts)
 
+        # Expose zero_expert_num and zero_expert_type as attributes for
+        # compatibility with quantization methods that check these attributes
+        self.zero_expert_num = zero_expert_num
+        self.zero_expert_type = zero_expert_type
+
         # Memoization state for routing results
         self._memoized_topk_weights: torch.Tensor | None = None
         self._memoized_topk_ids: torch.Tensor | None = None
