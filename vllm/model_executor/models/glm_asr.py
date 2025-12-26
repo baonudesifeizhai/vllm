@@ -13,7 +13,12 @@ from transformers import BatchFeature, WhisperFeatureExtractor
 
 from vllm.attention.backends.abstract import AttentionType
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
-from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
+from vllm.config import (
+    ModelConfig,
+    SpeechToTextConfig,
+    VllmConfig,
+    get_current_vllm_config,
+)
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
@@ -173,6 +178,11 @@ class GlmAsrEncoderLayer(nn.Module):
         # Replace internal Attention with EncoderOnlyAttention for KV cache handling.
         # EncoderOnlyAttention implements AttentionLayerBase and returns None from
         # get_kv_cache_spec.
+        # Remove old Attention registration before creating new one.
+        attn_prefix = f"{prefix}.self_attn.attn"
+        compilation_config = get_current_vllm_config().compilation_config
+        if attn_prefix in compilation_config.static_forward_context:
+            del compilation_config.static_forward_context[attn_prefix]
         self.self_attn.attn = EncoderOnlyAttention(
             num_heads=self.self_attn.num_heads,
             head_size=self.self_attn.head_dim,
@@ -180,7 +190,7 @@ class GlmAsrEncoderLayer(nn.Module):
             num_kv_heads=self.self_attn.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            prefix=f"{prefix}.self_attn.attn",
+            prefix=attn_prefix,
             attn_type=AttentionType.ENCODER_ONLY,
         )
 
