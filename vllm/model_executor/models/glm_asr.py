@@ -699,7 +699,14 @@ class GlmAsrForConditionalGeneration(
     def get_audio_features(
         self, input_features: torch.Tensor, input_features_mask: torch.Tensor
     ) -> torch.Tensor:
-        audio_outputs = self.audio_encoder(input_features)
+        # Convert Tensor to list[torch.Tensor] for audio_encoder
+        if isinstance(input_features, torch.Tensor):
+            input_features_list = [
+                input_features[i] for i in range(input_features.shape[0])
+            ]
+        else:
+            input_features_list = input_features
+        audio_outputs = self.audio_encoder(input_features_list)
         batch_size = audio_outputs.shape[0]
         audio_hidden_states = audio_outputs.reshape(
             batch_size, -1, self.config.audio_config.intermediate_size
@@ -750,6 +757,16 @@ class GlmAsrForConditionalGeneration(
             ]
             input_features = torch.stack(padded_features)
             input_features_mask = torch.stack(masks)
+        elif input_features_mask is None:
+            # Create default mask if input_features is Tensor but mask is None
+            # (e.g., during profiling)
+            # input_features shape: (batch_size, n_mels, seq_len)
+            # input_features_mask shape: (batch_size, seq_len)
+            batch_size = input_features.shape[0]
+            seq_len = input_features.shape[-1]  # Last dimension is seq_len
+            input_features_mask = torch.ones(
+                (batch_size, seq_len), dtype=torch.bool, device=input_features.device
+            )
 
         audio_embeds = self.get_audio_features(input_features, input_features_mask)
 
