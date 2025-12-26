@@ -236,7 +236,7 @@ class GlmAsrEncoder(nn.Module):
             lambda prefix: GlmAsrEncoderLayer(
                 vllm_config=vllm_config,
                 audio_config=audio_config,
-                prefix=f"{prefix}.layers",
+                prefix=prefix,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -258,9 +258,10 @@ class GlmAsrEncoder(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            # Remove "layers." prefix if present (AutoWeightsLoader passes it)
-            if name.startswith("layers."):
-                name = name[len("layers.") :]
+            # AutoWeightsLoader passes weights with module prefix removed
+            # For encoder layers, weights come as "layers.0.mlp.fc1.weight"
+            # and params_dict keys are "layers.0.mlp.gate_up_proj.weight"
+            # So we keep the name as-is
 
             # Handle fc1: load twice into gate_up_proj
             if ".mlp.fc1" in name and not name.endswith(".bias"):
@@ -497,7 +498,10 @@ class GlmAsrForConditionalGeneration(
             "multi_modal_projector.": "projector.",
         },
         orig_to_new_substr={
+            ".input_layernorm": ".norm1",
+            ".post_attention_layernorm": ".norm2",
             ".linear_1": ".linear",
+            ".linear_2": None,  # Ignore linear_2 if not used in vLLM
             ".mlp.fc2": ".mlp.down_proj",
             ".bias": None,  # Ignore bias weights that don't exist in vLLM
         },
