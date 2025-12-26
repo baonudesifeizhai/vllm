@@ -30,7 +30,11 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
+from vllm.multimodal.parse import (
+    AudioProcessorItems,
+    MultiModalDataItems,
+    MultiModalDataParser,
+)
 from vllm.multimodal.processing import (
     BaseMultiModalProcessor,
     BaseProcessingInfo,
@@ -334,13 +338,13 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         audio_token = getattr(processor, "audio_token", "<|pad|>")
         audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
 
+        audios = mm_items.get_items("audio", AudioProcessorItems)
         audio_lengths = []
-        for item in mm_items:
-            if item.modality == "audio":
-                audio_array = _extract_audio_array(item.data)
-                audio_lengths.append(
-                    math.ceil(len(audio_array) / feature_extractor.hop_length)
-                )
+        for i in range(len(audios)):
+            audio_array = audios.get(i)
+            audio_lengths.append(
+                math.ceil(len(audio_array) / feature_extractor.hop_length)
+            )
 
         num_tokens = (
             self.info.get_num_audio_tokens(torch.tensor(audio_lengths))
@@ -349,15 +353,14 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         )
 
         updates = []
-        for i, item in enumerate(mm_items):
-            if item.modality == "audio":
-                updates.append(
-                    PromptReplacement(
-                        modality="audio",
-                        target=[audio_token_id],
-                        replacement=[audio_token_id] * num_tokens[i].item(),
-                    )
+        for i in range(len(audios)):
+            updates.append(
+                PromptReplacement(
+                    modality="audio",
+                    target=[audio_token_id],
+                    replacement=[audio_token_id] * num_tokens[i].item(),
                 )
+            )
         return updates
 
 
