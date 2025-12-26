@@ -302,9 +302,15 @@ class GlmAsrEncoder(nn.Module):
                 break
 
             if not matched:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
+                # Skip bias only for encoder layers (RMSNorm doesn't have bias)
+                # Keep bias for layer_norm and conv layers
+                if name.endswith(".bias"):
+                    if "layers." in name and name not in params_dict:
+                        # Encoder layer bias (RMSNorm) - skip
+                        continue
+                    # layer_norm.bias or conv.bias - try to load
+                    if name not in params_dict:
+                        continue
 
                 if name not in params_dict:
                     continue
@@ -528,8 +534,7 @@ class GlmAsrForConditionalGeneration(
             # Projector mappings (safe, won't affect language_model)
             ".linear_1": ".linear",
             ".linear_2": None,
-            # Global mappings
-            ".bias": None,  # Ignore bias weights that don't exist in vLLM
+            # Don't ignore bias globally - let submodules handle it
         },
     )
 
@@ -729,5 +734,12 @@ class GlmAsrForConditionalGeneration(
         Submodules (audio_encoder, projector) handle their own mappings
         in their load_weights methods.
         """
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_suffixes=[
+                # GLM4-specific layer norms that may not exist in HF checkpoint
+                ".post_self_attn_layernorm.weight",
+                ".post_mlp_layernorm.weight",
+            ],
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
