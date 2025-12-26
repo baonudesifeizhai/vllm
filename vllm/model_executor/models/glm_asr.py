@@ -174,9 +174,7 @@ class GlmAsrEncoderAttention(EncoderOnlyAttention):
             value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
 
         # Compute attention scores
-        scale = (
-            self.scale if self.scale is not None else 1.0 / math.sqrt(self.head_size)
-        )
+        scale = 1.0 / math.sqrt(self.head_size)
         attn_scores = torch.einsum("thd,khd->hkt", query, key) * scale
         attn_probs = torch.softmax(attn_scores, dim=-1)
         attn_output = torch.einsum("hkt,khd->thd", attn_probs, value)
