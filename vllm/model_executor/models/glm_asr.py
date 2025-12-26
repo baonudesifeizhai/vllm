@@ -498,6 +498,10 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
+        # Return empty updates if no audio items (e.g., during profiling)
+        if "audio" not in mm_items:
+            return []
+
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer(**hf_processor_mm_kwargs)
