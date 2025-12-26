@@ -626,6 +626,14 @@ class GlmAsrForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Map fc1/fc2 to gate_up_proj/down_proj for encoder MLP
+        mlp_mapper = WeightsMapper(
+            orig_to_new_substr={
+                ".mlp.fc1": ".mlp.gate_up_proj",
+                ".mlp.fc2": ".mlp.down_proj",
+            }
+        )
+        combined_mapper = self.hf_to_vllm_mapper | mlp_mapper
         return AutoWeightsLoader(
             self, ignore_unexpected_suffixes=[".bias"]
-        ).load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        ).load_weights(weights, mapper=combined_mapper)
