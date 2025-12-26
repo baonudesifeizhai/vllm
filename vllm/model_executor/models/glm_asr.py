@@ -630,6 +630,16 @@ class GlmAsrForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        stacked_params_mapping = [
+            # Encoder attention: q/k/v_proj -> qkv_proj
+            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+            # Encoder MLP: fc1 -> gate_up_proj (load twice)
+            (".mlp.gate_up_proj", ".mlp.fc1", 0),  # gate
+            (".mlp.gate_up_proj", ".mlp.fc1", 1),  # up
+        ]
+
         weights = list(self.hf_to_vllm_mapper.apply(weights))
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -639,20 +649,29 @@ class GlmAsrForConditionalGeneration(
             if name.endswith(".bias"):
                 continue
 
-            # Handle fc1: load twice into gate_up_proj (gate and up)
+            # Handle fc1: load twice into gate_up_proj
             if ".mlp.fc1" in name:
                 gate_up_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
-                if gate_up_name in params_dict:
-                    param = params_dict[gate_up_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, weight, loaded_shard_id=0)
-                    weight_loader(param, weight, loaded_shard_id=1)
-                    loaded_params.add(gate_up_name)
+                param = params_dict[gate_up_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight, loaded_shard_id=0)
+                weight_loader(param, weight, loaded_shard_id=1)
+                loaded_params.add(gate_up_name)
                 continue
 
-            remaining_weights.append((name, weight))
+            # Handle QKV and other stacked params
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                new_name = name.replace(weight_name, param_name)
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, weight, loaded_shard_id=shard_id)
+                loaded_params.add(new_name)
+                break
+            else:
+                remaining_weights.append((name, weight))
 
         loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
         loaded_params.update(loader.load_weights(remaining_weights))
