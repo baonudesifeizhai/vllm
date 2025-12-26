@@ -160,10 +160,12 @@ class GlmAsrEncoderAttention(EncoderOnlyAttention):
             return super().forward(query, key, value, output_shape)
 
         # Profiling phase: forward context not set, use direct implementation
+        # Reshape query, key, value from (batch_size, seq_len, hidden_size) or
+        # (seq_len, hidden_size) to (num_tokens, num_heads, head_size)
+        query = query.view(-1, self.num_heads, self.head_size)
+        key = key.view(-1, self.num_kv_heads, self.head_size)
+        value = value.view(-1, self.num_kv_heads, self.head_size)
         num_tokens = query.shape[0]
-        query = query.view(num_tokens, self.num_heads, self.head_size)
-        key = key.view(num_tokens, self.num_kv_heads, self.head_size)
-        value = value.view(num_tokens, self.num_kv_heads, self.head_size)
 
         # Handle GQA
         num_queries_per_kv = self.num_heads // self.num_kv_heads
