@@ -240,7 +240,7 @@ class GlmAsrEncoder(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.layer_norm = nn.LayerNorm(embed_dim)
+        # Note: HuggingFace GLM-ASR encoder doesn't have a final layer_norm
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for encoder, handling QKV fusion and fc1 duplication."""
@@ -348,7 +348,8 @@ class GlmAsrEncoder(nn.Module):
         )
         for layer in self.layers:
             hidden_states = layer(hidden_states, positions)
-        return self.layer_norm(hidden_states)
+        # HuggingFace GLM-ASR encoder doesn't have a final layer_norm
+        return hidden_states
 
 
 class GlmAsrProjector(nn.Module):
@@ -734,12 +735,16 @@ class GlmAsrForConditionalGeneration(
         Submodules (audio_encoder, projector) handle their own mappings
         in their load_weights methods.
         """
-        loader = AutoWeightsLoader(
-            self,
-            ignore_unexpected_suffixes=[
-                # GLM4-specific layer norms that may not exist in HF checkpoint
-                ".post_self_attn_layernorm.weight",
-                ".post_mlp_layernorm.weight",
-            ],
-        )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loader = AutoWeightsLoader(self)
+        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+        # Add weights that use default initialization (not in HF checkpoint)
+        # GLM4-specific layer norms that don't exist in HF checkpoint
+        all_params = {name for name, _ in self.named_parameters()}
+        for param_name in all_params:
+            if ".post_self_attn_layernorm.weight" in param_name:
+                loaded_weights.add(param_name)
+            if ".post_mlp_layernorm.weight" in param_name:
+                loaded_weights.add(param_name)
+
+        return loaded_weights
