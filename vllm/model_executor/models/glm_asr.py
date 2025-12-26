@@ -268,73 +268,66 @@ class GlmAsrEncoder(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for encoder, handling QKV fusion and fc1 duplication."""
-        stacked_params_mapping = [
-            # Encoder attention: q/k/v_proj -> qkv_proj
+        # Name mappings: HF -> vLLM
+        name_mappings = {
+            ".input_layernorm": ".norm1",
+            ".post_attention_layernorm": ".norm2",
+            ".mlp.fc2": ".mlp.down_proj",
+        }
+        # Stacked params: (vllm_param, hf_weight, shard_id)
+        stacked_params = [
             (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
             (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
             (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            # Encoder MLP: fc1 -> gate_up_proj (load twice)
-            (".mlp.gate_up_proj", ".mlp.fc1", 0),  # gate
-            (".mlp.gate_up_proj", ".mlp.fc1", 1),  # up
         ]
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
-            # AutoWeightsLoader passes weights with module prefix removed
-            # For encoder layers, weights come as "layers.0.mlp.fc1.weight"
-            # and params_dict keys are "layers.0.mlp.gate_up_proj.weight"
+            # Apply name mappings
+            for old, new in name_mappings.items():
+                name = name.replace(old, new)
 
-            # Apply encoder-specific mappings
-            name = name.replace(".input_layernorm", ".norm1")
-            name = name.replace(".post_attention_layernorm", ".norm2")
-            name = name.replace(".mlp.fc2", ".mlp.down_proj")
-
-            # Handle fc1: load twice into gate_up_proj
+            # Special case: fc1 -> gate_up_proj (load twice)
             if ".mlp.fc1" in name and not name.endswith(".bias"):
-                gate_up_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
-                if gate_up_name in params_dict:
-                    param = params_dict[gate_up_name]
+                vllm_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
+                if vllm_name in params_dict:
+                    param = params_dict[vllm_name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight, loaded_shard_id=0)
                     weight_loader(param, loaded_weight, loaded_shard_id=1)
-                    loaded_params.add(gate_up_name)
+                    loaded_params.add(vllm_name)
                     continue
 
-            # Handle QKV and other stacked params
+            # Handle stacked params (QKV fusion)
             matched = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+            for vllm_param, hf_weight, shard_id in stacked_params:
+                if hf_weight not in name:
                     continue
 
-                new_name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if new_name.endswith(".bias") and new_name not in params_dict:
+                vllm_name = name.replace(hf_weight, vllm_param)
+                if vllm_name not in params_dict:
                     continue
 
-                if new_name not in params_dict:
-                    continue
-
-                param = params_dict[new_name]
+                param = params_dict[vllm_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(new_name)
+                loaded_params.add(vllm_name)
                 matched = True
                 break
 
+            # Handle regular params
             if not matched:
-                # Skip bias only for encoder layers (RMSNorm doesn't have bias)
-                # Keep bias for layer_norm and conv layers
-                if name.endswith(".bias"):
-                    if "layers." in name and name not in params_dict:
-                        # Encoder layer bias (RMSNorm) - skip
-                        continue
-                    # layer_norm.bias or conv.bias - try to load
-                    if name not in params_dict:
-                        continue
+                # Skip RMSNorm bias (encoder layers), but keep conv/layer_norm bias
+                if (
+                    name.endswith(".bias")
+                    and "layers." in name
+                    and name not in params_dict
+                ):
+                    continue  # RMSNorm has no bias
 
                 if name not in params_dict:
                     continue
@@ -744,14 +737,11 @@ class GlmAsrForConditionalGeneration(
     ) -> GlmAsrAudioInputs | None:
         input_features = kwargs.pop("input_features", None)
         input_features_mask = kwargs.pop("input_features_mask", None)
-        if input_features:
-            input_features = json_map_leaves(lambda x: x.to(self.dtype), input_features)
-        return (
-            GlmAsrAudioInputs(
-                input_features=input_features, input_features_mask=input_features_mask
-            )
-            if input_features
-            else None
+        if input_features is None:
+            return None
+        input_features = json_map_leaves(lambda x: x.to(self.dtype), input_features)
+        return GlmAsrAudioInputs(
+            input_features=input_features, input_features_mask=input_features_mask
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
