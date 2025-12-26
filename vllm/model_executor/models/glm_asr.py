@@ -53,6 +53,7 @@ from vllm.multimodal.processing import (
     PromptUpdate,
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
+from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm.utils.jsontree import json_map_leaves
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
@@ -723,12 +724,18 @@ class GlmAsrForConditionalGeneration(
         return audio_embeds[valid_mask]
 
     def forward(
-        self, input_ids: torch.Tensor, positions: torch.Tensor, **kwargs
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         return self.language_model.model(
             input_ids=input_ids,
             positions=positions,
-            inputs_embeds=kwargs.get("inputs_embeds"),
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
         )
 
     def get_language_model(self) -> torch.nn.Module:
