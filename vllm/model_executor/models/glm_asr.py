@@ -12,6 +12,7 @@ from torch import nn
 from transformers import BatchFeature, WhisperFeatureExtractor
 
 from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs.data import PromptType
@@ -168,6 +169,19 @@ class GlmAsrEncoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
             attn_type=AttentionType.ENCODER,
+        )
+        # Replace internal Attention with EncoderOnlyAttention for KV cache handling.
+        # EncoderOnlyAttention implements AttentionLayerBase and returns None from
+        # get_kv_cache_spec.
+        self.self_attn.attn = EncoderOnlyAttention(
+            num_heads=self.self_attn.num_heads,
+            head_size=self.self_attn.head_dim,
+            scale=self.self_attn.scaling,
+            num_kv_heads=self.self_attn.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn.attn",
+            attn_type=AttentionType.ENCODER_ONLY,
         )
 
         self.mlp = GlmAsrMLP(
