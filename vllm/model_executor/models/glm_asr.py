@@ -626,6 +626,6 @@ class GlmAsrForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        return AutoWeightsLoader(self).load_weights(
-            weights, mapper=self.hf_to_vllm_mapper
-        )
+        return AutoWeightsLoader(
+            self, ignore_unexpected_suffixes=[".bias"]
+        ).load_weights(weights, mapper=self.hf_to_vllm_mapper)
