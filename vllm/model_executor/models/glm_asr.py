@@ -25,6 +25,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.glm4 import Glm4Attention
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -432,7 +433,10 @@ class GlmAsrForConditionalGeneration(
         orig_to_new_prefix={
             "audio_tower.": "audio_encoder.",
             "multi_modal_projector.": "projector.",
-        }
+        },
+        orig_to_new_substr={
+            ".mlp.fc2": ".mlp.down_proj",
+        },
     )
 
     supports_transcription_only = True
@@ -626,14 +630,30 @@ class GlmAsrForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map fc1/fc2 to gate_up_proj/down_proj for encoder MLP
-        mlp_mapper = WeightsMapper(
-            orig_to_new_substr={
-                ".mlp.fc1": ".mlp.gate_up_proj",
-                ".mlp.fc2": ".mlp.down_proj",
-            }
-        )
-        combined_mapper = self.hf_to_vllm_mapper | mlp_mapper
-        return AutoWeightsLoader(
-            self, ignore_unexpected_suffixes=[".bias"]
-        ).load_weights(weights, mapper=combined_mapper)
+        weights = list(self.hf_to_vllm_mapper.apply(weights))
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        remaining_weights = []
+
+        for name, weight in weights:
+            if name.endswith(".bias"):
+                continue
+
+            # Handle fc1: load twice into gate_up_proj (gate and up)
+            if ".mlp.fc1" in name:
+                gate_up_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
+                if gate_up_name in params_dict:
+                    param = params_dict[gate_up_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, weight, loaded_shard_id=0)
+                    weight_loader(param, weight, loaded_shard_id=1)
+                    loaded_params.add(gate_up_name)
+                continue
+
+            remaining_weights.append((name, weight))
+
+        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
+        loaded_params.update(loader.load_weights(remaining_weights))
+        return loaded_params
