@@ -20,6 +20,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.multimodal import BaseDummyOptions
+from vllm.forward_context import is_forward_context_available
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import GeluAndMul, get_act_fn
@@ -143,6 +144,43 @@ class GlmAsrMLP(nn.Module):
         return x
 
 
+class GlmAsrEncoderAttention(EncoderOnlyAttention):
+    """Encoder attention wrapper that handles profiling phase without forward
+    context."""
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output_shape: torch.Size | None = None,
+    ) -> torch.Tensor:
+        """Forward pass with profiling phase support."""
+        if is_forward_context_available():
+            return super().forward(query, key, value, output_shape)
+
+        # Profiling phase: forward context not set, use direct implementation
+        num_tokens = query.shape[0]
+        query = query.view(num_tokens, self.num_heads, self.head_size)
+        key = key.view(num_tokens, self.num_kv_heads, self.head_size)
+        value = value.view(num_tokens, self.num_kv_heads, self.head_size)
+
+        # Handle GQA
+        num_queries_per_kv = self.num_heads // self.num_kv_heads
+        if num_queries_per_kv > 1:
+            key = torch.repeat_interleave(key, num_queries_per_kv, dim=1)
+            value = torch.repeat_interleave(value, num_queries_per_kv, dim=1)
+
+        # Compute attention scores
+        scale = (
+            self.scale if self.scale is not None else 1.0 / math.sqrt(self.head_size)
+        )
+        attn_scores = torch.einsum("thd,khd->hkt", query, key) * scale
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        attn_output = torch.einsum("hkt,khd->thd", attn_probs, value)
+        return attn_output.reshape(num_tokens, -1)
+
+
 class GlmAsrEncoderLayer(nn.Module):
     """Encoder layer for GLM-ASR audio encoder.
 
@@ -175,15 +213,14 @@ class GlmAsrEncoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=AttentionType.ENCODER,
         )
-        # Replace internal Attention with EncoderOnlyAttention for KV cache handling.
-        # EncoderOnlyAttention implements AttentionLayerBase and returns None from
-        # get_kv_cache_spec.
+        # Replace internal Attention with GlmAsrEncoderAttention for KV cache handling.
+        # GlmAsrEncoderAttention handles profiling phase without forward context.
         # Remove old Attention registration before creating new one.
         attn_prefix = f"{prefix}.self_attn.attn"
         compilation_config = get_current_vllm_config().compilation_config
         if attn_prefix in compilation_config.static_forward_context:
             del compilation_config.static_forward_context[attn_prefix]
-        self.self_attn.attn = EncoderOnlyAttention(
+        self.self_attn.attn = GlmAsrEncoderAttention(
             num_heads=self.self_attn.num_heads,
             head_size=self.self_attn.head_dim,
             scale=self.self_attn.scaling,
