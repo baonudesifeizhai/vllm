@@ -689,7 +689,7 @@ class GlmAsrForConditionalGeneration(
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         audio_input = self._parse_and_validate_audio_input(**kwargs)
-        if not audio_input or not audio_input["input_features"]:
+        if audio_input is None or audio_input["input_features"] is None:
             return []
 
         input_features = audio_input["input_features"]
