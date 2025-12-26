@@ -26,6 +26,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.glm4 import Glm4Attention
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -240,6 +241,75 @@ class GlmAsrEncoder(nn.Module):
             prefix=f"{prefix}.layers",
         )
         self.layer_norm = nn.LayerNorm(embed_dim)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights for encoder, handling QKV fusion and fc1 duplication."""
+        stacked_params_mapping = [
+            # Encoder attention: q/k/v_proj -> qkv_proj
+            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+            # Encoder MLP: fc1 -> gate_up_proj (load twice)
+            (".mlp.gate_up_proj", ".mlp.fc1", 0),  # gate
+            (".mlp.gate_up_proj", ".mlp.fc1", 1),  # up
+        ]
+
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # Remove "layers." prefix if present (AutoWeightsLoader passes it)
+            if name.startswith("layers."):
+                name = name[len("layers.") :]
+
+            # Handle fc1: load twice into gate_up_proj
+            if ".mlp.fc1" in name and not name.endswith(".bias"):
+                gate_up_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
+                if gate_up_name in params_dict:
+                    param = params_dict[gate_up_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight, loaded_shard_id=0)
+                    weight_loader(param, loaded_weight, loaded_shard_id=1)
+                    loaded_params.add(gate_up_name)
+                    continue
+
+            # Handle QKV and other stacked params
+            matched = False
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+
+                new_name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if new_name.endswith(".bias") and new_name not in params_dict:
+                    continue
+
+                if new_name not in params_dict:
+                    continue
+
+                param = params_dict[new_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(new_name)
+                matched = True
+                break
+
+            if not matched:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+
+        return loaded_params
 
     def forward_conv(self, input_features: list[torch.Tensor]) -> torch.Tensor:
         """Forward conv layers, reusing WhisperEncoder logic without pos embeddings."""
@@ -622,63 +692,5 @@ class GlmAsrForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # Encoder attention: q/k/v_proj -> qkv_proj
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            # Encoder MLP: fc1 -> gate_up_proj (load twice)
-            (".mlp.gate_up_proj", ".mlp.fc1", 0),  # gate
-            (".mlp.gate_up_proj", ".mlp.fc1", 1),  # up
-        ]
-
-        weights = list(self.hf_to_vllm_mapper.apply(weights))
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            # Handle fc1: load twice into gate_up_proj
-            if ".mlp.fc1" in name and not name.endswith(".bias"):
-                gate_up_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
-                if gate_up_name in params_dict:
-                    param = params_dict[gate_up_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, loaded_shard_id=0)
-                    weight_loader(param, loaded_weight, loaded_shard_id=1)
-                    loaded_params.add(gate_up_name)
-                    continue
-
-            # Handle QKV and other stacked params
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
