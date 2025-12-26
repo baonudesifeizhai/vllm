@@ -620,17 +620,18 @@ class GlmAsrForConditionalGeneration(
         request_prompt: str,
         to_language: str | None,
     ) -> PromptType:
-        decoder_prompt = (
-            f"<|prev|>{request_prompt}" if request_prompt else ""
-        ) + f"<|startoftranscript|><|{language}|><|{task_type}|><|notimestamps|>"
+        processor = cached_processor_from_config(model_config)
+        audio_token = getattr(processor, "audio_token", "<|pad|>")
+        prompt = (
+            (f"<|prev|>{request_prompt}" if request_prompt else "")
+            + f"<|startoftranscript|><|{language}|><|{task_type}|>"
+            f"<|notimestamps|>{audio_token}"
+        )
         return cast(
             PromptType,
             {
-                "encoder_prompt": {
-                    "prompt": "",
-                    "multi_modal_data": {"audio": (audio, stt_config.sample_rate)},
-                },
-                "decoder_prompt": decoder_prompt,
+                "prompt": prompt,
+                "multi_modal_data": {"audio": (audio, stt_config.sample_rate)},
             },
         )
 
@@ -700,7 +701,6 @@ class GlmAsrForConditionalGeneration(
     def get_audio_features(
         self, input_features: torch.Tensor, input_features_mask: torch.Tensor
     ) -> torch.Tensor:
-        # Convert Tensor to list[torch.Tensor] for audio_encoder
         if isinstance(input_features, torch.Tensor):
             input_features_list = [
                 input_features[i] for i in range(input_features.shape[0])
@@ -712,16 +712,7 @@ class GlmAsrForConditionalGeneration(
         audio_hidden_states = audio_outputs.reshape(
             batch_size, -1, self.config.audio_config.intermediate_size
         )
-        audio_embeds = self.projector(audio_hidden_states)
-
-        audio_lengths = input_features_mask.sum(-1)
-        post_lengths = _compute_post_conv_lengths(audio_lengths)
-
-        valid_mask = (
-            torch.arange(audio_embeds.shape[1], device=audio_embeds.device)[None, :]
-            < post_lengths[:, None]
-        )
-        return audio_embeds[valid_mask]
+        return self.projector(audio_hidden_states)
 
     def forward(
         self,
@@ -776,10 +767,14 @@ class GlmAsrForConditionalGeneration(
             )
 
         audio_embeds = self.get_audio_features(input_features, input_features_mask)
-
         audio_lengths = input_features_mask.sum(-1)
         post_lengths = _compute_post_conv_lengths(audio_lengths)
-        return torch.split(audio_embeds, post_lengths.tolist())
+
+        valid_mask = (
+            torch.arange(audio_embeds.shape[1], device=audio_embeds.device)[None, :]
+            < post_lengths[:, None]
+        )
+        return audio_embeds[valid_mask].split(post_lengths.tolist())
 
     def embed_input_ids(
         self,
