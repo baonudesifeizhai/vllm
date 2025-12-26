@@ -56,6 +56,23 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _compute_post_conv_lengths(audio_lengths: torch.Tensor) -> torch.Tensor:
+    """Compute audio lengths after conv layers and reshape."""
+    for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
+        audio_lengths = (audio_lengths + 2 * padding - kernel_size) // stride + 1
+    return (audio_lengths - 4) // 4 + 1
+
+
+def _extract_audio_array(audio_data: object) -> object:
+    """Extract audio array from data (tuple or direct)."""
+    return audio_data[0] if isinstance(audio_data, tuple) else audio_data
+
+
+def _get_audio_dummy_length(feature_extractor: WhisperFeatureExtractor) -> int:
+    """Get dummy audio length from feature extractor."""
+    return feature_extractor.chunk_length * feature_extractor.sampling_rate
+
+
 class GlmAsrAudioInputs(TensorSchema):
     """
     Dimensions:
@@ -253,13 +270,7 @@ class GlmAsrProcessingInfo(BaseProcessingInfo):
 
     def get_num_audio_tokens(self, audio_lengths: torch.Tensor) -> torch.Tensor:
         """Calculate number of audio tokens from audio lengths."""
-        merge_factor = 4
-        for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
-            audio_lengths = (
-                audio_lengths + 2 * padding - (kernel_size - 1) - 1
-            ) // stride + 1
-        num_tokens = (audio_lengths - merge_factor) // merge_factor + 1
-        return num_tokens
+        return _compute_post_conv_lengths(audio_lengths)
 
 
 class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
@@ -275,11 +286,8 @@ class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
         mm_options: Mapping[str, BaseDummyOptions] | None = None,
     ) -> MultiModalDataDict:
         feature_extractor = self.info.get_feature_extractor()
-
-        sampling_rate = feature_extractor.sampling_rate
-        audio_len = feature_extractor.chunk_length * sampling_rate
+        audio_len = _get_audio_dummy_length(feature_extractor)
         num_audios = mm_counts.get("audio", 0)
-
         audio_overrides = mm_options.get("audio") if mm_options else None
 
         return {
@@ -322,16 +330,14 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
-        audio_token_id = processor.convert_tokens_to_ids(
-            getattr(processor, "audio_token", "<|pad|>")
-        )
+        tokenizer = self.info.get_tokenizer(**hf_processor_mm_kwargs)
+        audio_token = getattr(processor, "audio_token", "<|pad|>")
+        audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
 
         audio_lengths = []
         for item in mm_items:
             if item.modality == "audio":
-                audio_array = (
-                    item.data[0] if isinstance(item.data, tuple) else item.data
-                )
+                audio_array = _extract_audio_array(item.data)
                 audio_lengths.append(
                     math.ceil(len(audio_array) / feature_extractor.hop_length)
                 )
@@ -489,9 +495,7 @@ class GlmAsrForConditionalGeneration(
         audio_embeds = self.projector(audio_hidden_states)
 
         audio_lengths = input_features_mask.sum(-1)
-        for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
-            audio_lengths = (audio_lengths + 2 * padding - kernel_size) // stride + 1
-        post_lengths = (audio_lengths - 4) // 4 + 1
+        post_lengths = _compute_post_conv_lengths(audio_lengths)
 
         valid_mask = (
             torch.arange(audio_embeds.shape[1], device=audio_embeds.device)[None, :]
@@ -538,9 +542,7 @@ class GlmAsrForConditionalGeneration(
         audio_embeds = self.get_audio_features(input_features, input_features_mask)
 
         audio_lengths = input_features_mask.sum(-1)
-        for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
-            audio_lengths = (audio_lengths + 2 * padding - kernel_size) // stride + 1
-        post_lengths = (audio_lengths - 4) // 4 + 1
+        post_lengths = _compute_post_conv_lengths(audio_lengths)
         return torch.split(audio_embeds, post_lengths.tolist())
 
     def embed_input_ids(
