@@ -160,8 +160,7 @@ class GlmAsrEncoderAttention(EncoderOnlyAttention):
             return super().forward(query, key, value, output_shape)
 
         # Profiling phase: forward context not set, use direct implementation
-        # Reshape query, key, value from (batch_size, seq_len, hidden_size) or
-        # (seq_len, hidden_size) to (num_tokens, num_heads, head_size)
+        # Reshape query, key, value to (num_tokens, num_heads, head_size)
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
@@ -178,6 +177,7 @@ class GlmAsrEncoderAttention(EncoderOnlyAttention):
         attn_scores = torch.einsum("thd,khd->hkt", query, key) * scale
         attn_probs = torch.softmax(attn_scores, dim=-1)
         attn_output = torch.einsum("hkt,khd->thd", attn_probs, value)
+        # Return (num_tokens, hidden_size) to match Attention.forward behavior
         return attn_output.reshape(num_tokens, -1)
 
 
@@ -250,11 +250,14 @@ class GlmAsrEncoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
+        original_shape = hidden_states.shape
         hidden_states = self.norm1(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        # Reshape attention output back to original shape
+        hidden_states = hidden_states.reshape(original_shape)
         hidden_states = residual + hidden_states
 
         # MLP
