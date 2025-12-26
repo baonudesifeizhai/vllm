@@ -16,13 +16,16 @@ from vllm.config import ModelConfig, SpeechToTextConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.inputs.data import PromptType
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import get_act_fn
+from vllm.model_executor.layers.activation import GeluAndMul, get_act_fn
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.glm4 import Glm4Attention
-from vllm.model_executor.models.llama import LlamaMLP as Glm4MLP
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -92,6 +95,48 @@ class GlmAsrAudioInputs(TensorSchema):
     input_features_mask: Annotated[torch.Tensor | None, TensorShape("b", "t")] = None
 
 
+class GlmAsrMLP(nn.Module):
+    """MLP layer for GLM-ASR encoder with gelu activation.
+
+    Reuses the same structure as Zamba2MLP but without adapter logic.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
+        )
+        if hidden_act != "gelu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only gelu is supported."
+            )
+        self.act_fn = GeluAndMul()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x
+
+
 class GlmAsrEncoderLayer(nn.Module):
     """Encoder layer for GLM-ASR audio encoder."""
 
@@ -122,8 +167,7 @@ class GlmAsrEncoderLayer(nn.Module):
             attn_type=AttentionType.ENCODER,
         )
 
-        # Reuse Glm4MLP
-        self.mlp = Glm4MLP(
+        self.mlp = GlmAsrMLP(
             hidden_size=self.hidden_size,
             intermediate_size=audio_config.intermediate_size,
             hidden_act=audio_config.hidden_act,
