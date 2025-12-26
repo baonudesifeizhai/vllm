@@ -24,7 +24,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.glm4 import Glm4Attention
 from vllm.model_executor.models.whisper_utils import ISO639_1_SUPPORTED_LANGS
@@ -52,7 +51,6 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal, SupportsTranscription
 from .utils import (
-    AutoWeightsLoader,
     WeightsMapper,
     _merge_multimodal_embeddings,
     cast_overflow_tensors,
@@ -99,7 +97,7 @@ class GlmAsrAudioInputs(TensorSchema):
 class GlmAsrMLP(nn.Module):
     """MLP layer for GLM-ASR encoder with gelu activation.
 
-    Reuses the same structure as Zamba2MLP but without adapter logic.
+    Reuses the same structure as Glm4vVisionMLP but with GELU activation.
     """
 
     def __init__(
@@ -111,9 +109,13 @@ class GlmAsrMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        if hidden_act != "gelu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only gelu is supported."
+            )
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
+            input_size=hidden_size,
+            output_sizes=[intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
@@ -125,21 +127,20 @@ class GlmAsrMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        if hidden_act != "gelu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only gelu is supported."
-            )
         self.act_fn = GeluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        x, _ = self.gate_up_proj(x)
+        x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 
 
 class GlmAsrEncoderLayer(nn.Module):
-    """Encoder layer for GLM-ASR audio encoder."""
+    """Encoder layer for GLM-ASR audio encoder.
+
+    Reuses the same structure as Glm4vVisionBlock but with Glm4Attention.
+    """
 
     def __init__(
         self,
@@ -177,9 +178,8 @@ class GlmAsrEncoderLayer(nn.Module):
         )
 
         eps = getattr(audio_config, "rms_norm_eps", 1e-5)
-        self.input_layernorm = RMSNorm(self.hidden_size, eps=eps)
-        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=eps)
-        self.post_mlp_layernorm = RMSNorm(self.hidden_size, eps=eps)
+        self.norm1 = RMSNorm(self.hidden_size, eps=eps)
+        self.norm2 = RMSNorm(self.hidden_size, eps=eps)
 
     def forward(
         self,
@@ -188,19 +188,17 @@ class GlmAsrEncoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Self Attention
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.norm1(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         # MLP
         residual = hidden_states
-        hidden_states = self.post_mlp_layernorm(hidden_states)
+        hidden_states = self.norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_mlp_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
         hidden_states = cast_overflow_tensors(hidden_states)
@@ -243,27 +241,21 @@ class GlmAsrEncoder(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-        # RoPE for position encoding
-        rope_parameters = getattr(audio_config, "rope_parameters", {})
-        rope_parameters.setdefault("partial_rotary_factor", 0.5)
-        self.rotary_emb = get_rope(
-            embed_dim // audio_config.num_attention_heads,
-            max_position=self.max_source_positions,
-            rope_parameters=rope_parameters,
-            is_neox_style=False,
-        )
-
     def forward_conv(self, input_features: list[torch.Tensor]) -> torch.Tensor:
+        """Forward conv layers, reusing WhisperEncoder logic without pos embeddings."""
         hidden_states = []
+        input_is_batched = False
         for features in input_features:
             embeds = nn.functional.gelu(self.conv1(features))
             embeds = nn.functional.gelu(self.conv2(embeds))
-            hidden_states.append(embeds.transpose(-1, -2))
-        return (
-            torch.cat(hidden_states)
-            if hidden_states[0].ndim > 2
-            else torch.stack(hidden_states)
-        )
+            embeds = embeds.transpose(-1, -2)
+            hidden_states.append(embeds)
+            input_is_batched = embeds.ndim > 2
+        if input_is_batched:
+            hidden_states = torch.cat(hidden_states)
+        else:
+            hidden_states = torch.stack(hidden_states)
+        return hidden_states
 
     def forward(self, input_features: list[torch.Tensor]) -> torch.Tensor:
         hidden_states = self.forward_conv(input_features)
@@ -643,36 +635,50 @@ class GlmAsrForConditionalGeneration(
         weights = list(self.hf_to_vllm_mapper.apply(weights))
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        remaining_weights = []
 
-        for name, weight in weights:
-            if name.endswith(".bias"):
-                continue
-
+        for name, loaded_weight in weights:
             # Handle fc1: load twice into gate_up_proj
-            if ".mlp.fc1" in name:
+            if ".mlp.fc1" in name and not name.endswith(".bias"):
                 gate_up_name = name.replace(".mlp.fc1", ".mlp.gate_up_proj")
-                param = params_dict[gate_up_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight, loaded_shard_id=0)
-                weight_loader(param, weight, loaded_shard_id=1)
-                loaded_params.add(gate_up_name)
-                continue
+                if gate_up_name in params_dict:
+                    param = params_dict[gate_up_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight, loaded_shard_id=0)
+                    weight_loader(param, loaded_weight, loaded_shard_id=1)
+                    loaded_params.add(gate_up_name)
+                    continue
 
             # Handle QKV and other stacked params
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
 
-                new_name = name.replace(weight_name, param_name)
-                param = params_dict[new_name]
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight, loaded_shard_id=shard_id)
-                loaded_params.add(new_name)
+                weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
-                remaining_weights.append((name, weight))
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
-        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
-        loaded_params.update(loader.load_weights(remaining_weights))
+                if name not in params_dict:
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+
         return loaded_params
