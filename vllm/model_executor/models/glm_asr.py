@@ -497,6 +497,7 @@ class GlmAsrForConditionalGeneration(
             "multi_modal_projector.": "projector.",
         },
         orig_to_new_substr={
+            ".linear_1": ".linear",
             ".mlp.fc2": ".mlp.down_proj",
         },
     )
