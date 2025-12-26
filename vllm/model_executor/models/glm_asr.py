@@ -499,6 +499,7 @@ class GlmAsrForConditionalGeneration(
         orig_to_new_substr={
             ".linear_1": ".linear",
             ".mlp.fc2": ".mlp.down_proj",
+            ".bias": None,  # Ignore bias weights that don't exist in vLLM
         },
     )
 
