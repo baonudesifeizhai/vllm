@@ -261,7 +261,11 @@ class GlmAsrEncoder(nn.Module):
             # AutoWeightsLoader passes weights with module prefix removed
             # For encoder layers, weights come as "layers.0.mlp.fc1.weight"
             # and params_dict keys are "layers.0.mlp.gate_up_proj.weight"
-            # So we keep the name as-is
+
+            # Apply encoder-specific mappings
+            name = name.replace(".input_layernorm", ".norm1")
+            name = name.replace(".post_attention_layernorm", ".norm2")
+            name = name.replace(".mlp.fc2", ".mlp.down_proj")
 
             # Handle fc1: load twice into gate_up_proj
             if ".mlp.fc1" in name and not name.endswith(".bias"):
@@ -368,6 +372,29 @@ class GlmAsrProjector(nn.Module):
         hidden_states, _ = self.linear(audio_features)
         hidden_states = self.act(hidden_states)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights for projector, handling linear_1 -> linear mapping."""
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            # AutoWeightsLoader passes weights with module prefix removed
+            # Apply projector-specific mappings
+            name = name.replace(".linear_1", ".linear")
+            # Ignore linear_2 and bias
+            if ".linear_2" in name or name.endswith(".bias"):
+                continue
+
+            if name not in params_dict:
+                continue
+
+            param = params_dict[name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params
 
 
 class GlmAsrProcessingInfo(BaseProcessingInfo):
@@ -498,11 +525,10 @@ class GlmAsrForConditionalGeneration(
             "multi_modal_projector.": "projector.",
         },
         orig_to_new_substr={
-            ".input_layernorm": ".norm1",
-            ".post_attention_layernorm": ".norm2",
+            # Projector mappings (safe, won't affect language_model)
             ".linear_1": ".linear",
-            ".linear_2": None,  # Ignore linear_2 if not used in vLLM
-            ".mlp.fc2": ".mlp.down_proj",
+            ".linear_2": None,
+            # Global mappings
             ".bias": None,  # Ignore bias weights that don't exist in vLLM
         },
     )
@@ -698,5 +724,10 @@ class GlmAsrForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights using AutoWeightsLoader.
+
+        Submodules (audio_encoder, projector) handle their own mappings
+        in their load_weights methods.
+        """
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
