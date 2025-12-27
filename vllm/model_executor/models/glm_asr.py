@@ -506,6 +506,15 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         feature_extractor = self.info.get_feature_extractor()
         return MultiModalDataParser(target_sr=feature_extractor.sampling_rate)
 
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> bool:
+        return False
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -517,14 +526,20 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
             feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
             mm_data = {"audio": mm_data.pop("audios")}
             mm_kwargs = {**mm_kwargs, "sampling_rate": feature_extractor.sampling_rate}
-        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        outputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        if "feature_attention_mask" in outputs and "input_features_mask" not in outputs:
+            outputs["input_features_mask"] = outputs.pop("feature_attention_mask")
+        return outputs
 
     def _get_mm_fields_config(
         self,
         hf_inputs: BatchFeature,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
-        return dict(input_features=MultiModalFieldConfig.batched("audio"))
+        return dict(
+            input_features=MultiModalFieldConfig.batched("audio"),
+            input_features_mask=MultiModalFieldConfig.batched("audio"),
+        )
 
     def _get_prompt_updates(
         self,
