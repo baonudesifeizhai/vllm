@@ -79,11 +79,6 @@ def _compute_post_conv_lengths(audio_lengths: torch.Tensor) -> torch.Tensor:
     return (audio_lengths - 4) // 4 + 1
 
 
-def _extract_audio_array(audio_data: object) -> object:
-    """Extract audio array from data (tuple or direct)."""
-    return audio_data[0] if isinstance(audio_data, tuple) else audio_data
-
-
 def _get_audio_dummy_length(feature_extractor: WhisperFeatureExtractor) -> int:
     """Get dummy audio length from feature extractor."""
     return feature_extractor.chunk_length * feature_extractor.sampling_rate
@@ -522,11 +517,16 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         mm_kwargs: Mapping[str, object],
         tok_kwargs: Mapping[str, object],
     ) -> BatchFeature:
-        if mm_data:
-            feature_extractor = self.info.get_feature_extractor(**mm_kwargs)
-            mm_data = {"audio": mm_data.pop("audios")}
-            mm_kwargs = {**mm_kwargs, "sampling_rate": feature_extractor.sampling_rate}
-        outputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+        processor = self.info.get_hf_processor(**mm_kwargs)
+        audio = mm_data.get("audios") or mm_data.get("audio")
+        if isinstance(audio, list):
+            audio = audio[0]
+        outputs = processor.apply_transcription_request(
+            audio=audio,
+            language=mm_kwargs.get("language"),
+            prompt=mm_kwargs.get("prompt"),
+            model_id=self.info.model_id,
+        )
         if "feature_attention_mask" in outputs and "input_features_mask" not in outputs:
             outputs["input_features_mask"] = outputs.pop("feature_attention_mask")
         return outputs
@@ -646,26 +646,15 @@ class GlmAsrForConditionalGeneration(
         request_prompt: str,
         to_language: str | None,
     ) -> PromptType:
-        processor = cached_processor_from_config(model_config)
-        audio_token = getattr(processor, "audio_token", "<|pad|>")
-        instruction = (
-            request_prompt
-            if request_prompt
-            else "Please transcribe this audio into text"
-            if task_type == "transcribe"
-            else "Please translate this audio into text"
-        )
-        prompt = (
-            "<|user|>\n"
-            f"<|begin_of_audio|>{audio_token}<|end_of_audio|>"
-            "<|user|>\n"
-            f"{instruction}<|assistant|>"
-        )
         return cast(
             PromptType,
             {
-                "prompt": prompt,
+                "prompt": "",
                 "multi_modal_data": {"audio": (audio, stt_config.sample_rate)},
+                "mm_processor_kwargs": {
+                    "language": language,
+                    "prompt": request_prompt or None,
+                },
             },
         )
 
