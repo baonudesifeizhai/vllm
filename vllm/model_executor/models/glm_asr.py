@@ -520,7 +520,9 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         processor = self.info.get_hf_processor(**mm_kwargs)
         audio = mm_data.get("audios") or mm_data.get("audio")
         if isinstance(audio, list):
-            audio = audio[0]
+            audio = audio[0] if audio else None
+        if audio is None:
+            return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
         outputs = processor.apply_transcription_request(
             audio=audio,
             language=mm_kwargs.get("language"),
