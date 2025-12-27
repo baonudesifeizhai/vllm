@@ -51,6 +51,7 @@ from vllm.multimodal.processing import (
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdate,
+    PromptUpdateDetails,
 )
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
@@ -540,6 +541,8 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         tokenizer = self.info.get_tokenizer(**hf_processor_mm_kwargs)
         audio_token = getattr(processor, "audio_token", "<|pad|>")
         audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
+        audio_start_id = tokenizer.convert_tokens_to_ids("<|begin_of_audio|>")
+        audio_end_id = tokenizer.convert_tokens_to_ids("<|end_of_audio|>")
 
         # Prefer actual processed audio features from HuggingFace processor
         out_mm_data = out_mm_kwargs.get_data()
@@ -565,8 +568,13 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         return [
             PromptReplacement(
                 modality="audio",
-                target=[audio_token_id],
-                replacement=[audio_token_id] * num_tokens[i].item(),
+                target=[audio_start_id, audio_token_id, audio_end_id],
+                replacement=PromptUpdateDetails.select_token_id(
+                    [audio_start_id]
+                    + [audio_token_id] * num_tokens[i].item()
+                    + [audio_end_id],
+                    audio_token_id,
+                ),
             )
             for i in range(len(audios))
         ]
@@ -626,10 +634,18 @@ class GlmAsrForConditionalGeneration(
     ) -> PromptType:
         processor = cached_processor_from_config(model_config)
         audio_token = getattr(processor, "audio_token", "<|pad|>")
+        instruction = (
+            request_prompt
+            if request_prompt
+            else "Please transcribe this audio into text"
+            if task_type == "transcribe"
+            else "Please translate this audio into text"
+        )
         prompt = (
-            (f"<|prev|>{request_prompt}" if request_prompt else "")
-            + f"<|startoftranscript|><|{language}|><|{task_type}|>"
-            f"<|notimestamps|>{audio_token}"
+            "<|user|>\n"
+            f"<|begin_of_audio|>{audio_token}<|end_of_audio|>"
+            "<|user|>\n"
+            f"{instruction}<|assistant|>"
         )
         return cast(
             PromptType,
