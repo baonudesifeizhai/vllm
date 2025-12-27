@@ -658,7 +658,7 @@ class GlmAsrForConditionalGeneration(
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("audio"):
-            return None
+            return "<|begin_of_audio|><|pad|><|end_of_audio|>"
 
         raise ValueError("Only audio modality is supported")
 
