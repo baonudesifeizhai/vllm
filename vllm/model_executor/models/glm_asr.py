@@ -537,35 +537,39 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
             return []
 
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-        feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer(**hf_processor_mm_kwargs)
         audio_token = getattr(processor, "audio_token", "<|pad|>")
         audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
 
+        # Prefer actual processed audio features from HuggingFace processor
+        out_mm_data = out_mm_kwargs.get_data()
+        input_features_mask = out_mm_data.get("input_features_mask")
+
+        if isinstance(input_features_mask, torch.Tensor):
+            # Use actual mel feature lengths from processor
+            audio_lengths = input_features_mask.sum(-1)
+        else:
+            # Fallback to theoretical calculation (e.g., during profiling)
+            feature_extractor = self.info.get_feature_extractor(
+                **hf_processor_mm_kwargs
+            )
+            audios = mm_items.get_items("audio", AudioProcessorItems)
+            hop_length = feature_extractor.hop_length
+            audio_lengths = torch.tensor(
+                [math.ceil(len(audios.get(i)) / hop_length) for i in range(len(audios))]
+            )
+
+        num_tokens = self.info.get_num_audio_tokens(audio_lengths)
         audios = mm_items.get_items("audio", AudioProcessorItems)
-        audio_lengths = []
-        for i in range(len(audios)):
-            audio_array = audios.get(i)
-            audio_lengths.append(
-                math.ceil(len(audio_array) / feature_extractor.hop_length)
-            )
 
-        num_tokens = (
-            self.info.get_num_audio_tokens(torch.tensor(audio_lengths))
-            if audio_lengths
-            else torch.tensor([0])
-        )
-
-        updates = []
-        for i in range(len(audios)):
-            updates.append(
-                PromptReplacement(
-                    modality="audio",
-                    target=[audio_token_id],
-                    replacement=[audio_token_id] * num_tokens[i].item(),
-                )
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=[audio_token_id],
+                replacement=[audio_token_id] * num_tokens[i].item(),
             )
-        return updates
+            for i in range(len(audios))
+        ]
 
 
 @MULTIMODAL_REGISTRY.register_processor(
