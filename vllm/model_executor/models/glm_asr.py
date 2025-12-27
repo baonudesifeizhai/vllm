@@ -481,8 +481,7 @@ class GlmAsrProcessingInfo(BaseProcessingInfo):
 class GlmAsrDummyInputsBuilder(BaseDummyInputsBuilder[GlmAsrProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_audios = mm_counts.get("audio", 0)
-        # Use <|pad|> as audio token placeholder
-        return "<|pad|>" * num_audios
+        return "<|begin_of_audio|><|pad|><|end_of_audio|>" * num_audios
 
     def get_dummy_mm_data(
         self,
