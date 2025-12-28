@@ -336,7 +336,11 @@ class GlmAsrMultiModalProjector(nn.Module):
     def __init__(self, config: Any, audio_feature_dim: int | None = None):
         super().__init__()
         if audio_feature_dim is None:
-            audio_feature_dim = config.audio_config.hidden_size
+            audio_feature_dim = getattr(
+                config.audio_config,
+                "intermediate_size",
+                config.audio_config.hidden_size,
+            )
         self.linear_1 = nn.Linear(
             audio_feature_dim,
             config.text_config.hidden_size * 2,
@@ -569,7 +573,11 @@ class GlmAsrForConditionalGeneration(
 
         audio_config = config.audio_config
         self.audio_tower = GlmAsrAudioTower(audio_config)
-        self.audio_feature_dim = audio_config.hidden_size
+        self.audio_feature_dim = getattr(
+            audio_config,
+            "intermediate_size",
+            audio_config.hidden_size,
+        )
         self.multi_modal_projector = GlmAsrMultiModalProjector(
             config, audio_feature_dim=self.audio_feature_dim
         )
