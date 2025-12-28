@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import cast
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio.functional as AF
@@ -161,9 +162,13 @@ def _get_num_features_for_item(
     raise ValueError("Either feature_attention_mask or audio_embeds must be provided")
 
 
-def _to_audio_tensor(audio: torch.Tensor | list[float]) -> torch.Tensor:
+def _to_audio_tensor(
+    audio: torch.Tensor | np.ndarray | list[float],
+) -> torch.Tensor:
     if isinstance(audio, torch.Tensor):
         return audio
+    if isinstance(audio, np.ndarray):
+        return torch.from_numpy(audio)
     return torch.tensor(audio, dtype=torch.float32)
 
 
@@ -194,7 +199,7 @@ def compute_log_mel_spectrogram(
         n_mels=n_mels,
         sample_rate=sampling_rate,
     ).to(magnitudes.device)
-    mel_spec = mel_filters @ magnitudes
+    mel_spec = mel_filters.T @ magnitudes
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
     log_spec = (log_spec + 4.0) / 4.0
