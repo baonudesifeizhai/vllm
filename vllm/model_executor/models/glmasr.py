@@ -642,6 +642,7 @@ class GlmAsrForConditionalGeneration(
             audio_input.get("chunk_counts"), num_chunks=num_chunks
         )
 
+        input_features = input_features.to(self.audio_tower.conv1.weight.dtype)
         audio_hidden_states = self.audio_tower(input_features)
         audio_hidden_states = audio_hidden_states.reshape(
             num_chunks,
