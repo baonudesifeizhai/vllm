@@ -180,7 +180,7 @@ class GlmAsrSelfAttention(nn.Module):
         self.rope = rope
 
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
@@ -290,11 +290,15 @@ class GlmAsrAudioTower(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
         )
 
+        intermediate_size = getattr(audio_config, "intermediate_size", None)
+        if intermediate_size is None or intermediate_size < hidden_size * 4:
+            intermediate_size = hidden_size * 4
+
         self.layers = nn.ModuleList(
             [
                 GlmAsrEncoderLayer(
                     hidden_size=hidden_size,
-                    intermediate_size=audio_config.intermediate_size,
+                    intermediate_size=intermediate_size,
                     num_heads=audio_config.num_attention_heads,
                     hidden_act=audio_config.hidden_act,
                     rope=rope,
