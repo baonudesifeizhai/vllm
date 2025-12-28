@@ -454,11 +454,8 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
     def _ensure_audio_placeholders(
         prompt_ids: list[int],
         audio_list: list[Any],
-        processor: GlmAsrProcessorAdapter,
-        tokenizer,
+        audio_token_id: int | None,
     ) -> list[int]:
-        vocab = tokenizer.get_vocab()
-        audio_token_id = vocab.get(processor.audio_token)
         if audio_token_id is None:
             return prompt_ids
 
@@ -491,9 +488,11 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         prompt_ids = self.info.get_tokenizer().encode(prompt)
         prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
         processor = self.info.get_hf_processor()
+        config = self.info.get_hf_config()
+        audio_token_id = getattr(config, "audio_token_id", None)
         if audio_list:
             prompt_ids = self._ensure_audio_placeholders(
-                prompt_ids, audio_list, processor, self.info.get_tokenizer()
+                prompt_ids, audio_list, audio_token_id
             )
         else:
             return {"input_ids": torch.tensor([prompt_ids], dtype=torch.long)}
@@ -531,15 +530,9 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         hf_processor_mm_kwargs: Mapping[str, object],
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
-        processor = self.info.get_hf_processor()
-        tokenizer = self.info.get_tokenizer()
-        vocab = tokenizer.get_vocab()
         config = self.info.get_hf_config()
 
-        audio_token = processor.audio_token
-        audio_token_id = vocab.get(audio_token)
-        if audio_token_id is None:
-            audio_token_id = int(config.audio_token_id)
+        audio_token_id = int(config.audio_token_id)
 
         merge_factor = getattr(config, "merge_factor", DEFAULT_MERGE_FACTOR)
         out_mm_data = out_mm_kwargs.get_data()
@@ -567,11 +560,10 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
                 embed_token_id=audio_token_id,
             )
 
-        target: str | list[int] = [audio_token_id]
         return [
             PromptReplacement(
                 modality="audio",
-                target=target,
+                target=[audio_token_id],
                 replacement=get_replacement_glmasr,
             )
         ]
