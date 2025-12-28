@@ -9,7 +9,7 @@ from typing import cast
 import numpy as np
 import torch
 import torch.nn as nn
-import torchaudio.functional as AF
+from mistral_common.audio import mel_filter_bank
 
 DEFAULT_MAX_AUDIO_LEN_S = 655
 DEFAULT_MERGE_FACTOR = 4
@@ -54,7 +54,7 @@ def _get_audio_output_lengths_from_lengths(
         audio_lengths = _calculate_conv_output_length(
             audio_lengths, padding, kernel_size, stride
         )
-    return (audio_lengths - merge_factor) // merge_factor + 1
+    return _apply_merge_factor(audio_lengths, merge_factor)
 
 
 def _get_audio_output_lengths_from_mask(
@@ -66,6 +66,13 @@ def _get_audio_output_lengths_from_mask(
     return _get_audio_output_lengths_from_lengths(
         audio_lengths, merge_factor, conv_params
     )
+
+
+def _apply_merge_factor(
+    audio_lengths: torch.Tensor,
+    merge_factor: int,
+) -> torch.Tensor:
+    return (audio_lengths - merge_factor) // merge_factor + 1
 
 
 def _get_audio_output_lengths_for_tower(
@@ -192,13 +199,16 @@ def compute_log_mel_spectrogram(
         return_complex=True,
     )
     magnitudes = stft[..., :-1].abs().pow(2)
-    mel_filters = AF.melscale_fbanks(
-        n_freqs=n_fft // 2 + 1,
-        f_min=f_min,
-        f_max=f_max,
-        n_mels=n_mels,
-        sample_rate=sampling_rate,
-    ).to(magnitudes.device)
+    mel_filters = mel_filter_bank(
+        num_frequency_bins=1 + n_fft // 2,
+        num_mel_bins=n_mels,
+        min_frequency=f_min,
+        max_frequency=f_max,
+        sampling_rate=sampling_rate,
+    )
+    mel_filters = torch.tensor(
+        mel_filters, dtype=torch.float32, device=magnitudes.device
+    )
     mel_spec = mel_filters.T @ magnitudes
     log_spec = torch.clamp(mel_spec, min=1e-10).log10()
     log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
@@ -213,10 +223,15 @@ def extract_glmasr_features(
     n_fft: int,
     hop_length: int,
     n_mels: int,
-    chunk_length_s: int,
+    max_position_embeddings: int,
+    conv_params: list[tuple[int, int, int]],
     max_audio_len_s: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    chunk_length_frames = int(chunk_length_s * sampling_rate // hop_length)
+    downsample_factor = 1
+    for _, _, stride in conv_params:
+        downsample_factor *= stride
+    chunk_length_frames = max_position_embeddings * downsample_factor
+    chunk_length_s = int(chunk_length_frames * hop_length // sampling_rate)
     max_chunks = max(1, int(max_audio_len_s // max(1, chunk_length_s)))
 
     input_features = []

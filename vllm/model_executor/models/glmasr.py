@@ -19,6 +19,7 @@ from vllm.multimodal.glmasr_utils import (
     DEFAULT_MAX_AUDIO_LEN_S,
     DEFAULT_MERGE_FACTOR,
     DEFAULT_SAMPLE_RATE,
+    _apply_merge_factor,
     _flatten_audio_features_by_length,
     _get_audio_output_lengths_for_tower,
     _get_num_features_for_item,
@@ -475,13 +476,16 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
             return {"input_ids": torch.tensor([prompt_ids], dtype=torch.long)}
 
         processor = self.info.get_hf_processor()
+        audio_config = self.info.get_hf_config().audio_config
+        conv_params = getattr(audio_config, "conv_params", DEFAULT_CONV_PARAMS)
         input_features, feature_attention_mask, chunk_counts = extract_glmasr_features(
             audio_list,
             sampling_rate=processor.sampling_rate,
             n_fft=processor.n_fft,
             hop_length=processor.hop_length,
             n_mels=processor.n_mels,
-            chunk_length_s=processor.chunk_length_s,
+            max_position_embeddings=audio_config.max_position_embeddings,
+            conv_params=conv_params,
             max_audio_len_s=processor.max_audio_len_s,
         )
 
@@ -660,6 +664,7 @@ class GlmAsrForConditionalGeneration(
             merge_factor,
             conv_params,
         )
+        audio_output_lengths = _apply_merge_factor(audio_output_lengths, merge_factor)
 
         masked_audio_features = _flatten_audio_features_by_length(
             audio_features, audio_output_lengths
