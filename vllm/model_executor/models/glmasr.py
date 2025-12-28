@@ -548,7 +548,7 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
         return [
             PromptReplacement(
                 modality="audio",
-                target=[audio_token_id],
+                target=audio_token,
                 replacement=get_replacement_glmasr,
             )
         ]
