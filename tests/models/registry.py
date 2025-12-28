@@ -641,6 +641,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         trust_remote_code=True,
         hf_overrides={"architectures": ["GLM4VForCausalLM"]},
     ),
+    "GlmAsrForConditionalGeneration": _HfExamplesInfo(
+        "Zhangyuxuan-zR/GLM-ASR-Nano-2512",
+        min_transformers_version="5.0.0.dev",
+    ),
     "Glm4vForConditionalGeneration": _HfExamplesInfo("zai-org/GLM-4.1V-9B-Thinking"),
     "Glm4vMoeForConditionalGeneration": _HfExamplesInfo("zai-org/GLM-4.5V"),
     "H2OVLChatModel": _HfExamplesInfo(
