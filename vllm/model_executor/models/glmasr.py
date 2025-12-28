@@ -707,4 +707,6 @@ class GlmAsrForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         skip_prefixes = ["audio_tower.embed_positions"]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights)
+        loaded_weights = loader.load_weights(weights)
+        loaded_weights.add("audio_tower.embed_positions.weight")
+        return loaded_weights
