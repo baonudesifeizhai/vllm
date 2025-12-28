@@ -450,6 +450,25 @@ class GlmAsrMultiModalDataParser(MultiModalDataParser):
 
 
 class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
+    @staticmethod
+    def _ensure_audio_placeholders(
+        prompt_ids: list[int],
+        audio_list: list[Any],
+        processor: GlmAsrProcessorAdapter,
+        tokenizer,
+    ) -> list[int]:
+        vocab = tokenizer.get_vocab()
+        audio_token_id = vocab.get(processor.audio_token)
+        if audio_token_id is None:
+            return prompt_ids
+
+        audio_token_count = prompt_ids.count(audio_token_id)
+        if audio_token_count < len(audio_list):
+            prompt_ids = prompt_ids + [audio_token_id] * (
+                len(audio_list) - audio_token_count
+            )
+        return prompt_ids
+
     def _get_data_parser(self) -> MultiModalDataParser:
         processor = self.info.get_hf_processor()
         return GlmAsrMultiModalDataParser(target_sr=processor.sampling_rate)
@@ -471,11 +490,14 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
 
         prompt_ids = self.info.get_tokenizer().encode(prompt)
         prompt_ids = self._apply_hf_processor_tokens_only(prompt_ids)
-
-        if not audio_list:
+        processor = self.info.get_hf_processor()
+        if audio_list:
+            prompt_ids = self._ensure_audio_placeholders(
+                prompt_ids, audio_list, processor, self.info.get_tokenizer()
+            )
+        else:
             return {"input_ids": torch.tensor([prompt_ids], dtype=torch.long)}
 
-        processor = self.info.get_hf_processor()
         audio_config = self.info.get_hf_config().audio_config
         conv_params = getattr(audio_config, "conv_params", DEFAULT_CONV_PARAMS)
         input_features, feature_attention_mask, chunk_counts = extract_glmasr_features(
@@ -545,10 +567,11 @@ class GlmAsrMultiModalProcessor(BaseMultiModalProcessor[GlmAsrProcessingInfo]):
                 embed_token_id=audio_token_id,
             )
 
+        target: str | list[int] = [audio_token_id]
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=target,
                 replacement=get_replacement_glmasr,
             )
         ]
