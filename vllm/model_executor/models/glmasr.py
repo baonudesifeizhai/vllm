@@ -179,10 +179,10 @@ class GlmAsrSelfAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.rope = rope
 
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -221,9 +221,9 @@ class GlmAsrMLP(nn.Module):
         self, hidden_size: int, intermediate_size: int, hidden_act: str
     ) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
         self.act = get_act_fn(hidden_act)
-        self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.fc2 = nn.Linear(intermediate_size, hidden_size, bias=True)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.act(self.fc1(hidden_states)))
