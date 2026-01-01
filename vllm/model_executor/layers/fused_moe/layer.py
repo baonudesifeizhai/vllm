@@ -1733,7 +1733,6 @@ class FusedMoE(CustomOp):
         self,
         full_hidden_states: torch.Tensor,
         full_router_logits: torch.Tensor,
-        has_separate_shared_experts: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.batched_hidden_states is not None
         assert self.batched_router_logits is not None
@@ -1744,8 +1743,6 @@ class FusedMoE(CustomOp):
         assert self.batched_router_logits.size(-1) == full_router_logits.size(-1)
 
         full_fused_final_hidden_states = torch.empty_like(full_hidden_states)
-        if self.shared_experts is not None:
-            full_shared_final_hidden_states = torch.empty_like(full_hidden_states)
 
         def process_chunk(chunk_start, chunk_end, skip_result_store=False):
             chunk_size = chunk_end - chunk_start
@@ -1785,29 +1782,10 @@ class FusedMoE(CustomOp):
                 router_logits=staged_router_logits,
             )
 
-            if has_separate_shared_experts:
-                assert not isinstance(final_hidden_states, tuple)
-                assert self.shared_experts is not None
-
-                shared_output = self.shared_experts(staged_hidden_states)
-
-                final_hidden_states = (
-                    shared_output,
-                    final_hidden_states,
-                )
-
             if not skip_result_store:
-                if self.shared_experts is None:
-                    full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                        final_hidden_states, non_blocking=True
-                    )
-                else:
-                    full_shared_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                        final_hidden_states[0], non_blocking=True
-                    )
-                    full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
-                        final_hidden_states[1], non_blocking=True
-                    )
+                full_fused_final_hidden_states[chunk_start:chunk_end, :].copy_(
+                    final_hidden_states, non_blocking=True
+                )
 
         ctx = get_forward_context()
         # flashinfer_cutlass_kernels can handle: optional DP + TP/EP
@@ -1839,10 +1817,7 @@ class FusedMoE(CustomOp):
                     chunk_start, chunk_end, skip_result_store=chunk_start_ >= num_tokens
                 )
 
-        if self.shared_experts is None:
-            return full_fused_final_hidden_states
-        else:
-            return (full_shared_final_hidden_states, full_fused_final_hidden_states)
+        return full_fused_final_hidden_states
 
     def forward_impl(
         self,
@@ -1854,30 +1829,13 @@ class FusedMoE(CustomOp):
         self.ensure_moe_quant_config_init()
         self.ensure_dp_chunking_init()
 
-        has_separate_shared_experts = (
-            not isinstance(self.quant_method, FusedMoEModularMethod)
-            and self.shared_experts is not None
-        )
-
         use_chunked_impl = self.use_dp_chunking
 
-        use_shared_experts_stream, hidden_states_clone = (
-            self._maybe_setup_shared_experts_stream(
-                hidden_states, has_separate_shared_experts, use_chunked_impl
-            )
-        )
-
-        # If router/gate provided, then apply it here.
-        # (Note: This code runs only when "overlapped mode" is on to allow
-        #        parallel execution of shared experts with the FusedMoE via
-        #        separate cuda stream)
-        if self.gate is not None:
-            router_logits, _ = self.gate(hidden_states)
+        # Note: Gate and shared expert logic has been moved to MoELayer.
+        # FusedMoE now only handles routed experts computation.
 
         if use_chunked_impl:
-            return self.forward_impl_chunked(
-                hidden_states, router_logits, has_separate_shared_experts
-            )
+            return self.forward_impl_chunked(hidden_states, router_logits)
 
         do_naive_dispatch_combine: bool = self.dp_size > 1 and not isinstance(
             self.quant_method, FusedMoEModularMethod
@@ -1931,12 +1889,6 @@ class FusedMoE(CustomOp):
                 else:
                     hidden_states_combined, router_logits = dispatch_res
 
-            # Run shared experts before matrix multiply.
-            # because matrix multiply maybe modify the hidden_states.
-            if has_separate_shared_experts and not use_shared_experts_stream:
-                assert self.shared_experts is not None
-                shared_output = self.shared_experts(hidden_states)
-
             # NOTE: Similar with DP, PCP also needs dispatch and combine. For
             # simplicity, AgRsAll2All was added separately for PCP here. Maybe
             # we should modify All2AllManager abstract to better support PCP.
@@ -1959,26 +1911,6 @@ class FusedMoE(CustomOp):
                 router_logits=router_logits,
             )
 
-            if has_separate_shared_experts:
-                assert self.shared_experts is not None
-
-                if use_shared_experts_stream:
-                    # Run shared experts in parallel on a separate stream
-                    # NOTE: We start the separate stream here and mark the
-                    # sync end point immediately after it is done. This is
-                    # important to avoid excessive stream allocations by the cuda
-                    # graph replay later.
-                    with torch.cuda.stream(self.shared_experts_stream):
-                        # Note that hidden_states clone() is necessary here to avoid
-                        # conflict with the main stream
-                        shared_output = self.shared_experts(hidden_states_clone)
-                    current_stream().wait_stream(self.shared_experts_stream)
-
-                final_hidden_states = (
-                    shared_output,
-                    final_hidden_states,
-                )
-
             def combine_output(states: torch.Tensor) -> torch.Tensor:
                 if do_naive_dispatch_combine:
                     states = get_ep_group().combine(states, self.is_sequence_parallel)
@@ -1991,13 +1923,7 @@ class FusedMoE(CustomOp):
 
                 return states
 
-            if self.shared_experts is not None:
-                return (
-                    final_hidden_states[0],
-                    combine_output(final_hidden_states[1]),
-                )
-            else:
-                return combine_output(final_hidden_states)
+            return combine_output(final_hidden_states)
 
     @classmethod
     def make_expert_params_mapping(
