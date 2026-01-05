@@ -1055,6 +1055,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         ## DECODE PATHWAY
         if num_decodes > 0:
             if decode_use_trtllm:
+                if num_decode_tokens % num_decodes != 0:
+                    logger.error(
+                        "TRTLLM decode non-uniform query lengths detected. "
+                        "common_attn_metadata.num_actual_tokens: %d, "
+                        "num_decodes: %d, num_decode_tokens: %d, "
+                        "num_prefills: %d, num_prefill_tokens: %d, "
+                        "query_start_loc_cpu: %s",
+                        common_attn_metadata.num_actual_tokens,
+                        num_decodes,
+                        num_decode_tokens,
+                        num_prefills,
+                        num_prefill_tokens,
+                        common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+                        .cpu()
+                        .tolist(),
+                    )
                 assert num_decode_tokens % num_decodes == 0, (
                     "TRTLLM decode requires uniform query lengths per request."
                 )
