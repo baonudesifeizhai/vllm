@@ -954,9 +954,15 @@ def split_decodes_and_prefills(
         # requests may have a query length of 0 but since they are padding its fine
         # to treat them as decodes (ensures num_decodes matches the captured size)
         if torch.all((query_lens == query_lens[0]) | (query_lens == 0)):
-            assert num_reqs * query_lens[0] == num_tokens, "tokens not padded correctly"
-            return num_reqs, 0, num_tokens, 0  # all decodes
-        is_prefill = query_lens != query_lens[0]
+            # For padded batches, verify padding correctness.
+            # If padding is incorrect, exclude zero-length requests from decodes.
+            expected_tokens = num_reqs * query_lens[0].item()
+            if num_tokens == expected_tokens:
+                return num_reqs, 0, num_tokens, 0  # all decodes
+            # Padding incorrect: zero-length requests are prefills
+            is_prefill = query_lens == 0
+        else:
+            is_prefill = query_lens != query_lens[0]
     else:
         is_prefill = query_lens > decode_threshold
 
