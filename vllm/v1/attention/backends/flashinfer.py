@@ -62,6 +62,8 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.utils import CpuGpuBuffer
 
+logger = init_logger(__name__)
+
 FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -1055,6 +1057,33 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         ## DECODE PATHWAY
         if num_decodes > 0:
             if decode_use_trtllm:
+                # Debug logging for non-uniform query lengths
+                if num_decode_tokens % num_decodes != 0:
+                    query_lens = qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]
+                    decode_query_lens = query_lens[:num_decodes]
+                    logger.error(
+                        "TRTLLM decode non-uniform query lengths detected:\n"
+                        "  num_decodes: %d\n"
+                        "  num_decode_tokens: %d\n"
+                        "  num_decode_tokens %% num_decodes: %d\n"
+                        "  query_start_loc (first %d+1): %s\n"
+                        "  decode query_lens (first %d): %s\n"
+                        "  all query_lens: %s\n"
+                        "  num_prefills: %d\n"
+                        "  num_prefill_tokens: %d\n"
+                        "  decode_threshold: %d",
+                        num_decodes,
+                        num_decode_tokens,
+                        num_decode_tokens % num_decodes,
+                        num_decodes,
+                        qo_indptr_cpu[: num_decodes + 1].tolist(),
+                        num_decodes,
+                        decode_query_lens.tolist(),
+                        query_lens.tolist(),
+                        num_prefills,
+                        num_prefill_tokens,
+                        self.reorder_batch_threshold,
+                    )
                 assert num_decode_tokens % num_decodes == 0, (
                     "TRTLLM decode requires uniform query lengths per request."
                 )
