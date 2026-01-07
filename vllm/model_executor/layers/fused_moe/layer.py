@@ -1030,9 +1030,17 @@ class FusedMoE(CustomOp):
                 # Weight is already TP-sharded, use as-is
                 shard_size = loaded_dim_size
 
-        # Ensure shard_size doesn't exceed expert_data dimension
-        # This is critical when expert_data is already TP-sharded
+        # Ensure shard_size fits within both expert_data and loaded_weight dimensions
+        # This is critical when either tensor is already TP-sharded
         shard_size = min(shard_size, expert_dim_size)
+        current_loaded_dim = loaded_weight.shape[shard_dim]
+
+        # Align loaded_weight to match shard_size
+        if current_loaded_dim > shard_size:
+            loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
+        elif current_loaded_dim < shard_size:
+            # loaded_weight is smaller, use its size
+            shard_size = current_loaded_dim
 
         # Determine target position in expert_data
         if shard_id == "w1":
