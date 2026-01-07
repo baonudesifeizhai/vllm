@@ -78,7 +78,22 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         weight_loader: Callable,
         **kwargs,
     ):
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            align_dim_for_cutlass,
+        )
+
         output_size_per_partition = sum(output_partition_sizes)
+        # Align output_size_per_partition to 32 for CUTLASS kernel
+        if self.backend == "cutlass":
+            original_output_size = output_size_per_partition
+            output_size_per_partition = align_dim_for_cutlass(output_size_per_partition)
+            if output_size_per_partition != original_output_size:
+                logger.warning(
+                    "[CompressedTensorsW4A4Fp4] Aligned output_size_per_partition "
+                    "from %s to %s for CUTLASS kernel",
+                    original_output_size,
+                    output_size_per_partition,
+                )
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -86,7 +101,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         # Weight
         weight = ModelWeightParameter(
             data=torch.empty(
-                sum(output_partition_sizes),
+                output_size_per_partition,
                 input_size_per_partition // 2,
                 dtype=torch.uint8,
             ),
@@ -106,7 +121,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         # Per Group Weight Scale
         weight_scale = GroupQuantScaleParameter(
             data=torch.empty(
-                sum(output_partition_sizes),
+                output_size_per_partition,
                 input_size_per_partition // self.group_size,
                 dtype=torch.float8_e4m3fn,
             ),
@@ -124,12 +139,37 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         layer.register_parameter("input_global_scale", input_global_scale)
 
     def process_weights_after_loading(self, layer) -> None:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            align_dim_for_cutlass,
+        )
+
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
         layer.weight_global_scale = Parameter(
             layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
+
+        # Ensure alignment for CUTLASS kernel
+        if self.backend == "cutlass":
+            weight_data = layer.weight_packed.data
+            original_output_size = weight_data.shape[0]
+            aligned_output_size = align_dim_for_cutlass(original_output_size)
+            if aligned_output_size != original_output_size:
+                logger.warning(
+                    "[CompressedTensorsW4A4Fp4.process_weights_after_loading] "
+                    "Truncating weight_packed output_size from %s to %s "
+                    "for CUTLASS kernel",
+                    original_output_size,
+                    aligned_output_size,
+                )
+                weight_data = weight_data[:aligned_output_size, :]
+                layer.weight_scale = Parameter(
+                    layer.weight_scale.data[:aligned_output_size, :],
+                    requires_grad=False,
+                )
+                layer.weight_packed = Parameter(weight_data, requires_grad=False)
+                layer.output_size_per_partition = aligned_output_size
 
         if self.backend == "flashinfer-trtllm":
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
