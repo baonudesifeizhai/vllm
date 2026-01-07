@@ -19,6 +19,14 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 
+def align_dim_for_cutlass(dim: int, max_dim: int | None = None) -> int:
+    """Align dimension to 32 for CUTLASS kernel requirement."""
+    aligned = (dim // 32) * 32
+    if max_dim is not None:
+        aligned = min(aligned, max_dim)
+    return aligned if aligned > 0 else dim
+
+
 # Use proxy as NamedTuple direct subclasses cannot have static members
 class _GroupShape(NamedTuple):
     row: int

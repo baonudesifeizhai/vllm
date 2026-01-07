@@ -80,6 +80,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
     prepare_moe_fp8_layer_for_marlin,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    align_dim_for_cutlass,
     convert_bf16_scales_to_fp8,
     convert_packed_uint4b8_to_signed_int4_inplace,
     swizzle_blockscale,
@@ -271,8 +272,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
         # Align n dimension to 32 for CUTLASS kernel
         n_dim = 2 * intermediate_size_per_partition
-        if self.use_cutlass and n_dim % 32 != 0:
-            n_dim = (n_dim // 32) * 32
+        if self.use_cutlass:
+            n_dim = align_dim_for_cutlass(n_dim)
 
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -373,10 +374,17 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2_input_scale, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # From packed to weight
-        layer.w13_weight = torch.nn.Parameter(
-            layer.w13_weight_packed.data, requires_grad=False
-        )
+        w13_data = layer.w13_weight_packed.data
+        # Ensure alignment for CUTLASS kernel
+        if self.use_cutlass and w13_data.dtype == torch.uint8:
+            aligned_n_dim = align_dim_for_cutlass(w13_data.shape[1])
+            if aligned_n_dim < w13_data.shape[1]:
+                w13_data = w13_data[:, :aligned_n_dim, :]
+                layer.w13_weight_scale = torch.nn.Parameter(
+                    layer.w13_weight_scale.data[:, :aligned_n_dim, :],
+                    requires_grad=False,
+                )
+        layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
         delattr(layer, "w13_weight_packed")
 
         layer.w2_weight = torch.nn.Parameter(

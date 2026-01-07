@@ -41,6 +41,9 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     is_flashinfer_supporting_global_sf,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    align_dim_for_cutlass,
+)
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 from vllm.utils.math_utils import cdiv, round_up
@@ -1044,12 +1047,10 @@ class FusedMoE(CustomOp):
 
         # Align n dimension to 32 for CUTLASS kernel (NVFP4)
         if shard_dim == 0 and expert_data.dtype == torch.uint8:
-            aligned_shard_size = min((shard_size // 32) * 32, expert_dim_size)
-            if aligned_shard_size > 0 and aligned_shard_size != shard_size:
-                shard_size = aligned_shard_size
-                current_loaded_dim = loaded_weight.shape[shard_dim]
-                if current_loaded_dim > shard_size:
-                    loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
+            shard_size = align_dim_for_cutlass(shard_size, expert_dim_size)
+            current_loaded_dim = loaded_weight.shape[shard_dim]
+            if current_loaded_dim > shard_size:
+                loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
 
         # Determine target position in expert_data
         if shard_id == "w1":
