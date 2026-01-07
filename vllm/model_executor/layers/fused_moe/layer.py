@@ -1043,10 +1043,11 @@ class FusedMoE(CustomOp):
             shard_size = current_loaded_dim
 
         # Align n dimension to 32 for CUTLASS kernel (NVFP4)
-        if shard_dim == 0 and expert_data.dtype == torch.uint8 and shard_size % 32 != 0:
+        if shard_dim == 0 and expert_data.dtype == torch.uint8:
             aligned_shard_size = min((shard_size // 32) * 32, expert_dim_size)
-            if aligned_shard_size > 0:
+            if aligned_shard_size > 0 and aligned_shard_size != shard_size:
                 shard_size = aligned_shard_size
+                current_loaded_dim = loaded_weight.shape[shard_dim]
                 if current_loaded_dim > shard_size:
                     loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
 
