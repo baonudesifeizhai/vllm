@@ -138,6 +138,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         )
 
         # Ensure alignment for CUTLASS kernel
+        # Note: We don't truncate weights here to avoid breaking mamba_mixer2
+        # split operations. Instead, we handle alignment in apply_weights.
         if self.backend == "cutlass":
             weight_data = layer.weight_packed.data
             original_output_size = weight_data.shape[0]
@@ -145,27 +147,15 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             if aligned_output_size != original_output_size:
                 logger.warning(
                     "[CompressedTensorsW4A4Fp4.process_weights_after_loading] "
-                    "Truncating weight_packed output_size from %s to %s "
-                    "for CUTLASS kernel",
+                    "Weight output_size=%s is not aligned to 32. "
+                    "Will handle alignment in apply_weights to avoid breaking "
+                    "mamba_mixer2 split operations.",
                     original_output_size,
-                    aligned_output_size,
                 )
-                weight_data = weight_data[:aligned_output_size, :]
-                layer.weight_scale = Parameter(
-                    layer.weight_scale.data[:aligned_output_size, :],
-                    requires_grad=False,
-                )
-                layer.weight_packed = Parameter(weight_data, requires_grad=False)
-                layer.output_size_per_partition = aligned_output_size
-                # Update logical_widths to match aligned size
-                # Adjust the last partition size to fit
-                total_logical_width = sum(layer.logical_widths)
-                if total_logical_width > aligned_output_size:
-                    diff = total_logical_width - aligned_output_size
-                    if layer.logical_widths:
-                        layer.logical_widths[-1] = max(
-                            0, layer.logical_widths[-1] - diff
-                        )
+                # Store aligned size for use in apply_weights
+                layer._aligned_output_size = aligned_output_size
+            else:
+                layer._aligned_output_size = None
 
         if self.backend == "flashinfer-trtllm":
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -220,16 +210,36 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             return out
 
         output_dtype = x.dtype
-        output_shape = [*x.shape[:-1], layer.weight_packed.shape[0]]
+        original_output_size = layer.weight_packed.shape[0]
+
+        # Handle alignment for CUTLASS kernel if needed
+        if self.backend == "cutlass" and hasattr(layer, "_aligned_output_size"):
+            aligned_output_size = layer._aligned_output_size
+            if (
+                aligned_output_size is not None
+                and aligned_output_size != original_output_size
+            ):
+                # Truncate weight for CUTLASS kernel alignment
+                weight_packed = layer.weight_packed[:aligned_output_size, :]
+                weight_scale = layer.weight_scale[:aligned_output_size, :]
+                output_shape = [*x.shape[:-1], aligned_output_size]
+            else:
+                weight_packed = layer.weight_packed
+                weight_scale = layer.weight_scale
+                output_shape = [*x.shape[:-1], original_output_size]
+        else:
+            weight_packed = layer.weight_packed
+            weight_scale = layer.weight_scale
+            output_shape = [*x.shape[:-1], original_output_size]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_global_scale)
 
         mm_args = (
             x_fp4,
-            layer.weight_packed,
+            weight_packed,
             x_blockscale,
-            layer.weight_scale,
+            weight_scale,
             layer.alpha,
             output_dtype,
         )
@@ -239,9 +249,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         elif self.backend == "fbgemm":
             out = torch.ops.fbgemm.f4f4bf16(
                 x_fp4,
-                layer.weight_packed,
+                weight_packed,
                 x_blockscale.view(-1).view(torch.uint8),
-                layer.weight_scale,
+                weight_scale,
                 layer.alpha,
                 use_mx=False,
             ).to(output_dtype)
@@ -250,5 +260,13 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             out = cutlass_scaled_fp4_mm(*mm_args)
 
         if bias is not None:
+            # Truncate bias if output was truncated
+            if self.backend == "cutlass" and hasattr(layer, "_aligned_output_size"):
+                aligned_output_size = layer._aligned_output_size
+                if (
+                    aligned_output_size is not None
+                    and aligned_output_size != original_output_size
+                ):
+                    bias = bias[:aligned_output_size]
             out = out + bias
         return out.view(*output_shape)
