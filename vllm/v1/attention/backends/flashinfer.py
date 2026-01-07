@@ -1056,20 +1056,32 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if num_decodes > 0:
             if decode_use_trtllm:
                 if num_decode_tokens % num_decodes != 0:
+                    # Calculate decode query lengths for debugging
+                    decode_query_lens = (
+                        qo_indptr_cpu[1 : num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+                    ).tolist()
                     logger.error(
                         "TRTLLM decode non-uniform query lengths detected. "
-                        "common_attn_metadata.num_actual_tokens: %d, "
-                        "num_decodes: %d, num_decode_tokens: %d, "
-                        "num_prefills: %d, num_prefill_tokens: %d, "
-                        "query_start_loc_cpu: %s",
+                        "common_attn_metadata: num_actual_tokens=%d, "
+                        "num_reqs=%d, max_query_len=%d, max_seq_len=%d, "
+                        "num_decodes=%d, num_decode_tokens=%d, "
+                        "num_prefills=%d, num_prefill_tokens=%d, "
+                        "decode_threshold=%d, "
+                        "query_start_loc_cpu (first %d): %s, "
+                        "decode query_lens (first %d): %s",
                         common_attn_metadata.num_actual_tokens,
+                        common_attn_metadata.num_reqs,
+                        common_attn_metadata.max_query_len,
+                        common_attn_metadata.max_seq_len,
                         num_decodes,
                         num_decode_tokens,
                         num_prefills,
                         num_prefill_tokens,
-                        common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
-                        .cpu()
-                        .tolist(),
+                        self.reorder_batch_threshold,
+                        num_decodes + 1,
+                        qo_indptr_cpu[: num_decodes + 1].tolist(),
+                        num_decodes,
+                        decode_query_lens,
                     )
                 assert num_decode_tokens % num_decodes == 0, (
                     "TRTLLM decode requires uniform query lengths per request."
