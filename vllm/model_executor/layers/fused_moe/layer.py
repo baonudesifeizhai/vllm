@@ -1042,6 +1042,19 @@ class FusedMoE(CustomOp):
             # loaded_weight is smaller, use its size
             shard_size = current_loaded_dim
 
+        # For compressed-tensors NVFP4 with CUTLASS kernel, ensure 32-byte alignment
+        # The n dimension (2 * intermediate_size_per_partition) must be divisible by 32
+        if (
+            shard_dim == 0
+            and expert_data.dtype == torch.uint8
+            and expert_dim_size % 32 == 0
+            and shard_size % 32 != 0
+        ):
+            # Round down to maintain 32-byte alignment
+            shard_size = (shard_size // 32) * 32
+            if current_loaded_dim > shard_size:
+                loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
+
         # Determine target position in expert_data
         if shard_id == "w1":
             expert_offset = 0
