@@ -276,9 +276,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             original_n_dim = n_dim
             n_dim = align_dim_for_cutlass(n_dim)
             if n_dim != original_n_dim:
-                logger.warning_once(
-                    f"[{self.layer_name}] Aligned n_dim from {original_n_dim} to "
-                    f"{n_dim} for CUTLASS kernel"
+                logger.warning(
+                    "[%s] Aligned n_dim from %s to %s for CUTLASS kernel",
+                    self.layer_name,
+                    original_n_dim,
+                    n_dim,
                 )
 
         w13_weight = torch.nn.Parameter(
@@ -386,9 +388,12 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             original_n_dim = w13_data.shape[1]
             aligned_n_dim = align_dim_for_cutlass(original_n_dim)
             if aligned_n_dim != original_n_dim:
-                logger.warning_once(
-                    f"[{self.layer_name}] Truncating w13_weight_packed n_dim from "
-                    f"{original_n_dim} to {aligned_n_dim} for CUTLASS kernel"
+                logger.warning(
+                    "[%s] Truncating w13_weight_packed n_dim from %s to %s "
+                    "for CUTLASS kernel",
+                    self.layer_name,
+                    original_n_dim,
+                    aligned_n_dim,
                 )
                 w13_data = w13_data[:, :aligned_n_dim, :]
                 layer.w13_weight_scale = torch.nn.Parameter(
@@ -396,10 +401,22 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                     requires_grad=False,
                 )
             else:
-                logger.debug_once(
-                    f"[{self.layer_name}] w13_weight_packed n_dim={original_n_dim} "
-                    f"already aligned for CUTLASS kernel"
+                logger.warning(
+                    "[%s] w13_weight_packed n_dim=%s already aligned "
+                    "for CUTLASS kernel",
+                    self.layer_name,
+                    original_n_dim,
                 )
+            # Log final shape for debugging
+            logger.warning(
+                "[%s] Final w13_weight shape: %s, n_dim=%s, num_experts=%s, "
+                "num_experts*n_dim=%s",
+                self.layer_name,
+                w13_data.shape,
+                w13_data.shape[1],
+                w13_data.shape[0],
+                w13_data.shape[0] * w13_data.shape[1],
+            )
         layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
         delattr(layer, "w13_weight_packed")
 
