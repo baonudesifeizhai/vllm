@@ -683,6 +683,9 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             from vllm.model_executor.layers.fused_moe.cutlass_moe import cutlass_moe_fp4
 
             assert self.moe_quant_config is not None
+            # Use w13_weight.shape[1] (aligned n_dim) instead of w2_weight.shape[2] * 2
+            # to ensure n is divisible by 32 for CUTLASS kernel
+            n_dim = layer.w13_weight.shape[1]
             return cutlass_moe_fp4(
                 a=x,
                 w1_fp4=layer.w13_weight,
@@ -694,7 +697,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 # TODO(bnell): derive these from arguments
                 m=x.shape[0],
-                n=layer.w2_weight.shape[2] * 2,
+                n=n_dim,
                 k=x.shape[1],
                 e=layer.w13_weight.shape[0],
             ).to(x.dtype)
