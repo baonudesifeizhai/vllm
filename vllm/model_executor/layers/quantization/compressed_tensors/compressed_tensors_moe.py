@@ -391,7 +391,25 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         # Ensure alignment for CUTLASS kernel
         if self.use_cutlass and w13_data.dtype == torch.uint8:
             original_n_dim = w13_data.shape[1]
+            original_intermediate_size = original_n_dim // 2
             aligned_n_dim = align_dim_for_cutlass(original_n_dim)
+            aligned_intermediate_size = aligned_n_dim // 2
+            logger.warning(
+                "[%s.process_weights_after_loading] Weight alignment check: "
+                "original_n_dim=%s, original_intermediate_size=%s, "
+                "aligned_n_dim=%s, aligned_intermediate_size=%s, "
+                "original_n_dim_divisible_by_32=%s, "
+                "original_intermediate_size_divisible_by_32=%s, "
+                "aligned_intermediate_size_divisible_by_32=%s",
+                self.layer_name,
+                original_n_dim,
+                original_intermediate_size,
+                aligned_n_dim,
+                aligned_intermediate_size,
+                original_n_dim % 32 == 0,
+                original_intermediate_size % 32 == 0,
+                aligned_intermediate_size % 32 == 0,
+            )
             if aligned_n_dim != original_n_dim:
                 logger.warning(
                     "[%s] Truncating w13_weight_packed n_dim from %s to %s "
