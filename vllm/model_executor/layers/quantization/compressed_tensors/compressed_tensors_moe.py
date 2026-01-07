@@ -240,6 +240,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         self.marlin_input_dtype = (
             get_marlin_input_dtype(layer_name) if self.use_marlin else None
         )
+        self.use_cutlass = (
+            not self.allow_flashinfer
+            and not self.use_marlin
+            and self.cutlass_nvfp4_supported
+        )
         self.flashinfer_moe_backend = None
         if self.allow_flashinfer:
             self.flashinfer_moe_backend = get_flashinfer_moe_backend()
