@@ -273,7 +273,13 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         # Align n dimension to 32 for CUTLASS kernel
         n_dim = 2 * intermediate_size_per_partition
         if self.use_cutlass:
+            original_n_dim = n_dim
             n_dim = align_dim_for_cutlass(n_dim)
+            if n_dim != original_n_dim:
+                logger.warning_once(
+                    f"[{self.layer_name}] Aligned n_dim from {original_n_dim} to "
+                    f"{n_dim} for CUTLASS kernel"
+                )
 
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -377,12 +383,22 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         w13_data = layer.w13_weight_packed.data
         # Ensure alignment for CUTLASS kernel
         if self.use_cutlass and w13_data.dtype == torch.uint8:
-            aligned_n_dim = align_dim_for_cutlass(w13_data.shape[1])
-            if aligned_n_dim != w13_data.shape[1]:
+            original_n_dim = w13_data.shape[1]
+            aligned_n_dim = align_dim_for_cutlass(original_n_dim)
+            if aligned_n_dim != original_n_dim:
+                logger.warning_once(
+                    f"[{self.layer_name}] Truncating w13_weight_packed n_dim from "
+                    f"{original_n_dim} to {aligned_n_dim} for CUTLASS kernel"
+                )
                 w13_data = w13_data[:, :aligned_n_dim, :]
                 layer.w13_weight_scale = torch.nn.Parameter(
                     layer.w13_weight_scale.data[:, :aligned_n_dim, :],
                     requires_grad=False,
+                )
+            else:
+                logger.debug_once(
+                    f"[{self.layer_name}] w13_weight_packed n_dim={original_n_dim} "
+                    f"already aligned for CUTLASS kernel"
                 )
         layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
         delattr(layer, "w13_weight_packed")

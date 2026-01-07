@@ -1055,7 +1055,13 @@ class FusedMoE(CustomOp):
             or (len(expert_data.shape) == 2 and shard_dim == 0)
         )
         if is_n_dim:
+            original_shard_size = shard_size
             shard_size = align_dim_for_cutlass(shard_size, expert_dim_size)
+            if shard_size != original_shard_size:
+                logger.warning_once(
+                    f"Aligned shard_size from {original_shard_size} to {shard_size} "
+                    f"for CUTLASS kernel (shard_id={shard_id}, shard_dim={shard_dim})"
+                )
             current_loaded_dim = loaded_weight.shape[shard_dim]
             if current_loaded_dim > shard_size:
                 loaded_weight = loaded_weight.narrow(shard_dim, 0, shard_size)
