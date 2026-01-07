@@ -844,6 +844,13 @@ class CutlassExpertsFp4(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        logger.warning(
+            "[CutlassExpertsFp4.apply] Entering apply: "
+            "w1.shape=%s, w2.shape=%s, hidden_states.shape=%s",
+            w1.shape,
+            w2.shape,
+            hidden_states.shape,
+        )
         e, m, n, k, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
         # n should be intermediate_size_per_partition
         # According to run_cutlass_moe_fp4 assertion: nx2_w1 == n * 2
@@ -913,6 +920,18 @@ def cutlass_moe_fp4(
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
+    logger.warning(
+        "[cutlass_moe_fp4] Entering function: "
+        "m=%s, n=%s, k=%s, e=%s, w1_fp4.shape=%s, w2_fp4.shape=%s, "
+        "n_divisible_by_32=%s",
+        m,
+        n,
+        k,
+        e,
+        w1_fp4.shape,
+        w2_fp4.shape,
+        n % 32 == 0,
+    )
     assert expert_map is None, (
         "Expert Parallelism / expert_map "
         "is currently not supported for "
@@ -937,6 +956,12 @@ def cutlass_moe_fp4(
         w2_scale=quant_config.w2_scale,
     )
 
+    logger.warning(
+        "[cutlass_moe_fp4] Creating CutlassExpertsFp4: "
+        "max_experts_per_worker=%s, out_dtype=%s",
+        e,
+        a.dtype,
+    )
     fn = mk.FusedMoEModularKernel(
         MoEPrepareAndFinalizeNoEP(),
         CutlassExpertsFp4(
@@ -947,6 +972,16 @@ def cutlass_moe_fp4(
         ),
     )
 
+    logger.warning(
+        "[cutlass_moe_fp4] Calling fn with: "
+        "w1.shape=%s, w2.shape=%s, m=%s, n=%s, k=%s, e=%s",
+        w1_fp4.shape,
+        w2_fp4.shape,
+        a.shape[0],
+        n,
+        a.shape[1],
+        e,
+    )
     return fn(
         hidden_states=a,
         w1=w1_fp4,

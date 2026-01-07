@@ -607,6 +607,14 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        logger.warning(
+            "[%s.apply] Entering apply method: "
+            "use_cutlass=%s, allow_flashinfer=%s, use_marlin=%s",
+            self.layer_name,
+            self.use_cutlass,
+            self.allow_flashinfer,
+            self.use_marlin,
+        )
         assert layer.activation == "silu", "Only SiLU activation is supported."
 
         if (
