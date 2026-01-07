@@ -78,22 +78,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         weight_loader: Callable,
         **kwargs,
     ):
-        from vllm.model_executor.layers.quantization.utils.quant_utils import (
-            align_dim_for_cutlass,
-        )
-
         output_size_per_partition = sum(output_partition_sizes)
-        # Align output_size_per_partition to 32 for CUTLASS kernel
-        if self.backend == "cutlass":
-            original_output_size = output_size_per_partition
-            output_size_per_partition = align_dim_for_cutlass(output_size_per_partition)
-            if output_size_per_partition != original_output_size:
-                logger.warning(
-                    "[CompressedTensorsW4A4Fp4] Aligned output_size_per_partition "
-                    "from %s to %s for CUTLASS kernel",
-                    original_output_size,
-                    output_size_per_partition,
-                )
+        # Store original output_size_per_partition for weight loading
+        # Alignment will be done in process_weights_after_loading
         layer.logical_widths = output_partition_sizes
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
@@ -170,6 +157,15 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 )
                 layer.weight_packed = Parameter(weight_data, requires_grad=False)
                 layer.output_size_per_partition = aligned_output_size
+                # Update logical_widths to match aligned size
+                # Adjust the last partition size to fit
+                total_logical_width = sum(layer.logical_widths)
+                if total_logical_width > aligned_output_size:
+                    diff = total_logical_width - aligned_output_size
+                    if layer.logical_widths:
+                        layer.logical_widths[-1] = max(
+                            0, layer.logical_widths[-1] - diff
+                        )
 
         if self.backend == "flashinfer-trtllm":
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
