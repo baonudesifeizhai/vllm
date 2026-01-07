@@ -264,10 +264,15 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer.num_experts = num_experts
         layer.params_dtype = params_dtype
 
+        # Align n dimension to 32 for CUTLASS kernel
+        n_dim = 2 * intermediate_size_per_partition
+        if self.use_cutlass and n_dim % 32 != 0:
+            n_dim = (n_dim // 32) * 32
+
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                n_dim,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 requires_grad=False,
@@ -295,7 +300,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         w13_weight_scale = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                n_dim,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // self.group_size,
                 dtype=torch.float8_e4m3fn,
