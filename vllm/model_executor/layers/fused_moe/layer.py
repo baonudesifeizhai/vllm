@@ -1000,57 +1000,51 @@ class FusedMoE(CustomOp):
         tp_rank: int,
         load_full: bool = False,
     ):
-        # Index the loaded weight for tp sharding.
-        # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
+        """
+        Load w1 or w3 weight into the merged w13_weight tensor.
+
+        For gated MoE (is_act_and_mul=True): w13 contains [w1, w3] concatenated.
+        For non-gated MoE (is_act_and_mul=False): w13 may contain w1 and w3
+        separately, or be TP-sharded.
+        """
+        expert_dim_size = expert_data.shape[shard_dim]
+        loaded_dim_size = loaded_weight.shape[shard_dim]
+
+        # Determine base shard size based on MoE type
         if self.moe_config.is_act_and_mul:
-            shard_size = expert_data.shape[shard_dim] // 2
+            shard_size = expert_dim_size // 2
         else:
-            # For non-gated MoE, check if loaded_weight is already sharded
-            # (e.g., for compressed-tensors NVFP4, w1 and w3 may be separate)
-            expert_dim_size = expert_data.shape[shard_dim]
-            loaded_dim_size = loaded_weight.shape[shard_dim]
+            shard_size = expert_dim_size
 
-            # If loaded_weight dimension matches expert_data, use full size
-            # Otherwise, it might be a single weight (w1 or w3) already sharded
-            if loaded_dim_size == expert_dim_size:
-                shard_size = expert_dim_size
-            elif loaded_dim_size == expert_dim_size // 2:
-                # Single weight (w1 or w3) for compressed-tensors format
-                shard_size = expert_dim_size // 2
-            else:
-                # Fallback: use expert_data dimension
-                shard_size = expert_dim_size
-
+        # Handle TP sharding of loaded_weight
         if not load_full:
-            # Check if loaded_weight needs TP sharding
             start_idx = shard_size * tp_rank
-
-            # If the requested slice would exceed bounds, the weight is likely
-            # already TP-sharded or a single weight (w1 or w3)
-            if start_idx + shard_size > loaded_dim_size:
-                # Weight is already sharded or smaller than expected
-                # Adjust shard_size to match available data
-                if start_idx < loaded_dim_size:
-                    # Partial slice available
-                    shard_size = loaded_dim_size - start_idx
-                    loaded_weight = loaded_weight.narrow(
-                        shard_dim, start_idx, shard_size
-                    )
-                else:
-                    # Beyond bounds, weight is already sharded, use as-is
-                    # Adjust shard_size to match loaded_weight
-                    shard_size = loaded_dim_size
-            else:
-                # Safe to shard from full weight
+            if start_idx + shard_size <= loaded_dim_size:
+                # Safe to extract TP shard from full weight
                 loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
-        # Narrow parameter and load.
-        # w1, gate_proj: Load into first logical weight of w13.
+            elif start_idx < loaded_dim_size:
+                # Partial slice available (weight is partially sharded)
+                shard_size = loaded_dim_size - start_idx
+                loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
+            else:
+                # Weight is already TP-sharded, use as-is
+                shard_size = loaded_dim_size
+
+        # Ensure shard_size doesn't exceed expert_data dimension
+        # This is critical when expert_data is already TP-sharded
+        shard_size = min(shard_size, expert_dim_size)
+
+        # Determine target position in expert_data
         if shard_id == "w1":
-            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
-        # w3, up_proj: Load into second logical weight of w13.
+            expert_offset = 0
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            # For non-gated MoE, w3 is at position shard_size if space allows
+            # Otherwise (TP-sharded case), load at beginning
+            expert_offset = shard_size if shard_size * 2 <= expert_dim_size else 0
+
+        # Narrow expert_data to target region and copy loaded_weight
+        expert_data = expert_data.narrow(shard_dim, expert_offset, shard_size)
         expert_data.copy_(loaded_weight)
 
     def _load_w2(
