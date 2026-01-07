@@ -1005,11 +1005,44 @@ class FusedMoE(CustomOp):
         if self.moe_config.is_act_and_mul:
             shard_size = expert_data.shape[shard_dim] // 2
         else:
-            shard_size = expert_data.shape[shard_dim]
+            # For non-gated MoE, check if loaded_weight is already sharded
+            # (e.g., for compressed-tensors NVFP4, w1 and w3 may be separate)
+            expert_dim_size = expert_data.shape[shard_dim]
+            loaded_dim_size = loaded_weight.shape[shard_dim]
+
+            # If loaded_weight dimension matches expert_data, use full size
+            # Otherwise, it might be a single weight (w1 or w3) already sharded
+            if loaded_dim_size == expert_dim_size:
+                shard_size = expert_dim_size
+            elif loaded_dim_size == expert_dim_size // 2:
+                # Single weight (w1 or w3) for compressed-tensors format
+                shard_size = expert_dim_size // 2
+            else:
+                # Fallback: use expert_data dimension
+                shard_size = expert_dim_size
+
         if not load_full:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+            # Check if loaded_weight needs TP sharding
+            start_idx = shard_size * tp_rank
+
+            # If the requested slice would exceed bounds, the weight is likely
+            # already TP-sharded or a single weight (w1 or w3)
+            if start_idx + shard_size > loaded_dim_size:
+                # Weight is already sharded or smaller than expected
+                # Adjust shard_size to match available data
+                if start_idx < loaded_dim_size:
+                    # Partial slice available
+                    shard_size = loaded_dim_size - start_idx
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, start_idx, shard_size
+                    )
+                else:
+                    # Beyond bounds, weight is already sharded, use as-is
+                    # Adjust shard_size to match loaded_weight
+                    shard_size = loaded_dim_size
+            else:
+                # Safe to shard from full weight
+                loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
