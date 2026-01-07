@@ -688,9 +688,23 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             from vllm.model_executor.layers.fused_moe.cutlass_moe import cutlass_moe_fp4
 
             assert self.moe_quant_config is not None
-            # Use w13_weight.shape[1] (aligned n_dim) instead of w2_weight.shape[2] * 2
-            # to ensure n is divisible by 32 for CUTLASS kernel
+            # Note: cutlass_moe_fp4 expects n to be intermediate_size_per_partition,
+            # not n_dim. n_dim = 2 * intermediate_size_per_partition.
+            # The n parameter will be recalculated in CutlassExpertsFp4.apply
+            # to use w1.shape[1] // 2 and align it to 32.
             n_dim = layer.w13_weight.shape[1]
+            w2_half_n = layer.w2_weight.shape[2]
+            logger.warning(
+                "[%s.apply] Calling cutlass_moe_fp4: "
+                "w13_weight.shape=%s, w2_weight.shape=%s, "
+                "n_dim=%s, w2_half_n=%s, w2_half_n*2=%s",
+                self.layer_name,
+                layer.w13_weight.shape,
+                layer.w2_weight.shape,
+                n_dim,
+                w2_half_n,
+                w2_half_n * 2,
+            )
             return cutlass_moe_fp4(
                 a=x,
                 w1_fp4=layer.w13_weight,
@@ -701,6 +715,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 expert_map=layer.expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 # TODO(bnell): derive these from arguments
+                # Note: n will be recalculated in CutlassExpertsFp4.apply
                 m=x.shape[0],
                 n=n_dim,
                 k=x.shape[1],

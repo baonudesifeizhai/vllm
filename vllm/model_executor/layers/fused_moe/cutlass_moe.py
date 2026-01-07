@@ -578,6 +578,14 @@ def run_cutlass_moe_fp4(
     device: torch.device,
     apply_router_weight_on_input: bool = False,
 ) -> None:
+    logger.warning(
+        "[run_cutlass_moe_fp4] Received n=%s, n_divisible_by_32=%s, "
+        "w1_fp4.shape=%s, w2_fp4.shape=%s",
+        n,
+        n % 32 == 0,
+        w1_fp4.shape,
+        w2_fp4.shape,
+    )
     """
     MoE implementation for FP4 Inputs
 
@@ -655,6 +663,14 @@ def run_cutlass_moe_fp4(
 
     # problem shapes should have [m, n, k]
     # Note that problem sizes are based on logical number of elements.
+    logger.warning(
+        "[run_cutlass_moe_fp4] Before get_cutlass_moe_mm_data: "
+        "n=%s, n_divisible_by_32=%s, e=%s, k=%s",
+        n,
+        n % 32 == 0,
+        e,
+        k,
+    )
     ops.get_cutlass_moe_mm_data(
         topk_ids,
         expert_offsets,
@@ -666,6 +682,12 @@ def run_cutlass_moe_fp4(
         n,
         k,
         blockscale_offsets,
+    )
+    logger.warning(
+        "[run_cutlass_moe_fp4] After get_cutlass_moe_mm_data: "
+        "problem_sizes1=%s, problem_sizes2=%s",
+        problem_sizes1,
+        problem_sizes2,
     )
 
     a = ops.shuffle_rows(a, a_map)
@@ -679,6 +701,14 @@ def run_cutlass_moe_fp4(
     c1 = _resize_cache(workspace13, (m * topk, n * 2))
     c2 = _resize_cache(workspace2, (m * topk, n))
     c3 = _resize_cache(workspace13, (m * topk, k))
+    logger.warning(
+        "[run_cutlass_moe_fp4] Before first cutlass_fp4_moe_mm: "
+        "n=%s, n*2=%s, problem_sizes1=%s, w1_fp4.shape=%s",
+        n,
+        n * 2,
+        problem_sizes1,
+        w1_fp4.shape,
+    )
     ops.cutlass_fp4_moe_mm(
         c1,
         rep_a_fp4,
@@ -696,6 +726,13 @@ def run_cutlass_moe_fp4(
         c2, a2_gscale, expert_offsets, blockscale_offsets, num_topk
     )
 
+    logger.warning(
+        "[run_cutlass_moe_fp4] Before second cutlass_fp4_moe_mm: "
+        "n=%s, problem_sizes2=%s, w2_fp4.shape=%s",
+        n,
+        problem_sizes2,
+        w2_fp4.shape,
+    )
     ops.cutlass_fp4_moe_mm(
         c3,
         int_fp4,
@@ -818,8 +855,25 @@ class CutlassExpertsFp4(mk.FusedMoEPermuteExpertsUnpermute):
             align_dim_for_cutlass,
         )
 
+        original_n_from_problem_size = n
+        w1_n_dim = w1.shape[1]
+        w2_half_n = w2.shape[2]
         # n = intermediate_size_per_partition = n_dim // 2
         n = align_dim_for_cutlass(w1.shape[1] // 2)
+        logger.warning(
+            "[CutlassExpertsFp4.apply] n calculation: "
+            "original_n_from_problem_size=%s, w1.shape=%s, w2.shape=%s, "
+            "w1_n_dim=%s, w2_half_n=%s, w2_half_n*2=%s, "
+            "calculated_n=%s, n_divisible_by_32=%s",
+            original_n_from_problem_size,
+            w1.shape,
+            w2.shape,
+            w1_n_dim,
+            w2_half_n,
+            w2_half_n * 2,
+            n,
+            n % 32 == 0,
+        )
 
         run_cutlass_moe_fp4(
             output=output,
