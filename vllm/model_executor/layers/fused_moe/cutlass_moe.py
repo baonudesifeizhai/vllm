@@ -808,7 +808,18 @@ class CutlassExpertsFp4(mk.FusedMoEPermuteExpertsUnpermute):
         apply_router_weight_on_input: bool,
     ):
         e, m, n, k, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
-        n = w2.shape[2] * 2
+        # n should be intermediate_size_per_partition
+        # According to run_cutlass_moe_fp4 assertion: nx2_w1 == n * 2
+        # where nx2_w1 = w1.shape[1] (n_dim), so n = w1.shape[1] // 2
+        # But we need to ensure n is divisible by 32 for CUTLASS kernel
+        # Since w1.shape[1] is already aligned to 32, n = w1.shape[1] // 2
+        # may not be divisible by 32. We need to align it.
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            align_dim_for_cutlass,
+        )
+
+        # n = intermediate_size_per_partition = n_dim // 2
+        n = align_dim_for_cutlass(w1.shape[1] // 2)
 
         run_cutlass_moe_fp4(
             output=output,

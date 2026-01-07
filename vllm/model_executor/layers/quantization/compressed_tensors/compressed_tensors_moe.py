@@ -270,18 +270,23 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer.num_experts = num_experts
         layer.params_dtype = params_dtype
 
-        # Align n dimension to 32 for CUTLASS kernel
-        n_dim = 2 * intermediate_size_per_partition
+        # Align intermediate_size_per_partition to 32 for CUTLASS kernel
+        # n_dim = 2 * intermediate_size_per_partition
+        # We need both n_dim and intermediate_size_per_partition to be aligned
         if self.use_cutlass:
-            original_n_dim = n_dim
-            n_dim = align_dim_for_cutlass(n_dim)
-            if n_dim != original_n_dim:
+            original_intermediate_size = intermediate_size_per_partition
+            intermediate_size_per_partition = align_dim_for_cutlass(
+                intermediate_size_per_partition
+            )
+            if intermediate_size_per_partition != original_intermediate_size:
                 logger.warning(
-                    "[%s] Aligned n_dim from %s to %s for CUTLASS kernel",
+                    "[%s] Aligned intermediate_size_per_partition from %s to %s "
+                    "for CUTLASS kernel",
                     self.layer_name,
-                    original_n_dim,
-                    n_dim,
+                    original_intermediate_size,
+                    intermediate_size_per_partition,
                 )
+        n_dim = 2 * intermediate_size_per_partition
 
         w13_weight = torch.nn.Parameter(
             torch.empty(
