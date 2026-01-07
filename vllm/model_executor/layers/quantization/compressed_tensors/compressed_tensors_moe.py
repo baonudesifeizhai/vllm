@@ -718,16 +718,26 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             # not n_dim. n_dim = 2 * intermediate_size_per_partition.
             # The n parameter will be recalculated in CutlassExpertsFp4.apply
             # to use w1.shape[1] // 2 and align it to 32.
+            from vllm.model_executor.layers.quantization.utils.quant_utils import (
+                align_dim_for_cutlass,
+            )
+
             n_dim = layer.w13_weight.shape[1]
+            # n should be intermediate_size_per_partition, which is n_dim // 2
+            # and must be divisible by 32 for CUTLASS kernel
+            n = align_dim_for_cutlass(n_dim // 2)
             w2_half_n = layer.w2_weight.shape[2]
             logger.warning(
                 "[%s.apply] Calling cutlass_moe_fp4: "
                 "w13_weight.shape=%s, w2_weight.shape=%s, "
-                "n_dim=%s, w2_half_n=%s, w2_half_n*2=%s",
+                "n_dim=%s, n=%s, n_divisible_by_32=%s, "
+                "w2_half_n=%s, w2_half_n*2=%s",
                 self.layer_name,
                 layer.w13_weight.shape,
                 layer.w2_weight.shape,
                 n_dim,
+                n,
+                n % 32 == 0,
                 w2_half_n,
                 w2_half_n * 2,
             )
@@ -743,7 +753,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 # TODO(bnell): derive these from arguments
                 # Note: n will be recalculated in CutlassExpertsFp4.apply
                 m=x.shape[0],
-                n=n_dim,
+                n=n,
                 k=x.shape[1],
                 e=layer.w13_weight.shape[0],
             ).to(x.dtype)
