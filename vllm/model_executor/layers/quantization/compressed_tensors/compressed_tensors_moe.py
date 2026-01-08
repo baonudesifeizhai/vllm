@@ -85,6 +85,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.utils.math_utils import round_up
 
 logger = init_logger(__name__)
 
@@ -240,6 +241,16 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
     ):
         layer.num_experts = num_experts
         layer.params_dtype = params_dtype
+
+        # Align intermediate_size_per_partition to 32 for NVFP4 CUTLASS backend
+        # when using non-gated MoE (required by kernel alignment constraints)
+        if (
+            not self.moe.is_act_and_mul
+            and self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
+        ):
+            intermediate_size_per_partition = round_up(
+                intermediate_size_per_partition, 32
+            )
 
         w13_intermediate_size = (
             2 if self.moe.is_act_and_mul else 1
