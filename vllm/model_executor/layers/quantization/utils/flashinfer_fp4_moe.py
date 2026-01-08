@@ -31,7 +31,6 @@ from vllm.utils.flashinfer import (
     has_flashinfer_cutedsl_grouped_gemm_nt_masked,
     has_flashinfer_cutlass_fused_moe,
 )
-from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
@@ -496,10 +495,10 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     else:
         # Apply padding if needed (before swizzle_blockscale).
         # Kernel requires intermediate_size to be divisible by 32.
-        # Calculate pad_size based on 32-byte alignment, not 128-byte
-        # alignment from swizzle_blockscale.
-        aligned_w13_size = round_up(w13.size(1), 32)
-        pad_size = aligned_w13_size - w13.size(1)
+        # w13_scale is already aligned (from create_weights), but w13 uses
+        # original size. We need to pad w13 to match w13_scale's dimension.
+        # Calculate pad_size based on the difference between w13_scale and w13.
+        pad_size = w13_scale.size(1) - w13.size(1)
         if pad_size > 0:
             if is_act_and_mul:
                 raise NotImplementedError(
