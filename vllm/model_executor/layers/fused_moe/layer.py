@@ -583,6 +583,9 @@ class FusedMoE(CustomOp):
 
         if not self.moe_config.is_act_and_mul:
             # Avoid circular import
+            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa: E501
+                CompressedTensorsW4A4Nvfp4MoEMethod,
+            )
             from vllm.model_executor.layers.quantization.modelopt import (
                 ModelOptFp8MoEMethod,
                 ModelOptNvFp4FusedMoE,
@@ -594,11 +597,13 @@ class FusedMoE(CustomOp):
                     UnquantizedFusedMoEMethod,
                     ModelOptFp8MoEMethod,
                     ModelOptNvFp4FusedMoE,
+                    CompressedTensorsW4A4Nvfp4MoEMethod,
                 ),
             ):
                 raise NotImplementedError(
                     "is_act_and_mul=False is supported only for unquantized "
-                    ", ModelOpt FP8, and ModelOpt NvFp4 checkpoints"
+                    ", ModelOpt FP8, ModelOpt NvFp4, and compressed-tensors "
+                    "NVFP4 checkpoints"
                 )
             # ROCm without AITER MoE uses Triton which supports
             # is_act_and_mul=False via standard PyTorch ops (F.silu, F.gelu)

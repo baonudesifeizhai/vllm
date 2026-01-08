@@ -212,15 +212,18 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
 
 class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
     def __init__(self, moe: FusedMoEConfig, layer_name: str | None = None):
-        if not moe.is_act_and_mul:
-            raise ValueError(
-                "CompressedTensorsW4A4Nvfp4MoEMethod does not yet "
-                "support non gated MoE models."
-            )
-
         super().__init__(moe)
         self.group_size = 16
         self.nvfp4_backend = select_nvfp4_moe_backend()
+        # Check if non-gated activations are supported
+        if (
+            not self.moe.is_act_and_mul
+            and not self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
+        ):
+            raise NotImplementedError(
+                "Non-gated activations are only supported by FlashInfer "
+                "CUTLASS NvFP4 MoE backend."
+            )
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
         )
