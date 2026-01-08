@@ -244,12 +244,18 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
         # Align intermediate_size_per_partition to 32 for NVFP4 CUTLASS backend
         # when using non-gated MoE (required by kernel alignment constraints)
+        # Store original size for weight loading
+        original_intermediate_size_per_partition = intermediate_size_per_partition
         if (
             not self.moe.is_act_and_mul
             and self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS
         ):
             intermediate_size_per_partition = round_up(
                 intermediate_size_per_partition, 32
+            )
+            # Store original size for weight loading
+            layer._original_intermediate_size_per_partition = (
+                original_intermediate_size_per_partition
             )
 
         w13_intermediate_size = (
