@@ -999,10 +999,21 @@ class FusedMoE(CustomOp):
             shard_size = expert_data.shape[shard_dim] // 2
         else:
             shard_size = expert_data.shape[shard_dim]
-        if not load_full:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
-            )
+
+        if load_full:
+            loaded_weight_shard = loaded_weight
+        else:
+            loaded_dim = loaded_weight.shape[shard_dim]
+            if loaded_dim >= shard_size * self.tp_size:
+                # Full size, calculate shard
+                original_shard_size = loaded_dim // self.tp_size
+                loaded_weight_shard = loaded_weight.narrow(
+                    shard_dim, original_shard_size * tp_rank, original_shard_size
+                )
+            else:
+                # Already sharded, use as-is
+                loaded_weight_shard = loaded_weight
+
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -1010,8 +1021,27 @@ class FusedMoE(CustomOp):
         # w3, up_proj: Load into second logical weight of w13.
         else:
             assert shard_id == "w3"
-            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
-        expert_data.copy_(loaded_weight)
+            if self.moe_config.is_act_and_mul:
+                # For gated MoE, w3 loads at position shard_size
+                expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+            else:
+                # For non-gated MoE, w1 and w3 are separate weights,
+                # both load at position 0 since w13_weight only has
+                # intermediate_size_per_partition dimension
+                expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+
+        # Handle size mismatch
+        if loaded_weight_shard.shape[shard_dim] != shard_size:
+            copy_size = min(shard_size, loaded_weight_shard.shape[shard_dim])
+            expert_slice = [slice(None)] * len(expert_data.shape)
+            loaded_slice = [slice(None)] * len(loaded_weight_shard.shape)
+            expert_slice[shard_dim] = slice(0, copy_size)
+            loaded_slice[shard_dim] = slice(0, copy_size)
+            expert_data[tuple(expert_slice)].copy_(
+                loaded_weight_shard[tuple(loaded_slice)]
+            )
+        else:
+            expert_data.copy_(loaded_weight_shard)
 
     def _load_w2(
         self,
