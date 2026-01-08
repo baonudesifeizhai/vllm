@@ -1025,12 +1025,35 @@ class FusedMoE(CustomOp):
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
+        loaded_dim = loaded_weight.shape[shard_dim]
+
         if not load_full:
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, shard_size * tp_rank, shard_size
+            # Check if loaded_weight is already sharded
+            if loaded_dim < shard_size * self.tp_size:
+                # Already sharded, use as-is
+                loaded_weight_shard = loaded_weight
+            else:
+                # Full size, calculate shard
+                original_shard_size = loaded_dim // self.tp_size
+                loaded_weight_shard = loaded_weight.narrow(
+                    shard_dim, original_shard_size * tp_rank, original_shard_size
+                )
+        else:
+            loaded_weight_shard = loaded_weight
+
+        # Copy data, handling potential size mismatch
+        if loaded_weight_shard.shape[shard_dim] != shard_size:
+            # Size mismatch: copy only the matching portion
+            expert_slice = [slice(None)] * len(expert_data.shape)
+            loaded_slice = [slice(None)] * len(loaded_weight_shard.shape)
+            copy_size = min(shard_size, loaded_weight_shard.shape[shard_dim])
+            expert_slice[shard_dim] = slice(0, copy_size)
+            loaded_slice[shard_dim] = slice(0, copy_size)
+            expert_data[tuple(expert_slice)].copy_(
+                loaded_weight_shard[tuple(loaded_slice)]
             )
-        # w2, down_proj: Load into only logical weight of w2.
-        expert_data.copy_(loaded_weight)
+        else:
+            expert_data.copy_(loaded_weight_shard)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
