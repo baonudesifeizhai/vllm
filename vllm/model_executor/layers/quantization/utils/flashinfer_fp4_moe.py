@@ -507,13 +507,27 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
                     backend.value,
                 )
 
-            w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size, 0, 0))
+            # For 3D tensor [num_experts, intermediate_size, hidden_size // 2],
+            # pad the intermediate_size dimension (dim=1).
+            # Padding format: (pad_left_dim2, pad_right_dim2, pad_left_dim1,
+            # pad_right_dim1, pad_left_dim0, pad_right_dim0)
+            # For w13: [num_experts, 2576, hidden_size // 2] ->
+            # [num_experts, 2592, hidden_size // 2]
+            # Ensure padding is applied correctly by using .contiguous()
+            # after padding
+            w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size, 0, 0)).contiguous()
 
-            w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0, 0, 0))
+            # For w2: [num_experts, hidden_size, intermediate_size // 2],
+            # pad the last dimension (dim=2).
+            w2 = torch.nn.functional.pad(
+                w2, (0, pad_size // 2, 0, 0, 0, 0)
+            ).contiguous()
 
+            # For w2_scale: [num_experts, hidden_size, intermediate_size // group_size],
+            # pad the last dimension (dim=2).
             w2_scale = torch.nn.functional.pad(
                 w2_scale, (0, pad_size // 16, 0, 0, 0, 0)
-            )
+            ).contiguous()
 
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         # This pads scales to 128-byte alignment, which is fine as long
