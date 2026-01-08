@@ -223,24 +223,28 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             self.backend.startswith("flashinfer-")
             and self.backend[len("flashinfer-") :] == "cutlass"
         )
+        needs_alignment = False
+        aligned_output_size = None
         if uses_cutlass and hasattr(layer, "_aligned_output_size"):
             aligned_output_size = layer._aligned_output_size
             if (
                 aligned_output_size is not None
                 and aligned_output_size != original_output_size
             ):
+                needs_alignment = True
                 # Truncate weight for CUTLASS kernel alignment
                 weight_packed = layer.weight_packed[:aligned_output_size, :]
                 weight_scale = layer.weight_scale[:aligned_output_size, :]
-                output_shape = [*x.shape[:-1], aligned_output_size]
             else:
                 weight_packed = layer.weight_packed
                 weight_scale = layer.weight_scale
-                output_shape = [*x.shape[:-1], original_output_size]
         else:
             weight_packed = layer.weight_packed
             weight_scale = layer.weight_scale
-            output_shape = [*x.shape[:-1], original_output_size]
+
+        # Always use original output size for output_shape to preserve dimensions
+        # for downstream layers (e.g., mamba_mixer2)
+        output_shape = [*x.shape[:-1], original_output_size]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_global_scale)
@@ -269,14 +273,33 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             assert self.backend == "cutlass"
             out = cutlass_scaled_fp4_mm(*mm_args)
 
+        # If alignment was needed, pad output back to original size
+        if needs_alignment and aligned_output_size < original_output_size:
+            # Pad with zeros to restore original dimension
+            pad_size = original_output_size - aligned_output_size
+            logger.debug(
+                "[CompressedTensorsW4A4Fp4.apply_weights] Padding output from %s "
+                "to %s (pad_size=%s)",
+                aligned_output_size,
+                original_output_size,
+                pad_size,
+            )
+            out = torch.nn.functional.pad(
+                out, (0, pad_size), mode="constant", value=0.0
+            )
+
         if bias is not None:
-            # Truncate bias if output was truncated
-            if uses_cutlass and hasattr(layer, "_aligned_output_size"):
-                aligned_output_size = layer._aligned_output_size
-                if (
-                    aligned_output_size is not None
-                    and aligned_output_size != original_output_size
-                ):
-                    bias = bias[:aligned_output_size]
             out = out + bias
-        return out.view(*output_shape)
+
+        # Ensure output shape matches expected dimensions
+        result = out.view(*output_shape)
+        if result.shape[-1] != original_output_size:
+            logger.warning(
+                "[CompressedTensorsW4A4Fp4.apply_weights] Output shape mismatch: "
+                "expected last dim=%s, got %s, output_shape=%s, out.shape=%s",
+                original_output_size,
+                result.shape[-1],
+                output_shape,
+                out.shape,
+            )
+        return result
