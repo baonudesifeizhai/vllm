@@ -506,9 +506,14 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
                     "NvFp4 backend, but this is not currently supported",
                     backend.value,
                 )
-            w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size))
-            w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0))
-            w2_scale = torch.nn.functional.pad(w2_scale, (0, pad_size // 16))
+
+            w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size, 0, 0))
+
+            w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0, 0, 0))
+
+            w2_scale = torch.nn.functional.pad(
+                w2_scale, (0, pad_size // 16, 0, 0, 0, 0)
+            )
 
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         # This pads scales to 128-byte alignment, which is fine as long
