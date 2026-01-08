@@ -241,10 +241,15 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         layer.num_experts = num_experts
         layer.params_dtype = params_dtype
 
+        w13_intermediate_size = (
+            2 if self.moe.is_act_and_mul else 1
+        ) * intermediate_size_per_partition
+        w13_scale_dim = 2 if self.moe.is_act_and_mul else 1
+
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_intermediate_size,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // 2,
                 requires_grad=False,
@@ -272,7 +277,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         w13_weight_scale = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_intermediate_size,
                 # 2 fp4 items are packed in the input dimension
                 hidden_size // self.group_size,
                 dtype=torch.float8_e4m3fn,
@@ -303,7 +308,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
         # Weight Global Scales
         w13_weight_scale_2 = torch.nn.Parameter(
-            torch.empty(num_experts, 2, dtype=torch.float32), requires_grad=False
+            torch.empty(num_experts, w13_scale_dim, dtype=torch.float32),
+            requires_grad=False,
         )
         layer.register_parameter("w13_weight_global_scale", w13_weight_scale_2)
         extra_weight_attrs.update(
@@ -322,7 +328,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
 
         # Input Global Scales
         w13_input_scale = torch.nn.Parameter(
-            torch.empty(num_experts, 2, dtype=torch.float32), requires_grad=False
+            torch.empty(num_experts, w13_scale_dim, dtype=torch.float32),
+            requires_grad=False,
         )
         layer.register_parameter("w13_input_global_scale", w13_input_scale)
         extra_weight_attrs.update(
@@ -365,7 +372,16 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 "w1_weight_global_scale must match w3_weight_global_scale. "
                 "Accuracy may be affected.",
             )
-        w13_weight_global_scale = layer.w13_weight_global_scale[:, 0].contiguous()
+        w13_weight_global_scale = (
+            layer.w13_weight_global_scale[:, 0].contiguous()
+            if self.moe.is_act_and_mul
+            else layer.w13_weight_global_scale.squeeze(-1).contiguous()
+        )
+        a13_scale_input = (
+            1.0 / layer.w13_input_global_scale
+            if self.moe.is_act_and_mul
+            else 1.0 / layer.w13_input_global_scale.squeeze(-1)
+        )
 
         # Shuffle weights into the NvFp4 kernel format.
         (
@@ -383,7 +399,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             w13=layer.w13_weight,
             w13_scale=layer.w13_weight_scale,
             w13_scale_2=(1.0 / w13_weight_global_scale),
-            a13_scale=(1.0 / layer.w13_input_global_scale),
+            a13_scale=a13_scale_input,
             w2=layer.w2_weight,
             w2_scale=layer.w2_weight_scale,
             w2_scale_2=(1.0 / layer.w2_weight_global_scale),
