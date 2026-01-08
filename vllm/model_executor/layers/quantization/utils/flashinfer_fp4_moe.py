@@ -31,6 +31,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_cutedsl_grouped_gemm_nt_masked,
     has_flashinfer_cutlass_fused_moe,
 )
+from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
@@ -493,11 +494,12 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         layer.g1_alphas = a13_scale * w13_scale_2
         layer.g2_alphas = a2_scale * w2_scale_2
     else:
-        # Swizzle the block scales for other FI NVFP4 MoE kernels.
-        w13_scale = swizzle_blockscale(w13_scale)
-
-        # Apply padding if needed.
-        pad_size = w13_scale.size(1) - w13.size(1)
+        # Apply padding if needed (before swizzle_blockscale).
+        # Kernel requires intermediate_size to be divisible by 32.
+        # Calculate pad_size based on 32-byte alignment, not 128-byte
+        # alignment from swizzle_blockscale.
+        aligned_w13_size = round_up(w13.size(1), 32)
+        pad_size = aligned_w13_size - w13.size(1)
         if pad_size > 0:
             if is_act_and_mul:
                 raise NotImplementedError(
@@ -509,6 +511,10 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             w2 = torch.nn.functional.pad(w2, (0, pad_size // 2, 0, 0))
             w2_scale = torch.nn.functional.pad(w2_scale, (0, pad_size // 16))
 
+        # Swizzle the block scales for other FI NVFP4 MoE kernels.
+        # This pads scales to 128-byte alignment, which is fine as long
+        # as we've already padded weights to 32-byte alignment above.
+        w13_scale = swizzle_blockscale(w13_scale)
         w2_scale = swizzle_blockscale(w2_scale)
 
     return w13, w13_scale, w13_scale_2, a13_scale, w2, w2_scale, w2_scale_2, a2_scale
