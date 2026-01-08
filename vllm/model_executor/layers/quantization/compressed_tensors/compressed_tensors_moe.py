@@ -633,10 +633,15 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             self.allow_flashinfer,
             self.use_marlin,
         )
-        # Support both "silu" and "silu_no_mul" (from activation_without_mul)
-        supported_activations = ("silu", "silu_no_mul")
+        # Support SiLU and ReLU2 activations (both gated and non-gated)
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            RELU2_NO_MUL,
+            SILU_NO_MUL,
+        )
+
+        supported_activations = ("silu", SILU_NO_MUL, RELU2_NO_MUL)
         assert layer.activation in supported_activations, (
-            f"Only SiLU activation is supported, got {layer.activation}."
+            f"Only SiLU and ReLU2 activations are supported, got {layer.activation}."
         )
 
         if (
@@ -754,6 +759,7 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 quant_config=self.moe_quant_config,
                 expert_map=layer.expert_map,
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                activation=layer.activation,
                 # TODO(bnell): derive these from arguments
                 # Note: n will be recalculated in CutlassExpertsFp4.apply
                 m=x.shape[0],

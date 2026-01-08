@@ -577,6 +577,7 @@ def run_cutlass_moe_fp4(
     e: int,
     device: torch.device,
     apply_router_weight_on_input: bool = False,
+    activation: str = "silu",
 ) -> None:
     logger.warning(
         "[run_cutlass_moe_fp4] Received n=%s, n_divisible_by_32=%s, "
@@ -721,7 +722,25 @@ def run_cutlass_moe_fp4(
         blockscale_offsets[:-1],
     )
     del rep_a_fp4, rep_a_blockscale
-    torch.ops._C.silu_and_mul(c2, c1)
+    # Apply activation based on type
+    import torch.nn.functional as F
+
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        RELU2_NO_MUL,
+        SILU_NO_MUL,
+    )
+
+    if activation == "silu":
+        torch.ops._C.silu_and_mul(c2, c1)
+    elif activation == SILU_NO_MUL:
+        # For non-gated, apply SiLU to first half of c1 (up projection)
+        c2.copy_(F.silu(c1.view(-1, n * 2)[:, :n]))
+    elif activation == RELU2_NO_MUL:
+        # For non-gated, apply ReLU2 to first half of c1 (up projection)
+        # ReLU2 = square(ReLU(x))
+        c2.copy_(torch.square(F.relu(c1.view(-1, n * 2)[:, :n])))
+    else:
+        raise ValueError(f"Unsupported activation for cutlass_moe_fp4: {activation}")
     int_fp4, int_blockscale = ops.scaled_fp4_experts_quant(
         c2, a2_gscale, expert_offsets, blockscale_offsets, num_topk
     )
@@ -903,6 +922,7 @@ class CutlassExpertsFp4(mk.FusedMoEPermuteExpertsUnpermute):
             e=e,
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            activation=activation,
         )
 
 
@@ -919,6 +939,7 @@ def cutlass_moe_fp4(
     e: int,
     expert_map: torch.Tensor | None = None,
     apply_router_weight_on_input: bool = False,
+    activation: str = "silu",
 ) -> torch.Tensor:
     logger.warning(
         "[cutlass_moe_fp4] Entering function: "
@@ -989,7 +1010,7 @@ def cutlass_moe_fp4(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         inplace=False,
-        activation="silu",
+        activation=activation,
         global_num_experts=e,
         expert_map=None,
         apply_router_weight_on_input=apply_router_weight_on_input,
