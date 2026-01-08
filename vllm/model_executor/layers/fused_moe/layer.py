@@ -1023,51 +1023,14 @@ class FusedMoE(CustomOp):
     ):
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
+        # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
-        loaded_dim = loaded_weight.shape[shard_dim]
-
-        # Check if we have original (unaligned) intermediate_size_per_partition
-        # This is needed when weights are padded for alignment
-        original_intermediate_size = getattr(
-            self, "_original_intermediate_size_per_partition", None
-        )
-
-        # Calculate original dimensions (accounting for FP4 packing if shard_dim=1)
-        # For w2 with FP4 packed weights, shard_dim=1 corresponds to
-        # intermediate_size_per_partition // 2 (packed dimension)
-        packing_factor = 2 if shard_dim == 1 else 1
-
-        if original_intermediate_size is not None:
-            original_full_dim = original_intermediate_size // packing_factor
-            original_shard_size = original_full_dim // self.tp_size
-        else:
-            # No original size stored, use standard logic
-            original_full_dim = loaded_dim
-            if load_full or loaded_dim < shard_size * self.tp_size:
-                original_shard_size = loaded_dim
-            else:
-                original_shard_size = loaded_dim // self.tp_size
-
-        # Get the shard to load
-        if load_full:
-            loaded_weight_shard = loaded_weight
-        elif loaded_dim < original_full_dim:
-            # Already sharded
-            loaded_weight_shard = loaded_weight
-        else:
-            # Full size: calculate shard and narrow using original size
-            loaded_weight_shard = loaded_weight.narrow(
-                shard_dim, original_shard_size * tp_rank, original_shard_size
+        if not load_full:
+            loaded_weight = loaded_weight.narrow(
+                shard_dim, shard_size * tp_rank, shard_size
             )
-
-        # Copy data, handling padding if expert_data is larger than original size
-        if original_shard_size < shard_size:
-            # expert_data is padded, copy only the original portion
-            expert_data_slice = [slice(None)] * len(expert_data.shape)
-            expert_data_slice[shard_dim] = slice(0, original_shard_size)
-            expert_data[tuple(expert_data_slice)].copy_(loaded_weight_shard)
-        else:
-            expert_data.copy_(loaded_weight_shard)
+        # w2, down_proj: Load into only logical weight of w2.
+        expert_data.copy_(loaded_weight)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
