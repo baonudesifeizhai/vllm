@@ -633,7 +633,11 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             self.allow_flashinfer,
             self.use_marlin,
         )
-        assert layer.activation == "silu", "Only SiLU activation is supported."
+        # Support both "silu" and "silu_no_mul" (from activation_without_mul)
+        supported_activations = ("silu", "silu_no_mul")
+        assert layer.activation in supported_activations, (
+            f"Only SiLU activation is supported, got {layer.activation}."
+        )
 
         if (
             self.allow_flashinfer
