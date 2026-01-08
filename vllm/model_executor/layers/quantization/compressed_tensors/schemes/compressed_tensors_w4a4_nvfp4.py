@@ -277,13 +277,6 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         if needs_alignment and aligned_output_size < original_output_size:
             # Pad with zeros to restore original dimension
             pad_size = original_output_size - aligned_output_size
-            logger.debug(
-                "[CompressedTensorsW4A4Fp4.apply_weights] Padding output from %s "
-                "to %s (pad_size=%s)",
-                aligned_output_size,
-                original_output_size,
-                pad_size,
-            )
             out = torch.nn.functional.pad(
                 out, (0, pad_size), mode="constant", value=0.0
             )
@@ -291,15 +284,4 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         if bias is not None:
             out = out + bias
 
-        # Ensure output shape matches expected dimensions
-        result = out.view(*output_shape)
-        if result.shape[-1] != original_output_size:
-            logger.warning(
-                "[CompressedTensorsW4A4Fp4.apply_weights] Output shape mismatch: "
-                "expected last dim=%s, got %s, output_shape=%s, out.shape=%s",
-                original_output_size,
-                result.shape[-1],
-                output_shape,
-                out.shape,
-            )
-        return result
+        return out.view(*output_shape)
