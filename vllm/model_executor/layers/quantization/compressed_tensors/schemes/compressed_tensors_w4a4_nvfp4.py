@@ -140,7 +140,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         # Ensure alignment for CUTLASS kernel
         # Note: We don't truncate weights here to avoid breaking mamba_mixer2
         # split operations. Instead, we handle alignment in apply_weights.
-        if self.backend == "cutlass":
+        # Check if backend uses CUTLASS (either "cutlass" or "flashinfer-cutlass")
+        uses_cutlass = self.backend == "cutlass" or (
+            self.backend.startswith("flashinfer-")
+            and self.backend[len("flashinfer-") :] == "cutlass"
+        )
+        if uses_cutlass:
             weight_data = layer.weight_packed.data
             original_output_size = weight_data.shape[0]
             aligned_output_size = align_dim_for_cutlass(original_output_size)
@@ -213,7 +218,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         original_output_size = layer.weight_packed.shape[0]
 
         # Handle alignment for CUTLASS kernel if needed
-        if self.backend == "cutlass" and hasattr(layer, "_aligned_output_size"):
+        # Check if backend uses CUTLASS (either "cutlass" or "flashinfer-cutlass")
+        uses_cutlass = self.backend == "cutlass" or (
+            self.backend.startswith("flashinfer-")
+            and self.backend[len("flashinfer-") :] == "cutlass"
+        )
+        if uses_cutlass and hasattr(layer, "_aligned_output_size"):
             aligned_output_size = layer._aligned_output_size
             if (
                 aligned_output_size is not None
@@ -261,7 +271,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
         if bias is not None:
             # Truncate bias if output was truncated
-            if self.backend == "cutlass" and hasattr(layer, "_aligned_output_size"):
+            if uses_cutlass and hasattr(layer, "_aligned_output_size"):
                 aligned_output_size = layer._aligned_output_size
                 if (
                     aligned_output_size is not None
