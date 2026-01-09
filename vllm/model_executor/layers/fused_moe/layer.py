@@ -2097,6 +2097,15 @@ class FusedMoE(CustomOp):
             )
         )
 
+        # Build the list of (shard_id, weight_name) pairs
+        # Skip w3 if ckpt_up_proj_name is empty (for non-gated MoE)
+        shard_weight_pairs = [
+            ("w1", ckpt_gate_proj_name),
+            ("w2", ckpt_down_proj_name),
+        ]
+        if ckpt_up_proj_name:
+            shard_weight_pairs.append(("w3", ckpt_up_proj_name))
+
         return [
             # (param_name, weight_name, expert_id, shard_id)
             (
@@ -2108,11 +2117,7 @@ class FusedMoE(CustomOp):
                 shard_id,
             )
             for expert_id in range(num_physical_experts)
-            for shard_id, weight_name in [
-                ("w1", ckpt_gate_proj_name),
-                ("w2", ckpt_down_proj_name),
-                ("w3", ckpt_up_proj_name),
-            ]
+            for shard_id, weight_name in shard_weight_pairs
         ]
 
     def extra_repr(self) -> str:
