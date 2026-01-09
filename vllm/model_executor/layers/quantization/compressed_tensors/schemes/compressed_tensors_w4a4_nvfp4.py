@@ -152,13 +152,32 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.weight_packed = Parameter(weight, requires_grad=False)
         else:
-            swizzled_weight_scale = swizzle_blockscale(layer.weight_scale)
+            weight = layer.weight_packed.data
+            weight_scale = layer.weight_scale.data
+            orig_n = weight.shape[0]
+            pad_n = (-orig_n) % 32
+            if pad_n:
+                padded_n = orig_n + pad_n
+                padded_weight = torch.zeros(
+                    (padded_n, weight.shape[1]),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                padded_weight[:orig_n] = weight
+                weight = padded_weight
+                padded_weight_scale = torch.zeros(
+                    (padded_n, weight_scale.shape[1]),
+                    dtype=weight_scale.dtype,
+                    device=weight_scale.device,
+                )
+                padded_weight_scale[:orig_n] = weight_scale
+                weight_scale = padded_weight_scale
+
+            swizzled_weight_scale = swizzle_blockscale(weight_scale)
             if self.backend == "fbgemm":
                 swizzled_weight_scale = swizzled_weight_scale.view(-1).view(torch.uint8)
             layer.weight_scale = Parameter(swizzled_weight_scale, requires_grad=False)
-            layer.weight_packed = Parameter(
-                layer.weight_packed.data, requires_grad=False
-            )
+            layer.weight_packed = Parameter(weight, requires_grad=False)
 
         layer.alpha = Parameter(
             1 / (layer.input_global_scale * layer.weight_global_scale),
@@ -171,6 +190,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        output_size = layer.output_size_per_partition
         if envs.VLLM_USE_NVFP4_CT_EMULATIONS:
             out = run_nvfp4_emulations(
                 x=x,
@@ -179,12 +199,14 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
                 weight_scale_swizzled=layer.weight_scale,
                 weight_global_scale=layer.weight_global_scale,
             )
+            if layer.weight_packed.shape[0] != output_size:
+                out = out[..., :output_size]
             if bias is not None:
                 out = out + bias
-            return out
+            return out.view(*x.shape[:-1], output_size)
 
         output_dtype = x.dtype
-        output_shape = [*x.shape[:-1], layer.weight_packed.shape[0]]
+        output_shape = [*x.shape[:-1], output_size]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = scaled_fp4_quant(x, layer.input_global_scale)
@@ -213,6 +235,8 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             assert self.backend == "cutlass"
             out = cutlass_scaled_fp4_mm(*mm_args)
 
+        if layer.weight_packed.shape[0] != output_size:
+            out = out[:, :output_size]
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
