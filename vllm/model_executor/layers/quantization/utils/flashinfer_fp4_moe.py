@@ -526,12 +526,21 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             w13.size(0),  # num_experts
         )
 
+        # Adjust scales based on padding ratio to account for padded dimensions.
+        # The kernel uses padded_intermediate_size, but scales were computed
+        # based on original intermediate_size, so we need to adjust them.
+        padding_ratio = padded_intermediate_size / intermediate_size
+        # For w13: padding affects the output dimension, so scale needs adjustment
+        w13_scale_2_adjusted = w13_scale_2 / padding_ratio
+        # For w2: padding affects the input dimension, so scale needs adjustment
+        w2_scale_2_adjusted = w2_scale_2 / padding_ratio
+
         # We do not need to make this a parameter, because
         # it is not used during the weight (re)-loading process.
-        layer.g1_scale_c = a13_scale * w13_scale_2 / a2_scale
+        layer.g1_scale_c = a13_scale * w13_scale_2_adjusted / a2_scale
         layer.a1_gscale = 1.0 / a13_scale
-        layer.g1_alphas = a13_scale * w13_scale_2
-        layer.g2_alphas = a2_scale * w2_scale_2
+        layer.g1_alphas = a13_scale * w13_scale_2_adjusted
+        layer.g2_alphas = a2_scale * w2_scale_2_adjusted
     else:
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         w13_scale = swizzle_blockscale(w13_scale)
