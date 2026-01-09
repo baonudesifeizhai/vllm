@@ -251,6 +251,116 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     )
 
 
+def prepare_static_weights_for_trtllm_fp4_moe_nongated(
+    gemm1_weights,
+    gemm2_weights,
+    gemm1_scales_linear_fp4_bytes,
+    gemm2_scales_linear_fp4_bytes,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+):
+    from flashinfer import nvfp4_block_scale_interleave
+    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+
+    _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
+    """Prepare quantized weights for non-gated TRTLLM kernel (done offline)."""
+    epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
+
+    gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
+        num_experts, intermediate_size, hidden_size // 2
+    )  # packed fp4
+    gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, intermediate_size, hidden_size // 16)
+
+    gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
+        num_experts, hidden_size, intermediate_size // 2
+    )  # packed fp4
+    gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)
+
+    gemm1_weights_fp4_shuffled = []
+    gemm1_scales_fp4_shuffled = []
+    gemm2_weights_fp4_shuffled = []
+    gemm2_scales_fp4_shuffled = []
+    for i in range(num_experts):
+        permute_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm1_weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm1_weights_fp4_shuffled.append(
+            gemm1_weights_fp4[i]
+            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm1_scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm1_scales_fp4_shuffled.append(
+            nvfp4_block_scale_interleave(
+                gemm1_scales_linear_fp4[i]
+                .view(torch.uint8)[
+                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
+                ]
+                .contiguous()
+            )
+        )
+
+        permute_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm2_weights_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+        )
+        gemm2_weights_fp4_shuffled.append(
+            gemm2_weights_fp4[i]
+            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
+            .contiguous()
+        )
+
+        permute_sf_indices = get_w2_permute_indices_with_cache(
+            _cache_permute_indices,
+            gemm2_scales_linear_fp4[i].view(torch.uint8),
+            epilogue_tile_m,
+            num_elts_per_sf=16,
+        )
+        gemm2_scales_fp4_shuffled.append(
+            nvfp4_block_scale_interleave(
+                gemm2_scales_linear_fp4[i]
+                .view(torch.uint8)[
+                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
+                ]
+                .contiguous()
+            )
+        )
+
+    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
+    gemm1_scales_fp4_shuffled = (
+        torch.stack(gemm1_scales_fp4_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_experts, intermediate_size, hidden_size // 16)
+    )
+
+    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
+    gemm2_scales_fp4_shuffled = (
+        torch.stack(gemm2_scales_fp4_shuffled)
+        .view(torch.float8_e4m3fn)
+        .reshape(num_experts, hidden_size, intermediate_size // 16)
+    )
+    return (
+        gemm1_weights_fp4_shuffled,
+        gemm1_scales_fp4_shuffled,
+        gemm2_weights_fp4_shuffled,
+        gemm2_scales_fp4_shuffled,
+    )
+
+
 def flashinfer_trtllm_fp4_moe(
     layer: torch.nn.Module,
     x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -471,6 +581,9 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     ]
 
     # Reorder [w1, w3] to [w3, w1] for FI NVFP4 MoE kernels.
+    activation = getattr(layer, "activation", None)
+    if activation == "relu2":
+        is_act_and_mul = False
     if is_act_and_mul and backend in [
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
@@ -516,31 +629,35 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
 
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
-        w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
-            w13,
-            w2,
-            w13_scale,
-            w2_scale,
-            hidden_size,
-            padded_intermediate_size,
-            w13.size(0),  # num_experts
-        )
-
-        # Adjust scales based on padding ratio to account for padded dimensions.
-        # The kernel uses padded_intermediate_size, but scales were computed
-        # based on original intermediate_size, so we need to adjust them.
-        padding_ratio = padded_intermediate_size / intermediate_size
-        # For w13: padding affects the output dimension, so scale needs adjustment
-        w13_scale_2_adjusted = w13_scale_2 / padding_ratio
-        # For w2: padding affects the input dimension, so scale needs adjustment
-        w2_scale_2_adjusted = w2_scale_2 / padding_ratio
+        if is_act_and_mul:
+            w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
+                w13,
+                w2,
+                w13_scale,
+                w2_scale,
+                hidden_size,
+                padded_intermediate_size,
+                w13.size(0),  # num_experts
+            )
+        else:
+            w13, w13_scale, w2, w2_scale = (
+                prepare_static_weights_for_trtllm_fp4_moe_nongated(
+                    w13,
+                    w2,
+                    w13_scale,
+                    w2_scale,
+                    hidden_size,
+                    padded_intermediate_size,
+                    w13.size(0),  # num_experts
+                )
+            )
 
         # We do not need to make this a parameter, because
         # it is not used during the weight (re)-loading process.
-        layer.g1_scale_c = a13_scale * w13_scale_2_adjusted / a2_scale
+        layer.g1_scale_c = a13_scale * w13_scale_2 / a2_scale
         layer.a1_gscale = 1.0 / a13_scale
-        layer.g1_alphas = a13_scale * w13_scale_2_adjusted
-        layer.g2_alphas = a2_scale * w2_scale_2_adjusted
+        layer.g1_alphas = a13_scale * w13_scale_2
+        layer.g2_alphas = a2_scale * w2_scale_2
     else:
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
         w13_scale = swizzle_blockscale(w13_scale)
