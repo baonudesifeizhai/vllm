@@ -134,15 +134,18 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     """Prepare quantized weights for kernel (done offline with weights)."""
     epilogue_tile_m = 128  # FIXME: this depends on the kernel internals
 
+    # Determine actual gemm1 dimension from weights
+    # For gated MoE: gemm1_weights.size(-2) = 2 * intermediate_size
+    # For non-gated MoE: gemm1_weights.size(-2) = intermediate_size
+    gemm1_dim = gemm1_weights.size(-2)
+
     # Convert quantized weights to proper formats
     gemm1_weights_fp4 = gemm1_weights.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 2
+        num_experts, gemm1_dim, hidden_size // 2
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, gemm1_dim, hidden_size // 16)  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
         num_experts, hidden_size, intermediate_size // 2
@@ -219,7 +222,7 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     gemm1_scales_fp4_shuffled = (
         torch.stack(gemm1_scales_fp4_shuffled)
         .view(torch.float8_e4m3fn)
-        .reshape(num_experts, 2 * intermediate_size, hidden_size // 16)
+        .reshape(num_experts, gemm1_dim, hidden_size // 16)
     )
 
     gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
