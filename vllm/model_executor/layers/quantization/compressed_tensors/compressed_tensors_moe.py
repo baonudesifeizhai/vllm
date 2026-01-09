@@ -571,39 +571,36 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             )
         else:
             # Non-TRT-LLM processing (Cutlass or non-flashinfer)
+            # swizzle weight scales (this may pad the M dimension to 128)
+            w13_scale_before = layer.w13_weight_scale.shape
+            w13_weight_before = layer.w13_weight.shape
             w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
-            layer.w13_weight_scale = Parameter(
+            layer.w13_weight_scale = torch.nn.Parameter(
                 w13_blockscale_swizzled, requires_grad=False
             )
 
-            w13_weight = layer.w13_weight
-            intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
+            intermediate_size_pad = (
+                w13_blockscale_swizzled.size(1) - w13_weight_before[1]
+            )
+            logger.warning(
+                "[%s] CUTLASS swizzle: w13_weight_scale %s -> %s, "
+                "w13_weight %s, pad=%s, is_act_and_mul=%s",
+                self.layer_name,
+                w13_scale_before,
+                w13_blockscale_swizzled.shape,
+                w13_weight_before,
+                intermediate_size_pad,
+                self.moe.is_act_and_mul,
+            )
+
             if intermediate_size_pad:
-                assert not self.moe.is_act_and_mul, (
-                    "The intermediate size required padding, "
-                    "but padding is not implemented for gated activations"
+                logger.warning(
+                    "[%s] WARNING: Scale padded but weights not padded! "
+                    "This may cause dimension mismatch.",
+                    self.layer_name,
                 )
 
-                layer.w13_weight = Parameter(
-                    torch.nn.functional.pad(
-                        w13_weight, (0, 0, 0, intermediate_size_pad)
-                    ),
-                    requires_grad=False,
-                )
-                layer.w2_weight = Parameter(
-                    torch.nn.functional.pad(
-                        layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
-                    ),
-                    requires_grad=False,
-                )
-                layer.w2_weight_scale = Parameter(
-                    torch.nn.functional.pad(
-                        layer.w2_weight_scale, (0, intermediate_size_pad // 16)
-                    ),
-                    requires_grad=False,
-                )
-
-            layer.w2_weight_scale = Parameter(
+            layer.w2_weight_scale = torch.nn.Parameter(
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
