@@ -286,7 +286,13 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                     original_intermediate_size,
                     intermediate_size_per_partition,
                 )
-        n_dim = 2 * intermediate_size_per_partition
+        # For gated MoE: n_dim = 2 * intermediate_size (gate + up)
+        # For non-gated MoE: n_dim = intermediate_size (only up_proj)
+        n_dim = (
+            2 * intermediate_size_per_partition
+            if self.moe.is_act_and_mul
+            else intermediate_size_per_partition
+        )
 
         w13_weight = torch.nn.Parameter(
             torch.empty(
@@ -539,7 +545,10 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 layer.w13_weight_scale,
                 layer.w2_weight_scale,
                 layer.w2_weight.size(-2),  # hidden_size
-                layer.w13_weight.size(-2) // 2,  # intermediate_size
+                # For gated MoE: w13_weight.size(-2) = 2 * intermediate_size
+                # For non-gated MoE: w13_weight.size(-2) = intermediate_size
+                layer.w13_weight.size(-2)
+                // (2 if self.moe.is_act_and_mul else 1),  # intermediate_size
                 layer.w13_weight.size(0),  # num_experts
             )
             logger.debug_once("Finished shuffling weights for TRT-LLM MOE")
