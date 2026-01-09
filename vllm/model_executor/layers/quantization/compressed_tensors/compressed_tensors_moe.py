@@ -570,12 +570,40 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 requires_grad=False,
             )
         else:
-            # swizzle weight scales
-            layer.w13_weight_scale = torch.nn.Parameter(
-                swizzle_blockscale(layer.w13_weight_scale), requires_grad=False
+            # Non-TRT-LLM processing (Cutlass or non-flashinfer)
+            w13_blockscale_swizzled = swizzle_blockscale(layer.w13_weight_scale)
+            layer.w13_weight_scale = Parameter(
+                w13_blockscale_swizzled, requires_grad=False
             )
 
-            layer.w2_weight_scale = torch.nn.Parameter(
+            w13_weight = layer.w13_weight
+            intermediate_size_pad = w13_blockscale_swizzled.size(1) - w13_weight.size(1)
+            if intermediate_size_pad:
+                assert not self.moe.is_act_and_mul, (
+                    "The intermediate size required padding, "
+                    "but padding is not implemented for gated activations"
+                )
+
+                layer.w13_weight = Parameter(
+                    torch.nn.functional.pad(
+                        w13_weight, (0, 0, 0, intermediate_size_pad)
+                    ),
+                    requires_grad=False,
+                )
+                layer.w2_weight = Parameter(
+                    torch.nn.functional.pad(
+                        layer.w2_weight, (0, intermediate_size_pad // 2, 0, 0)
+                    ),
+                    requires_grad=False,
+                )
+                layer.w2_weight_scale = Parameter(
+                    torch.nn.functional.pad(
+                        layer.w2_weight_scale, (0, intermediate_size_pad // 16)
+                    ),
+                    requires_grad=False,
+                )
+
+            layer.w2_weight_scale = Parameter(
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
