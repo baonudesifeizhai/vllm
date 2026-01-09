@@ -31,6 +31,7 @@ from vllm.utils.flashinfer import (
     has_flashinfer_cutedsl_grouped_gemm_nt_masked,
     has_flashinfer_cutlass_fused_moe,
 )
+from vllm.utils.math_utils import round_up
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
@@ -311,6 +312,11 @@ def flashinfer_trtllm_fp4_moe(
     )
 
     # Call TRT-LLM FP4 block-scale MoE kernel
+    intermediate_size = getattr(
+        layer,
+        "intermediate_size_per_partition_padded",
+        layer.intermediate_size_per_partition,
+    )
     out = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
         routing_logits=router_logits,
         routing_bias=routing_bias,
@@ -334,7 +340,7 @@ def flashinfer_trtllm_fp4_moe(
         top_k=top_k,
         n_group=num_expert_group if num_expert_group is not None else 0,
         topk_group=topk_group if topk_group is not None else 0,
-        intermediate_size=layer.intermediate_size_per_partition,
+        intermediate_size=intermediate_size,
         local_expert_offset=layer.ep_rank * layer.local_num_experts,
         local_num_experts=layer.local_num_experts,
         routed_scaling_factor=None,
@@ -389,6 +395,11 @@ def flashinfer_trtllm_fp4_routed_moe(
         )
 
     # Call TRT-LLM FP4 block-scale MoE kernel
+    intermediate_size = getattr(
+        layer,
+        "intermediate_size_per_partition_padded",
+        layer.intermediate_size_per_partition,
+    )
     out = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe(
         topk_ids=packed_tensor,
         routing_bias=None,
@@ -412,7 +423,7 @@ def flashinfer_trtllm_fp4_routed_moe(
         top_k=top_k,
         n_group=0,
         topk_group=0,
-        intermediate_size=layer.intermediate_size_per_partition,
+        intermediate_size=intermediate_size,
         local_expert_offset=layer.ep_rank * layer.local_num_experts,
         local_num_experts=layer.local_num_experts,
         routed_scaling_factor=None,
@@ -456,7 +467,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         NvFp4MoeBackend.VLLM_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_CUTLASS,
         NvFp4MoeBackend.FLASHINFER_TRTLLM,
-        NvFp4MoeBackend.FLASHINFER_TRTLLM,
+        NvFp4MoeBackend.FLASHINFER_CUTEDSL,
     ]
 
     # Reorder [w1, w3] to [w3, w1] for FI NVFP4 MoE kernels.
@@ -474,6 +485,35 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
     else:
         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
 
+    hidden_size = w2.size(-2)
+    intermediate_size = w13.size(-2) // (2 if is_act_and_mul else 1)
+    padded_intermediate_size = round_up(intermediate_size, 64)
+    layer.intermediate_size_per_partition_padded = padded_intermediate_size
+
+    target_w13_rows = (2 if is_act_and_mul else 1) * padded_intermediate_size
+    target_w2_cols = padded_intermediate_size // 2
+    target_w2_scale_cols = padded_intermediate_size // 16
+
+    pad_w13 = max(0, target_w13_rows - w13.size(1))
+    if pad_w13:
+        w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_w13, 0, 0)).contiguous()
+
+    pad_w13_scale = max(0, target_w13_rows - w13_scale.size(1))
+    if pad_w13_scale:
+        w13_scale = torch.nn.functional.pad(
+            w13_scale, (0, 0, 0, pad_w13_scale, 0, 0)
+        ).contiguous()
+
+    pad_w2 = max(0, target_w2_cols - w2.size(2))
+    if pad_w2:
+        w2 = torch.nn.functional.pad(w2, (0, pad_w2, 0, 0, 0, 0)).contiguous()
+
+    pad_w2_scale = max(0, target_w2_scale_cols - w2_scale.size(2))
+    if pad_w2_scale:
+        w2_scale = torch.nn.functional.pad(
+            w2_scale, (0, pad_w2_scale, 0, 0, 0, 0)
+        ).contiguous()
+
     # Shuffle weights and scales for FI TRTLLM NVFP4 MoE kernels.
     if backend == NvFp4MoeBackend.FLASHINFER_TRTLLM:
         w13, w13_scale, w2, w2_scale = prepare_static_weights_for_trtllm_fp4_moe(
@@ -481,8 +521,8 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
             w2,
             w13_scale,
             w2_scale,
-            w2.size(-2),  # hidden_size
-            w13.size(-2) // 2,  # intermediate_size
+            hidden_size,
+            padded_intermediate_size,
             w13.size(0),  # num_experts
         )
 
@@ -493,45 +533,7 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
         layer.g1_alphas = a13_scale * w13_scale_2
         layer.g2_alphas = a2_scale * w2_scale_2
     else:
-        # Apply padding if needed (before swizzle_blockscale).
-        # Kernel requires intermediate_size to be divisible by 32.
-        # w13_scale is already aligned (from create_weights), but w13 uses
-        # original size. We need to pad w13 to match w13_scale's dimension.
-        # Calculate pad_size based on the difference between w13_scale and w13.
-        pad_size = w13_scale.size(1) - w13.size(1)
-        if pad_size > 0:
-            if is_act_and_mul:
-                raise NotImplementedError(
-                    "Intermediate size padding for w1 and w3, for %s "
-                    "NvFp4 backend, but this is not currently supported",
-                    backend.value,
-                )
-
-            # For 3D tensor [num_experts, intermediate_size, hidden_size // 2],
-            # pad the intermediate_size dimension (dim=1).
-            # Padding format: (pad_left_dim2, pad_right_dim2, pad_left_dim1,
-            # pad_right_dim1, pad_left_dim0, pad_right_dim0)
-            # For w13: [num_experts, 2576, hidden_size // 2] ->
-            # [num_experts, 2592, hidden_size // 2]
-            # Ensure padding is applied correctly by using .contiguous()
-            # after padding
-            w13 = torch.nn.functional.pad(w13, (0, 0, 0, pad_size, 0, 0)).contiguous()
-
-            # For w2: [num_experts, hidden_size, intermediate_size // 2],
-            # pad the last dimension (dim=2).
-            w2 = torch.nn.functional.pad(
-                w2, (0, pad_size // 2, 0, 0, 0, 0)
-            ).contiguous()
-
-            # For w2_scale: [num_experts, hidden_size, intermediate_size // group_size],
-            # pad the last dimension (dim=2).
-            w2_scale = torch.nn.functional.pad(
-                w2_scale, (0, pad_size // 16, 0, 0, 0, 0)
-            ).contiguous()
-
         # Swizzle the block scales for other FI NVFP4 MoE kernels.
-        # This pads scales to 128-byte alignment, which is fine as long
-        # as we've already padded weights to 32-byte alignment above.
         w13_scale = swizzle_blockscale(w13_scale)
         w2_scale = swizzle_blockscale(w2_scale)
 
