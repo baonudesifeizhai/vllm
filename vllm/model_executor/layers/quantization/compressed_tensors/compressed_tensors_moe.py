@@ -501,7 +501,12 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        assert layer.activation == "silu", "Only SiLU activation is supported."
+        allowed_activations = {"silu"}
+        if self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_CUTLASS:
+            allowed_activations.add("relu2_no_mul")
+        assert layer.activation in allowed_activations, (
+            "Only SiLU activation is supported."
+        )
 
         if (
             self.nvfp4_backend == NvFp4MoeBackend.FLASHINFER_TRTLLM
