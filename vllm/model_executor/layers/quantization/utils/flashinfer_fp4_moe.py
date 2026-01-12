@@ -268,7 +268,7 @@ def _quantize_input_fp4_with_linear_scales(
     Returns:
         Tuple of (quantized_fp4_tensor, linear_scale_tensor)
     """
-    logger.info_once(
+    logger.info(
         "Using vLLM NVFP4 quantize path (scaled_fp4_quant + "
         "convert_swizzled_to_linear)."
     )
