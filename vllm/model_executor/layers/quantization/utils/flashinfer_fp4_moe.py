@@ -268,32 +268,28 @@ def _quantize_input_fp4_with_linear_scales(
     Returns:
         Tuple of (quantized_fp4_tensor, linear_scale_tensor)
     """
-    use_nvtx = torch.cuda.is_available()
-    if use_nvtx:
-        torch.cuda.nvtx.range_push("nvfp4_quantize_vllm")
-    try:
-        # Normalize a1_gscale to a scalar tensor on the correct device
-        if not isinstance(a1_gscale, torch.Tensor):
-            a1_gscale = torch.tensor(a1_gscale, device=x.device, dtype=torch.float32)
-        else:
-            a1_gscale = (
-                (a1_gscale.max() if a1_gscale.numel() != 1 else a1_gscale)
-                .to(x.device)
-                .to(torch.float32)
-            )
+    logger.info_once(
+        "Using vLLM NVFP4 quantize path (scaled_fp4_quant + "
+        "convert_swizzled_to_linear)."
+    )
 
-        # Quantize using vLLM native op (outputs swizzled scales)
-        hidden_states_fp4, hidden_states_scale_swizzled = ops.scaled_fp4_quant(
-            x, a1_gscale
+    # Normalize a1_gscale to a scalar tensor on the correct device
+    if not isinstance(a1_gscale, torch.Tensor):
+        a1_gscale = torch.tensor(a1_gscale, device=x.device, dtype=torch.float32)
+    else:
+        a1_gscale = (
+            (a1_gscale.max() if a1_gscale.numel() != 1 else a1_gscale)
+            .to(x.device)
+            .to(torch.float32)
         )
 
-        # Convert swizzled scales to linear layout (required by TRTLLM kernels)
-        hidden_states_scale_linear_fp4 = convert_swizzled_to_linear(
-            hidden_states_scale_swizzled, x.shape[0], x.shape[1], block_size=16
-        )
-    finally:
-        if use_nvtx:
-            torch.cuda.nvtx.range_pop()
+    # Quantize using vLLM native op (outputs swizzled scales)
+    hidden_states_fp4, hidden_states_scale_swizzled = ops.scaled_fp4_quant(x, a1_gscale)
+
+    # Convert swizzled scales to linear layout (required by TRTLLM kernels)
+    hidden_states_scale_linear_fp4 = convert_swizzled_to_linear(
+        hidden_states_scale_swizzled, x.shape[0], x.shape[1], block_size=16
+    )
 
     return hidden_states_fp4, hidden_states_scale_linear_fp4
 
