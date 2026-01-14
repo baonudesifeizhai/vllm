@@ -165,19 +165,30 @@ def benchmark_e2e_moe_forward(
 
     if method == "flashinfer_swizzled":
         # FlashInfer with swizzled layout (reviewer's recommended approach)
+        # Note: Even though FlashInfer outputs swizzled, TRTLLM kernel needs linear,
+        # so we still need to convert. But FlashInfer's quantize might be faster.
         def moe_forward():
-            # Quantize input using FlashInfer (directly outputs swizzled layout)
-            hidden_states_fp4, hidden_states_scale = flashinfer_fp4_quantize(
+            # Quantize input using FlashInfer (outputs swizzled layout)
+            hidden_states_fp4, hidden_states_scale_swizzled = flashinfer_fp4_quantize(
                 x, layer.a1_gscale, is_sf_swizzled_layout=True
             )
-            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+            hidden_states_scale_swizzled = hidden_states_scale_swizzled.view(
+                torch.float8_e4m3fn
+            )
+
+            # Convert swizzled to linear (TRTLLM kernel requires linear layout)
+            hidden_states_scale_linear = convert_swizzled_to_linear(
+                hidden_states_scale_swizzled, x.shape[0], x.shape[1], block_size=16
+            )
 
             # Complete MoE forward pass
             out = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
                 routing_logits=router_logits.to(torch.bfloat16),
                 routing_bias=None,
                 hidden_states=hidden_states_fp4,
-                hidden_states_scale=hidden_states_scale.flatten(),
+                hidden_states_scale=hidden_states_scale_linear.view(
+                    torch.float8_e4m3fn
+                ).flatten(),
                 gemm1_weights=layer.w13_weight.data,
                 gemm1_weights_scale=layer.w13_weight_scale.data.view(
                     torch.float8_e4m3fn
