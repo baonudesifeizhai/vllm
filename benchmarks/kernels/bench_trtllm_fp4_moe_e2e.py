@@ -267,11 +267,19 @@ def benchmark_e2e_moe_forward(
         moe_forward()
     torch.cuda.synchronize()
 
+    # Clear cache to avoid interference between different methods/batch sizes
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
     # Benchmark with CUDA graph
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
         moe_forward, quantiles=quantiles
     )
+
+    # Clear cache after benchmark
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     return ms * 1000, min_ms * 1000, max_ms * 1000  # Convert to us
 
@@ -307,11 +315,19 @@ def benchmark_quantization_only(
         quantize_fn()
     torch.cuda.synchronize()
 
+    # Clear cache to avoid interference
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
     # Benchmark
     quantiles = [0.5, 0.2, 0.8]
     ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
         quantize_fn, quantiles=quantiles
     )
+
+    # Clear cache after benchmark
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
 
     return ms * 1000, min_ms * 1000, max_ms * 1000
 
@@ -410,6 +426,10 @@ def run_comprehensive_benchmark(
         print(f"Benchmark: M={M}, K={hidden_size}")
         print(f"{'=' * 100}")
 
+        # Clear cache before each batch size to ensure clean state
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
         # Create input and router logits
         x = torch.randn((M, hidden_size), device=device, dtype=dtype) / 10
         router_logits = torch.randn((M, num_experts), device=device, dtype=dtype)
@@ -421,9 +441,16 @@ def run_comprehensive_benchmark(
         print("\n1. Quantization Step Only:")
         print("-" * 100)
 
+        # Clear cache before each method to avoid interference
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         flashinfer_quant_us, _, _ = benchmark_quantization_only(
             x, a1_gscale, "flashinfer_swizzled"
         )
+
+        # Clear cache between methods
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         vllm_quant_us, _, _ = benchmark_quantization_only(x, a1_gscale, "vllm_linear")
 
         print(f"  FlashInfer (swizzled): {flashinfer_quant_us:.2f} us")
@@ -438,6 +465,9 @@ def run_comprehensive_benchmark(
         print("\n2. End-to-End MoE Forward Pass (COMPLETE):")
         print("-" * 100)
 
+        # Clear cache before each method to avoid interference
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         flashinfer_e2e_us, flashinfer_min, flashinfer_max = benchmark_e2e_moe_forward(
             layer,
             x,
@@ -447,6 +477,10 @@ def run_comprehensive_benchmark(
             "flashinfer_swizzled",
             num_iterations=num_iterations,
         )
+
+        # Clear cache between methods
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
         vllm_e2e_us, vllm_min, vllm_max = benchmark_e2e_moe_forward(
             layer,
             x,
