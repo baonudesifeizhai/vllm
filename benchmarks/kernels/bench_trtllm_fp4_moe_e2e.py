@@ -348,6 +348,61 @@ def run_comprehensive_benchmark(
     )
     print("MoE layer created.")
 
+    # Warmup: Pre-load FlashInfer kernels to avoid blocking during benchmark
+    print("\nWarming up FlashInfer kernels (this may take a while on first run)...")
+    print("(FlashInfer needs to download/compile CUDA kernels)")
+    warmup_x = torch.randn((1, hidden_size), device=device, dtype=dtype) / 10
+    warmup_router_logits = torch.randn((1, num_experts), device=device, dtype=dtype)
+    warmup_a1_gscale = compute_global_scale(warmup_x)
+
+    try:
+        # Warmup FlashInfer path
+        print("  Warming up FlashInfer path...")
+        import flashinfer
+
+        from vllm.utils.flashinfer import flashinfer_fp4_quantize
+
+        warmup_fp4, warmup_scale = flashinfer_fp4_quantize(
+            warmup_x, warmup_a1_gscale, is_sf_swizzled_layout=True
+        )
+        warmup_scale = warmup_scale.view(torch.float8_e4m3fn)
+
+        flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+            routing_logits=warmup_router_logits.to(torch.bfloat16),
+            routing_bias=None,
+            hidden_states=warmup_fp4,
+            hidden_states_scale=warmup_scale.flatten(),
+            gemm1_weights=layer.w13_weight.data,
+            gemm1_weights_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=layer.w2_weight.data,
+            gemm2_weights_scale=layer.w2_weight_scale.data.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=layer.g1_scale_c.data,
+            output1_scale_gate_scalar=layer.g1_alphas.data,
+            output2_scale_scalar=layer.g2_alphas.data,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=0,
+            topk_group=0,
+            intermediate_size=layer.intermediate_size_per_partition,
+            local_expert_offset=layer.ep_rank * layer.local_num_experts,
+            local_num_experts=layer.local_num_experts,
+            routed_scaling_factor=None,
+            tile_tokens_dim=None,
+            routing_method_type=layer.routing_method_type,
+            do_finalize=True,
+        )[0]
+        print("  FlashInfer warmup completed.")
+    except Exception as e:
+        print(f"  Warning: FlashInfer warmup failed: {e}")
+        print("  Continuing anyway...")
+
+    print("Warmup completed. Starting benchmarks...\n")
+
     results = []
 
     for M in batch_sizes:
