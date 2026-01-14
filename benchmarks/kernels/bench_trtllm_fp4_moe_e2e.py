@@ -389,16 +389,24 @@ def run_comprehensive_benchmark(
 
         from vllm.utils.flashinfer import flashinfer_fp4_quantize
 
-        warmup_fp4, warmup_scale = flashinfer_fp4_quantize(
+        warmup_fp4, warmup_scale_swizzled = flashinfer_fp4_quantize(
             warmup_x, warmup_a1_gscale, is_sf_swizzled_layout=True
         )
-        warmup_scale = warmup_scale.view(torch.float8_e4m3fn)
+        warmup_scale_swizzled = warmup_scale_swizzled.view(torch.float8_e4m3fn)
+
+        # Convert swizzled to linear (TRTLLM kernel requires linear layout)
+        warmup_scale_linear = convert_swizzled_to_linear(
+            warmup_scale_swizzled,
+            warmup_x.shape[0],
+            warmup_x.shape[1],
+            block_size=16,
+        )
 
         flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=warmup_router_logits.to(torch.bfloat16),
             routing_bias=None,
             hidden_states=warmup_fp4,
-            hidden_states_scale=warmup_scale.flatten(),
+            hidden_states_scale=warmup_scale_linear.view(torch.float8_e4m3fn).flatten(),
             gemm1_weights=layer.w13_weight.data,
             gemm1_weights_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
             gemm1_bias=None,
