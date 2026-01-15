@@ -42,6 +42,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "int8": torch.int8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
+    "nvfp4": torch.uint8,
 }
 
 TORCH_DTYPE_TO_NUMPY_DTYPE = {
@@ -59,6 +60,7 @@ MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP = {
     # mappings here when it supported by some attention backend
     # (for example supports nvfp4).
     "fp8": "fp8_e4m3",
+    "nvfp4": "nvfp4",
 }
 
 T = TypeVar("T")
