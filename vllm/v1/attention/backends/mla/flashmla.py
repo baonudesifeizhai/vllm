@@ -47,6 +47,7 @@ class FlashMLABackend(MLACommonBackend):
         "auto",
         "fp8",
         "fp8_e4m3",
+        "nvfp4",
     ]
 
     @staticmethod
