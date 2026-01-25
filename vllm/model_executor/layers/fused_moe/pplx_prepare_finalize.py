@@ -115,6 +115,10 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "PPLX expects topk_ids dtype torch.uint32. "
             "Check router indices dtype conversion for PPLX all2all."
         )
+        assert topk_ids.numel() == 0 or int(topk_ids.max().item()) < num_experts, (
+            "PPLX saw topk_ids out of range. "
+            "Check router logits or expert count configuration."
+        )
         # expert_map should be None because with expert map, -1 id is used for
         # non-local token; this causes error when casting ids to the
         # topk_indices_dtype() int32
@@ -151,6 +155,10 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         _validate_scale_shape(
             a1q, a1q_scale, quant_config.per_act_token_quant, quant_config.block_shape
         )
+        if a1q_scale is not None:
+            assert torch.isfinite(a1q_scale).all(), (
+                "Found non-finite values in PPLX a1q_scale."
+            )
 
         orig_a_scale_block_shape: int | None = None
 
@@ -167,6 +175,14 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             if not quant_config.is_block_quantized:
                 # TODO (bnell): use group_broadcast instead?
                 a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols)
+                assert a1q_scale.shape[0] == a1q.shape[0], (
+                    "PPLX expects per-token or per-tensor scales to have one "
+                    "row per token after repeat."
+                )
+                assert a1q_scale.shape[1] == repeat_cols, (
+                    "PPLX expects per-token or per-tensor scales to have "
+                    f"{repeat_cols} columns after repeat."
+                )
 
         assert a1q_scale is None or a1q_scale.ndim == 2, (
             f"{0 if a1q_scale is None else (a1q_scale.ndim, a1q_scale.shape)}"
