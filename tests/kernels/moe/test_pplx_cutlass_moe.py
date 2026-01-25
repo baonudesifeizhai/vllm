@@ -80,6 +80,7 @@ def pplx_cutlass_moe(
     per_act_token: bool,
     per_out_ch: bool,
     group_name: str | None,
+    apply_router_weight_on_input: bool = False,
 ):
     from vllm.model_executor.layers.fused_moe.pplx_prepare_finalize import (
         PplxPrepareAndFinalize,
@@ -188,6 +189,7 @@ def pplx_cutlass_moe(
         chunk_topk_ids,
         global_num_experts=num_experts,
         expert_map=None,  # TODO
+        apply_router_weight_on_input=apply_router_weight_on_input,
     )
 
     torch.cuda.synchronize()
@@ -218,6 +220,7 @@ def _pplx_moe(
     per_act_token: bool,
     per_out_ch: bool,
     use_internode: bool,
+    apply_router_weight_on_input: bool = False,
 ):
     try:
         if use_internode:
@@ -235,7 +238,12 @@ def _pplx_moe(
 
         with set_current_vllm_config(vllm_config):
             torch_output = torch_experts(
-                a_full, w1_full, w2_full, topk_weights, topk_ids
+                a_full,
+                w1_full,
+                w2_full,
+                topk_weights,
+                topk_ids,
+                apply_router_weights_on_input=apply_router_weight_on_input,
             )
             pplx_output = pplx_cutlass_moe(
                 pgi,
@@ -252,6 +260,7 @@ def _pplx_moe(
                 per_act_token,
                 per_out_ch,
                 group_name,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             )
 
             torch_output = chunk_by_rank(torch_output, pgi.rank, pgi.world_size).to(
@@ -359,4 +368,94 @@ def test_cutlass_moe_pplx(
             per_act_token,
             per_out_ch,
             use_internode,
+        )
+
+
+@pytest.mark.parametrize("m", [224])
+@pytest.mark.parametrize("n", [3072])
+@pytest.mark.parametrize("k", [1536])
+@pytest.mark.parametrize("e", [40])
+@pytest.mark.parametrize("per_act_token", [True])
+@pytest.mark.parametrize("per_out_ch", [True])
+@pytest.mark.parametrize("world_dp_size", [[2, 1]])
+@pytest.mark.parametrize("use_internode", [False])
+@multi_gpu_test(num_gpus=2)
+@requires_pplx
+def test_cutlass_moe_pplx_router_weight_on_input(
+    m: int,
+    n: int,
+    k: int,
+    e: int,
+    per_act_token: bool,
+    per_out_ch: bool,
+    world_dp_size: tuple[int, int],
+    use_internode: bool,
+):
+    set_random_seed(7)
+
+    with set_current_vllm_config(vllm_config):
+        dtype = torch.half
+
+        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10.0
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10.0
+        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10.0
+
+        n_b_scales = 2 * n if per_out_ch else 1
+        k_b_scales = k if per_out_ch else 1
+
+        w1_q = torch.empty((e, 2 * n, k), device="cuda", dtype=torch.float8_e4m3fn)
+        w2_q = torch.empty((e, k, n), device="cuda", dtype=torch.float8_e4m3fn)
+        w1_scale = torch.empty((e, n_b_scales, 1), device="cuda", dtype=torch.float32)
+        w2_scale = torch.empty((e, k_b_scales, 1), device="cuda", dtype=torch.float32)
+
+        for expert in range(e):
+            w1_q[expert], w1_scale[expert] = ops.scaled_fp8_quant(
+                w1[expert], use_per_token_if_dynamic=per_out_ch
+            )
+            w2_q[expert], w2_scale[expert] = ops.scaled_fp8_quant(
+                w2[expert], use_per_token_if_dynamic=per_out_ch
+            )
+
+        w1_d = torch.empty_like(w1)
+        w2_d = torch.empty_like(w2)
+        for expert in range(e):
+            w1_d[expert] = (w1_q[expert].float() * w1_scale[expert]).half()
+            w2_d[expert] = (w2_q[expert].float() * w2_scale[expert]).half()
+
+        topk = 1
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        topk_weights, topk_ids, _ = fused_topk(a, score, topk, renormalize=False)
+
+        world_size, dp_size = world_dp_size
+        a_scale1 = (
+            torch.randn(
+                (m if per_act_token else 1, 1),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            / 10.0
+        )
+        if not per_act_token:
+            a_scale1 = a_scale1.repeat(world_size, 1)
+
+        parallel_launch(
+            world_size,
+            _pplx_moe,
+            dp_size,
+            a,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            a_scale1,
+            dtype,
+            a,
+            w1_d,
+            w2_d,
+            per_act_token,
+            per_out_ch,
+            use_internode,
+            True,
         )

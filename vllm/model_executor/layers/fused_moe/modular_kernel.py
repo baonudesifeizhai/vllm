@@ -37,6 +37,28 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
 
+
+def _pplx_debug_enabled() -> bool:
+    return envs.VLLM_PPLX_DEBUG
+
+
+def _tensor_debug_stats(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "none"
+    shape = tuple(tensor.shape)
+    if tensor.numel() == 0:
+        return f"shape={shape} dtype={tensor.dtype} empty"
+    stats = tensor.float() if tensor.is_floating_point() else tensor.to(torch.int64)
+    min_v = float(stats.min().item())
+    max_v = float(stats.max().item())
+    mean_v = float(stats.float().mean().item())
+    sum_v = float(stats.float().sum().item())
+    return (
+        f"shape={shape} dtype={tensor.dtype} min={min_v:.4g} max={max_v:.4g} "
+        f"mean={mean_v:.4g} sum={sum_v:.4g}"
+    )
+
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -1277,6 +1299,55 @@ class FusedMoEModularKernel(torch.nn.Module):
             assert shared_output is not None
             return shared_output, output
 
+    def _log_moe_debug(
+        self,
+        hidden_states: torch.Tensor,
+        a1q: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        fused_out: torch.Tensor,
+        output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        expert_tokens_meta: ExpertTokensMetadata | None,
+        apply_router_weight_on_input: bool,
+        global_num_experts: int,
+        local_num_experts: int,
+    ) -> None:
+        topk = topk_ids.size(1) if topk_ids.dim() > 1 else -1
+        expert_num_tokens = (
+            None if expert_tokens_meta is None else expert_tokens_meta.expert_num_tokens
+        )
+        if isinstance(output, tuple):
+            output_stats = (
+                f"shared={_tensor_debug_stats(output[0])} "
+                f"fused={_tensor_debug_stats(output[1])}"
+            )
+        else:
+            output_stats = _tensor_debug_stats(output)
+
+        logger.info(
+            "PPLX_DEBUG kernel_id=%s prepare_finalize=%s fused_experts=%s "
+            "apply_router_weight_on_input=%s global_experts=%d "
+            "local_experts=%d topk=%d hidden_states=%s a1q=%s a1q_scale=%s "
+            "topk_ids=%s topk_weights=%s expert_num_tokens=%s fused_out=%s "
+            "output=%s",
+            id(self),
+            self.prepare_finalize.__class__.__name__,
+            self.fused_experts.__class__.__name__,
+            apply_router_weight_on_input,
+            global_num_experts,
+            local_num_experts,
+            topk,
+            _tensor_debug_stats(hidden_states),
+            _tensor_debug_stats(a1q),
+            _tensor_debug_stats(a1q_scale),
+            _tensor_debug_stats(topk_ids),
+            _tensor_debug_stats(topk_weights),
+            _tensor_debug_stats(expert_num_tokens),
+            _tensor_debug_stats(fused_out),
+            output_stats,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1326,6 +1397,7 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+        moe_debug = _pplx_debug_enabled()
 
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
@@ -1352,7 +1424,7 @@ class FusedMoEModularKernel(torch.nn.Module):
             expert_tokens_meta=expert_tokens_meta,
         )
 
-        return self._finalize(
+        final_output = self._finalize(
             output,
             fused_out,
             hidden_states,
@@ -1360,3 +1432,21 @@ class FusedMoEModularKernel(torch.nn.Module):
             topk_ids,
             apply_router_weight_on_input,
         )
+
+        if moe_debug and not getattr(self, "_pplx_debug_logged", False):
+            self._pplx_debug_logged = True
+            self._log_moe_debug(
+                hidden_states,
+                a1q,
+                a1q_scale,
+                topk_weights,
+                topk_ids,
+                fused_out,
+                final_output,
+                expert_tokens_meta,
+                apply_router_weight_on_input,
+                global_num_experts,
+                local_num_experts,
+            )
+
+        return final_output
