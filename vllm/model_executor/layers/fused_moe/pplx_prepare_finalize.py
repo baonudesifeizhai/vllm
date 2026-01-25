@@ -111,6 +111,10 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         hidden_dim = a1.size(-1)  # K
 
         assert topk_ids.size(0) == num_tokens
+        assert topk_ids.dtype == torch.uint32, (
+            "PPLX expects topk_ids dtype torch.uint32. "
+            "Check router indices dtype conversion for PPLX all2all."
+        )
         # expert_map should be None because with expert map, -1 id is used for
         # non-local token; this causes error when casting ids to the
         # topk_indices_dtype() int32
@@ -187,8 +191,8 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_x_scale: torch.Tensor | None = None
         if a1q.dtype.itemsize == 1:
             if quant_config.is_per_act_token:
-                # (M x 1) -> (E x M x 1)
-                final_dim = 1
+                # (M x 1) -> (E x M x K)
+                final_dim = expert_x.size(2)
             elif quant_config.is_per_tensor:
                 # (1 x 1) -> (E x 1 x 1)
                 final_dim = 1
@@ -320,6 +324,10 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
 
+        assert topk_ids.dtype == torch.uint32, (
+            "PPLX combine expects topk_ids dtype torch.uint32. "
+            "Check router indices dtype conversion for PPLX all2all."
+        )
         topk_ids_u32 = topk_ids.view(dtype=torch.uint32)
 
         self.a2a.combine(
