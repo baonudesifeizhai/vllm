@@ -115,10 +115,12 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "PPLX expects topk_ids dtype torch.uint32. "
             "Check router indices dtype conversion for PPLX all2all."
         )
-        assert topk_ids.numel() == 0 or int(topk_ids.max().item()) < num_experts, (
-            "PPLX saw topk_ids out of range. "
-            "Check router logits or expert count configuration."
-        )
+        if topk_ids.numel() != 0:
+            topk_ids_max = int(topk_ids.to(torch.int64).max().item())
+            assert topk_ids_max < num_experts, (
+                "PPLX saw topk_ids out of range. "
+                "Check router logits or expert count configuration."
+            )
         # expert_map should be None because with expert map, -1 id is used for
         # non-local token; this causes error when casting ids to the
         # topk_indices_dtype() int32
