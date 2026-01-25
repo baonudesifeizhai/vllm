@@ -187,8 +187,8 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         expert_x_scale: torch.Tensor | None = None
         if a1q.dtype.itemsize == 1:
             if quant_config.is_per_act_token:
-                # (M x 1) -> (E x M x K)
-                final_dim = expert_x.size(2)
+                # (M x 1) -> (E x M x 1)
+                final_dim = 1
             elif quant_config.is_per_tensor:
                 # (1 x 1) -> (E x 1 x 1)
                 final_dim = 1
