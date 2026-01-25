@@ -116,10 +116,33 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "Check router indices dtype conversion for PPLX all2all."
         )
         if topk_ids.numel() != 0:
-            topk_ids_max = int(topk_ids.to(torch.int64).max().item())
+            topk_ids_i64 = topk_ids.to(torch.int64)
+            topk_ids_min = int(topk_ids_i64.min().item())
+            topk_ids_max = int(topk_ids_i64.max().item())
+            assert topk_ids_min >= 0, (
+                "PPLX saw negative topk_ids. "
+                "Check router indices dtype conversion or padding."
+            )
             assert topk_ids_max < num_experts, (
                 "PPLX saw topk_ids out of range. "
                 "Check router logits or expert count configuration."
+            )
+        if topk_weights.numel() != 0:
+            assert topk_weights.is_floating_point(), (
+                "PPLX expects topk_weights to be a floating-point tensor."
+            )
+            assert torch.isfinite(topk_weights).all(), (
+                "PPLX saw non-finite values in topk_weights."
+            )
+            topk_weights_min = float(topk_weights.min().item())
+            topk_weights_max = float(topk_weights.max().item())
+            assert topk_weights_min >= 0.0, (
+                "PPLX saw negative topk_weights. "
+                "Check router logits or softmax stability."
+            )
+            assert topk_weights_max <= 1.0 + 1e-3, (
+                "PPLX saw topk_weights outside the expected [0, 1] range. "
+                "Check router logits or softmax stability."
             )
         # expert_map should be None because with expert map, -1 id is used for
         # non-local token; this causes error when casting ids to the
@@ -189,6 +212,22 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert a1q_scale is None or a1q_scale.ndim == 2, (
             f"{0 if a1q_scale is None else (a1q_scale.ndim, a1q_scale.shape)}"
         )
+        if quant_config.is_block_quantized and a1q_scale is not None:
+            block_shape = quant_config.block_shape
+            assert block_shape is not None
+            expected_scale_shape = (
+                a1q.shape[0],
+                cdiv(a1q.shape[1], block_shape[1]),
+            )
+            assert a1q_scale.shape == expected_scale_shape, (
+                "PPLX block-quant scale shape mismatch: "
+                f"{a1q_scale.shape} vs {expected_scale_shape}."
+            )
+            expected_stride = (expected_scale_shape[1], 1)
+            assert a1q_scale.stride() == expected_stride, (
+                "PPLX block-quant scale stride mismatch: "
+                f"{a1q_scale.stride()} vs {expected_stride}."
+            )
 
         expert_num_tokens = torch.empty(
             self.num_local_experts,
