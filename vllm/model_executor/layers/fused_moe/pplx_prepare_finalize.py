@@ -115,6 +115,19 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             "PPLX expects topk_ids dtype torch.uint32. "
             "Check router indices dtype conversion for PPLX all2all."
         )
+        assert topk_ids.is_contiguous(), "PPLX expects topk_ids to be contiguous."
+        assert topk_ids.stride(-1) == 1, (
+            f"PPLX expects topk_ids stride(-1) == 1, got {topk_ids.stride()}."
+        )
+        assert topk_ids.size() == topk_weights.size(), (
+            f"{topk_ids.size()} == {topk_weights.size()}"
+        )
+        assert topk_weights.is_contiguous(), (
+            "PPLX expects topk_weights to be contiguous."
+        )
+        assert topk_weights.stride(-1) == 1, (
+            f"PPLX expects topk_weights stride(-1) == 1, got {topk_weights.stride()}."
+        )
         if topk_ids.numel() != 0:
             topk_ids_i64 = topk_ids.to(torch.int64)
             topk_ids_min = int(topk_ids_i64.min().item())
@@ -320,6 +333,20 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_x_scale = expert_x_scale[:, :, :orig_a_scale_block_shape]
             assert expert_x_scale.ndim == 3
 
+        if expert_num_tokens.numel() != 0:
+            expert_num_tokens_i64 = expert_num_tokens.to(torch.int64)
+            expert_num_tokens_min = int(expert_num_tokens_i64.min().item())
+            expert_num_tokens_max = int(expert_num_tokens_i64.max().item())
+            assert expert_num_tokens_min >= 0, (
+                "PPLX saw negative expert_num_tokens. "
+                "Check dispatch indices or token counts."
+            )
+            max_tokens = self.max_num_tokens * self.num_dispatchers()
+            assert expert_num_tokens_max <= max_tokens, (
+                "PPLX saw expert_num_tokens out of range. "
+                f"max={expert_num_tokens_max} limit={max_tokens}."
+            )
+
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None
         )
@@ -384,6 +411,22 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert topk_ids.dtype == torch.uint32, (
             "PPLX combine expects topk_ids dtype torch.uint32. "
             "Check router indices dtype conversion for PPLX all2all."
+        )
+        assert topk_ids.is_contiguous(), (
+            "PPLX combine expects topk_ids to be contiguous."
+        )
+        assert topk_ids.stride(-1) == 1, (
+            f"PPLX combine expects topk_ids stride(-1) == 1, got {topk_ids.stride()}."
+        )
+        assert topk_ids.size() == topk_weights.size(), (
+            f"{topk_ids.size()} == {topk_weights.size()}"
+        )
+        assert topk_weights.is_contiguous(), (
+            "PPLX combine expects topk_weights to be contiguous."
+        )
+        assert topk_weights.stride(-1) == 1, (
+            "PPLX combine expects topk_weights stride(-1) == 1, got "
+            f"{topk_weights.stride()}."
         )
         topk_ids_u32 = topk_ids.view(dtype=torch.uint32)
 

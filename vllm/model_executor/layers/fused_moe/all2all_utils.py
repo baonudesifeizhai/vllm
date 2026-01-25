@@ -86,6 +86,18 @@ def maybe_make_prepare_finalize(
 
     if moe.use_pplx_kernels:
         assert quant_config is not None
+        assert moe.max_num_tokens > 0
+        assert moe.num_experts > 0
+        assert moe.num_local_experts > 0
+        assert moe.num_experts >= moe.num_local_experts
+        assert moe.experts_per_token > 0
+        assert moe.experts_per_token <= moe.num_experts
+        assert moe.hidden_dim > 0
+        assert all2all_manager.world_size > 0
+        assert all2all_manager.tp_group.world_size > 0
+        assert all2all_manager.world_size % all2all_manager.tp_group.world_size == 0, (
+            "PPLX expects EP world_size to be divisible by TP size."
+        )
 
         hidden_dim_bytes, hidden_scale_bytes = pplx_hidden_dim_scale_bytes(
             moe.max_num_tokens,
@@ -94,6 +106,13 @@ def maybe_make_prepare_finalize(
             quant_config.quant_dtype,
             per_act_token_quant=quant_config.per_act_token_quant,
             block_shape=quant_config.block_shape,
+        )
+        assert hidden_dim_bytes > 0
+        assert hidden_dim_bytes % 16 == 0, (
+            "PPLX expects hidden_dim_bytes to be 16-byte aligned."
+        )
+        assert hidden_scale_bytes % 16 == 0, (
+            "PPLX expects hidden_dim_scale_bytes to be 16-byte aligned."
         )
 
         all_to_all_args = dict(
@@ -112,6 +131,7 @@ def maybe_make_prepare_finalize(
         num_dispatchers = (
             all2all_manager.world_size // all2all_manager.tp_group.world_size
         )
+        assert num_dispatchers > 0
 
         # Intranode pplx a2a takes a group name while internode does not.
         if not all2all_manager.internode:

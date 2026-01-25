@@ -209,6 +209,45 @@ class PPLXAll2AllManager(All2AllManagerBase):
         self.handle_cache = Cache()
 
     def get_handle(self, kwargs):
+        required_keys = {
+            "max_num_tokens",
+            "num_experts",
+            "experts_per_token",
+            "rank",
+            "world_size",
+            "dp_size",
+            "hidden_dim",
+            "hidden_dim_bytes",
+            "hidden_dim_scale_bytes",
+        }
+        missing = required_keys.difference(kwargs.keys())
+        assert not missing, f"PPLX all2all missing args: {sorted(missing)}"
+        assert kwargs["max_num_tokens"] > 0
+        assert kwargs["num_experts"] > 0
+        assert kwargs["experts_per_token"] > 0
+        assert kwargs["experts_per_token"] <= kwargs["num_experts"], (
+            "PPLX expects experts_per_token <= num_experts."
+        )
+        assert kwargs["hidden_dim"] > 0
+        assert kwargs["hidden_dim_bytes"] > 0
+        assert kwargs["hidden_dim_bytes"] % 16 == 0, (
+            "PPLX expects hidden_dim_bytes to be 16-byte aligned."
+        )
+        assert kwargs["hidden_dim_scale_bytes"] % 16 == 0, (
+            "PPLX expects hidden_dim_scale_bytes to be 16-byte aligned."
+        )
+        assert kwargs["rank"] == self.rank
+        assert kwargs["world_size"] == self.world_size
+        assert 0 <= kwargs["rank"] < kwargs["world_size"]
+        assert kwargs["dp_size"] == self.tp_group.world_size
+        assert kwargs["world_size"] % kwargs["dp_size"] == 0, (
+            "PPLX expects world_size to be divisible by tp_size (dp_size arg)."
+        )
+        if self.internode:
+            assert "group_name" not in kwargs
+        else:
+            assert "group_name" in kwargs and kwargs["group_name"]
+
         import pplx_kernels as pplx  # type: ignore[import-not-found]
 
         return self.handle_cache.get_or_create(
