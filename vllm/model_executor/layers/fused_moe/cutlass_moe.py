@@ -170,7 +170,16 @@ def run_cutlass_moe_fp8(
         w1_scale = w1_scale.reshape(w1_scale.size(0), -1)
         w2_scale = w2_scale.reshape(w2_scale.size(0), -1)
         a1q = a1q.reshape(-1, a1q.size(2))
-        a1q_scale = a1q_scale.reshape(-1, a1q_scale.size(2)).contiguous()
+        # PPLX repeats scales by 4 columns for non-block quantized cases,
+        # but CUTLASS kernel only needs the first column.
+        if a1q_scale.ndim == 3 and a1q_scale.size(2) == 4:
+            # PPLX repeated scale: take first column only
+            if per_act_token:
+                a1q_scale = a1q_scale[:, :, 0].reshape(-1).contiguous()
+            else:
+                a1q_scale = a1q_scale[0, 0, 0].view(1).contiguous()
+        else:
+            a1q_scale = a1q_scale.reshape(-1, a1q_scale.size(2)).contiguous()
         # c3x get_group_gemm_starts expects int64 to avoid overflow
         # during offset calculations
         expert_offsets = expert_offsets.to(torch.int64)
