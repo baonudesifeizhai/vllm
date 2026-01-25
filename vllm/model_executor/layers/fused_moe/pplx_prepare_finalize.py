@@ -7,6 +7,7 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -23,6 +24,19 @@ logger = init_logger(__name__)
 
 def _pplx_debug_enabled() -> bool:
     return envs.VLLM_PPLX_DEBUG
+
+
+def _is_dummy_forward() -> bool:
+    if not is_forward_context_available():
+        return False
+    ctx = get_forward_context()
+    return bool(ctx.additional_kwargs.get("is_dummy_run"))
+
+
+def _has_non_finite(tensor: torch.Tensor | None) -> bool:
+    if tensor is None:
+        return False
+    return not torch.isfinite(tensor.float()).all().item()
 
 
 def _tensor_stats(tensor: torch.Tensor | None) -> str:
@@ -234,7 +248,19 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             assert torch.isfinite(a1q_scale).all(), (
                 "Found non-finite values in PPLX a1q_scale."
             )
-        if _pplx_debug_enabled() and not getattr(self, "_debug_prepare_logged", False):
+        has_non_finite_a1q = _has_non_finite(a1q)
+        if _pplx_debug_enabled() and has_non_finite_a1q:
+            logger.warning(
+                "PPLX_DEBUG_PREPARE found non-finite a1q values. a1=%s a1q=%s",
+                _tensor_stats(a1),
+                _tensor_stats(a1q),
+            )
+
+        if (
+            _pplx_debug_enabled()
+            and not _is_dummy_forward()
+            and not getattr(self, "_debug_prepare_logged", False)
+        ):
             self._debug_prepare_logged = True
             logger.info(
                 "PPLX_DEBUG_PREPARE tokens=%d hidden_dim=%d num_experts=%d "
@@ -266,10 +292,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             orig_a_scale_block_shape = a1q_scale.shape[-1]
 
-            if (
-                not quant_config.is_block_quantized
-                and not quant_config.is_per_act_token
-            ):
+            if not quant_config.is_block_quantized:
                 # TODO (bnell): use group_broadcast instead?
                 a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols)
                 assert a1q_scale.shape[0] == a1q.shape[0], (
@@ -406,7 +429,11 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 f"max={expert_num_tokens_max} limit={max_tokens}."
             )
 
-        if _pplx_debug_enabled() and not getattr(self, "_debug_receiver_logged", False):
+        if (
+            _pplx_debug_enabled()
+            and not _is_dummy_forward()
+            and not getattr(self, "_debug_receiver_logged", False)
+        ):
             self._debug_receiver_logged = True
             valid_x_stats, total_valid = _valid_expert_stats(
                 expert_x, expert_num_tokens
