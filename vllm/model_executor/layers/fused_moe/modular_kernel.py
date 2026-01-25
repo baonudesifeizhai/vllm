@@ -42,6 +42,13 @@ def _pplx_debug_enabled() -> bool:
     return envs.VLLM_PPLX_DEBUG
 
 
+def _tensor_is_all_zero(tensor: torch.Tensor) -> bool:
+    """Check if tensor is all zeros."""
+    if tensor.numel() == 0:
+        return True
+    return bool(tensor.eq(0).all().item())
+
+
 def _tensor_debug_stats(tensor: torch.Tensor | None) -> str:
     if tensor is None:
         return "none"
@@ -1434,19 +1441,25 @@ class FusedMoEModularKernel(torch.nn.Module):
         )
 
         if moe_debug and not getattr(self, "_pplx_debug_logged", False):
-            self._pplx_debug_logged = True
-            self._log_moe_debug(
-                hidden_states,
-                a1q,
-                a1q_scale,
-                topk_weights,
-                topk_ids,
-                fused_out,
-                final_output,
-                expert_tokens_meta,
-                apply_router_weight_on_input,
-                global_num_experts,
-                local_num_experts,
-            )
+            log_this = True
+            if is_forward_context_available():
+                ctx = get_forward_context()
+                if ctx.additional_kwargs.get("is_dummy_run"):
+                    log_this = False
+            if log_this and not _tensor_is_all_zero(hidden_states):
+                self._pplx_debug_logged = True
+                self._log_moe_debug(
+                    hidden_states,
+                    a1q,
+                    a1q_scale,
+                    topk_weights,
+                    topk_ids,
+                    fused_out,
+                    final_output,
+                    expert_tokens_meta,
+                    apply_router_weight_on_input,
+                    global_num_experts,
+                    local_num_experts,
+                )
 
         return final_output

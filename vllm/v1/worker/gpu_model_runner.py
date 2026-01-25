@@ -4633,6 +4633,11 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    additional_kwargs={
+                        "is_dummy_run": True,
+                        "is_profile": is_profile,
+                        "is_graph_capturing": is_graph_capturing,
+                    },
                 ),
             ):
                 outputs = self.model(
