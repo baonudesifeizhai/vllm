@@ -124,8 +124,7 @@ class DeviceCommunicatorBase:
             # as long as we use data parallel (coupled data parallel
             # where all data parallel ranks execute forward together),
             # we initialize the all2all manager used in expert parallel.
-            # Modified to allow single GPU (>= 1) for testing PPLX
-            use_ep = config.parallel_config.data_parallel_size >= 1
+            use_ep = config.parallel_config.data_parallel_size > 1
             all2all_backend = config.parallel_config.all2all_backend
 
         self.is_ep_communicator = "ep" in unique_name

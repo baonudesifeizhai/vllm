@@ -537,6 +537,11 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         assert output.size(1) == fused_expert_output.size(-1)
 
+        # For multi-GPU: ensure output buffer is zeroed before combine
+        # to avoid accumulation issues in PPLX combine
+        # PPLX combine may accumulate into output, so we need to zero it first
+        output.zero_()
+
         # Set weights to 1 if we did them in dispatch. This is hacky.
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)
@@ -573,15 +578,24 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             do_recv=False,
         )
 
-        return lambda: self.a2a.combine(
-            out_tokens=output,
-            indices=topk_ids_u32,
-            weights=topk_weights,
-            expert_y=fused_expert_output,
-            bound_m=bound_m,
-            do_send=False,
-            do_recv=True,
-        )
+        # For multi-GPU: synchronize before recv to ensure send completes
+        # This prevents data alignment and synchronization issues in PPLX combine
+        from vllm.utils.torch_utils import current_stream
+
+        def recv_combine():
+            # Ensure send phase completes before recv
+            current_stream().synchronize()
+            self.a2a.combine(
+                out_tokens=output,
+                indices=topk_ids_u32,
+                weights=topk_weights,
+                expert_y=fused_expert_output,
+                bound_m=bound_m,
+                do_send=False,
+                do_recv=True,
+            )
+
+        return recv_combine
 
     def finalize(
         self,
