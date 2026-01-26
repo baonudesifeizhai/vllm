@@ -66,6 +66,30 @@ def _tensor_debug_stats(tensor: torch.Tensor | None) -> str:
     )
 
 
+def _valid_expert_stats(
+    tensor: torch.Tensor | None,
+    expert_num_tokens: torch.Tensor | None,
+) -> str:
+    if tensor is None:
+        return "none"
+    if expert_num_tokens is None or expert_num_tokens.numel() == 0:
+        return _tensor_debug_stats(tensor)
+    if tensor.dim() < 2:
+        return _tensor_debug_stats(tensor)
+    if tensor.size(0) != expert_num_tokens.numel():
+        return (
+            f"shape={tuple(tensor.shape)} tokens={expert_num_tokens.numel()} mismatch"
+        )
+    valid_slices = []
+    for expert_idx, count in enumerate(expert_num_tokens.tolist()):
+        if count:
+            valid_slices.append(tensor[expert_idx, :count, ...])
+    if not valid_slices:
+        return "empty"
+    valid = torch.cat(valid_slices, dim=0)
+    return _tensor_debug_stats(valid)
+
+
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
 # The goal is to be able to utilize different communication mechanisms with
@@ -1324,6 +1348,8 @@ class FusedMoEModularKernel(torch.nn.Module):
         expert_num_tokens = (
             None if expert_tokens_meta is None else expert_tokens_meta.expert_num_tokens
         )
+        valid_a1q_stats = _valid_expert_stats(a1q, expert_num_tokens)
+        valid_a1q_scale_stats = _valid_expert_stats(a1q_scale, expert_num_tokens)
         if isinstance(output, tuple):
             output_stats = (
                 f"shared={_tensor_debug_stats(output[0])} "
@@ -1336,8 +1362,8 @@ class FusedMoEModularKernel(torch.nn.Module):
             "PPLX_DEBUG kernel_id=%s prepare_finalize=%s fused_experts=%s "
             "apply_router_weight_on_input=%s global_experts=%d "
             "local_experts=%d topk=%d hidden_states=%s a1q=%s a1q_scale=%s "
-            "topk_ids=%s topk_weights=%s expert_num_tokens=%s fused_out=%s "
-            "output=%s",
+            "a1q_valid=%s a1q_scale_valid=%s topk_ids=%s topk_weights=%s "
+            "expert_num_tokens=%s fused_out=%s output=%s",
             id(self),
             self.prepare_finalize.__class__.__name__,
             self.fused_experts.__class__.__name__,
@@ -1348,6 +1374,8 @@ class FusedMoEModularKernel(torch.nn.Module):
             _tensor_debug_stats(hidden_states),
             _tensor_debug_stats(a1q),
             _tensor_debug_stats(a1q_scale),
+            valid_a1q_stats,
+            valid_a1q_scale_stats,
             _tensor_debug_stats(topk_ids),
             _tensor_debug_stats(topk_weights),
             _tensor_debug_stats(expert_num_tokens),

@@ -368,6 +368,8 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 dtype=torch.float32,
                 device=expert_x.device,
             )
+            # Initialize scales to avoid undefined padding values.
+            expert_x_scale.zero_()
 
         if (
             _pplx_debug_enabled()
@@ -430,6 +432,8 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if expert_x_scale is not None:
             expert_x_scale = expert_x_scale[:, :, :orig_a_scale_block_shape]
             assert expert_x_scale.ndim == 3
+            if not expert_x_scale.is_contiguous():
+                expert_x_scale = expert_x_scale.contiguous()
 
         if expert_num_tokens.numel() != 0:
             expert_num_tokens_i64 = expert_num_tokens.to(torch.int64)
@@ -460,13 +464,18 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 )
             else:
                 valid_scale_stats = "none"
+            full_scale_stats = (
+                _tensor_stats(expert_x_scale) if expert_x_scale is not None else "none"
+            )
             logger.info(
                 "PPLX_DEBUG_RECEIVER total_valid=%d expert_num_tokens=%s "
-                "expert_x_valid=%s expert_x_scale_valid=%s",
+                "expert_x_valid=%s expert_x_scale_valid=%s "
+                "expert_x_scale_full=%s",
                 total_valid,
                 _tensor_stats(expert_num_tokens),
                 valid_x_stats,
                 valid_scale_stats,
+                full_scale_stats,
             )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
