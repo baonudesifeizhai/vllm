@@ -296,7 +296,11 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 assert scalar_scales
                 a1q_scale = a1q_scale.view(1, 1)
 
-            orig_a_scale_block_shape = a1q_scale.shape[-1]
+            orig_a_scale_block_shape = (
+                repeat_cols
+                if not quant_config.is_block_quantized
+                else a1q_scale.shape[-1]
+            )
 
             if not quant_config.is_block_quantized:
                 # TODO (bnell): use group_broadcast instead?
