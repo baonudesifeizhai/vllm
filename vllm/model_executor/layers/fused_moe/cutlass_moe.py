@@ -223,6 +223,10 @@ def run_cutlass_moe_fp8(
         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
     )
 
+    if use_batched_format and expert_num_tokens is not None:
+        # Clear padded rows; CUTLASS writes only valid tokens per expert.
+        mm2_out.zero_()
+
     ops.cutlass_moe_mm(
         mm2_out,
         a2q,
