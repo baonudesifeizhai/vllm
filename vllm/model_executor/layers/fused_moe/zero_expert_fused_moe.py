@@ -37,16 +37,18 @@ class ZeroExpertFusedMoE(FusedMoE):
             "It manages its own for routing memoization."
         )
 
-        # Use the full router e_score_correction_bias (including zero experts) for
-        # the base FusedMoE's router. select_experts() is always called with full
-        # router_logits (n_routed + zero_expert_num); topk_softmax uses
-        # gating_output.size(-1) as num_experts and requires bias.size(0) ==
-        # num_experts, so the bias must match the full logits dimension.
-        if hasattr(router, "e_score_correction_bias"):
+        # Use sliced e_score_correction_bias (real experts only) for the base
+        # FusedMoE's router. moe_forward / forward_impl receive sliced
+        # router_logits (logical_num_experts) and call router.select_experts;
+        # topk_softmax requires bias.size(0) == gating_output.size(-1). We
+        # temporarily override the router's bias to full (incl. zero experts)
+        # only when we compute routing with full logits in forward().
+        if hasattr(router, "e_score_correction_bias") and "num_experts" in kwargs:
+            num_real_experts = kwargs["num_experts"]
             router_bias = router.e_score_correction_bias
             user_bias = kwargs.get("e_score_correction_bias")
             if user_bias is None or user_bias.shape[0] == router_bias.shape[0]:
-                kwargs["e_score_correction_bias"] = router_bias
+                kwargs["e_score_correction_bias"] = router_bias[:num_real_experts]
 
         # FusedMoE no longer accepts zero_expert_num/zero_expert_type.
         # We handle zero experts ourselves in forward().
@@ -98,6 +100,22 @@ class ZeroExpertFusedMoE(FusedMoE):
             for key, value in originals.items():
                 object.__setattr__(self, key, value)
 
+    @staticmethod
+    @contextmanager
+    def _temporarily_set_attrs_on(obj, **attrs):
+        """
+        Temporarily set attributes on an arbitrary object and restore them.
+        Uses object.__setattr__ to avoid Dynamo tracing issues.
+        """
+        originals = {key: getattr(obj, key) for key in attrs}
+        try:
+            for key, value in attrs.items():
+                object.__setattr__(obj, key, value)
+            yield
+        finally:
+            for key, value in originals.items():
+                object.__setattr__(obj, key, value)
+
     def _compute_zero_expert_result(
         self,
         hidden_states: torch.Tensor,
@@ -135,21 +153,29 @@ class ZeroExpertFusedMoE(FusedMoE):
         Returns:
             Combined output from real experts and zero experts
         """
-        # Prepare temporary attribute overrides for routing computation
-        temp_attrs = {
-            "custom_routing_function": None,  # Disable for first routing
-        }
-        if self._router is not None:
-            temp_attrs["e_score_correction_bias"] = self._router.e_score_correction_bias
-
-        # Compute routing with temporary attributes
-        # Pass full router_logits (including zero experts) so that zero experts
-        # can be properly identified in topk_ids
-        with self._temporarily_set_attrs(**temp_attrs):
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,  # Full logits (includes zero experts)
+        # Disable custom_routing for first routing; temporarily use full
+        # e_score_correction_bias on the router so topk_softmax (num_experts
+        # from gating_output.size(-1)) matches bias.size(0) for full logits.
+        router_bias_override = {}
+        if self._router is not None and hasattr(self.router, "e_score_correction_bias"):
+            router_bias_override["e_score_correction_bias"] = (
+                self._router.e_score_correction_bias
             )
+
+        with self._temporarily_set_attrs(custom_routing_function=None):
+            if router_bias_override:
+                with self._temporarily_set_attrs_on(
+                    self.router, **router_bias_override
+                ):
+                    topk_weights, topk_ids = self.router.select_experts(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                    )
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                )
 
         # Compute zero expert result if needed
         zero_expert_result = self._compute_zero_expert_result(
