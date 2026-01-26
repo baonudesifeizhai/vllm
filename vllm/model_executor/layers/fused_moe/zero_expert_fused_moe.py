@@ -37,19 +37,16 @@ class ZeroExpertFusedMoE(FusedMoE):
             "It manages its own for routing memoization."
         )
 
-        # Automatically slice router's e_score_correction_bias to only include
-        # real experts (not zero_experts) for the base FusedMoE.
-        # The full bias will be used temporarily in forward() for routing.
-        if hasattr(router, "e_score_correction_bias") and "num_experts" in kwargs:
-            num_real_experts = kwargs["num_experts"]
+        # Use the full router e_score_correction_bias (including zero experts) for
+        # the base FusedMoE's router. select_experts() is always called with full
+        # router_logits (n_routed + zero_expert_num); topk_softmax uses
+        # gating_output.size(-1) as num_experts and requires bias.size(0) ==
+        # num_experts, so the bias must match the full logits dimension.
+        if hasattr(router, "e_score_correction_bias"):
             router_bias = router.e_score_correction_bias
             user_bias = kwargs.get("e_score_correction_bias")
-
-            # Use router's bias if:
-            # 1. User didn't provide bias, or
-            # 2. User provided full bias (same size as router)
             if user_bias is None or user_bias.shape[0] == router_bias.shape[0]:
-                kwargs["e_score_correction_bias"] = router_bias[:num_real_experts]
+                kwargs["e_score_correction_bias"] = router_bias
 
         # FusedMoE no longer accepts zero_expert_num/zero_expert_type.
         # We handle zero experts ourselves in forward().
