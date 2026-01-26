@@ -196,11 +196,9 @@ def run_cutlass_moe_fp8(
         )
         expert_offsets = expert_first_token_offset[:-1]
 
-    if not per_act_token and (expert_map is not None or use_batched_format):
-        # this is necessary to avoid imprecise scale calculation caused by
-        # random data in the unused workspace. The workspace is unused when
-        # this rank handles only partial tokens, or when it is batched .
-        mm1_out.fill_(0)
+    if expert_map is not None or use_batched_format:
+        # Clear workspace to avoid propagating garbage from padded/unused rows.
+        mm1_out.zero_()
 
     ops.cutlass_moe_mm(
         mm1_out,
@@ -222,6 +220,8 @@ def run_cutlass_moe_fp8(
     a2q, a2q_scale = ops.scaled_fp8_quant(
         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
     )
+    # Ensure scale layout is contiguous for CUTLASS scale pointer arithmetic.
+    a2q_scale = a2q_scale.contiguous()
 
     if use_batched_format and expert_num_tokens is not None:
         # Clear padded rows; CUTLASS writes only valid tokens per expert.
