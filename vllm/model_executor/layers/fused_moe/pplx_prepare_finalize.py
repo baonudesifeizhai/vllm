@@ -53,6 +53,12 @@ def _tensor_stats(tensor: torch.Tensor | None) -> str:
     )
 
 
+def _tensor_layout(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "none"
+    return f"shape={tuple(tensor.shape)} stride={tensor.stride()} dtype={tensor.dtype}"
+
+
 def _valid_expert_stats(
     expert_x: torch.Tensor, expert_num_tokens: torch.Tensor
 ) -> tuple[str, int]:
@@ -292,7 +298,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
             orig_a_scale_block_shape = a1q_scale.shape[-1]
 
-            if quant_config.is_per_tensor:
+            if not quant_config.is_block_quantized:
                 # TODO (bnell): use group_broadcast instead?
                 a1q_scale = a1q_scale.repeat(repeat_rows, repeat_cols)
                 assert a1q_scale.shape[0] == a1q.shape[0], (
@@ -342,12 +348,9 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
 
         expert_x_scale: torch.Tensor | None = None
         if a1q.dtype.itemsize == 1:
-            if quant_config.is_per_act_token:
-                # (M x 1) -> (E x M x K)
-                final_dim = expert_x.size(2)
-            elif quant_config.is_per_tensor:
-                # (1 x 1) -> (E x 1 x 1)
-                final_dim = 1
+            if quant_config.is_per_act_token or quant_config.is_per_tensor:
+                # PPLX expects 4 FP32 scales per token for non-block quant.
+                final_dim = repeat_cols
             else:
                 # (M x K_tiles) -> (E x M x K_tiles)
                 assert quant_config.block_shape is not None
@@ -357,13 +360,26 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             expert_x_scale_shape = (
                 self.num_local_experts,
                 expert_x.size(1),
-                round_up(final_dim, 4),  # round up for alignment
+                round_up(final_dim, repeat_cols),  # round up for alignment
             )
 
             expert_x_scale = torch.empty(
                 expert_x_scale_shape,
                 dtype=torch.float32,
                 device=expert_x.device,
+            )
+
+        if (
+            _pplx_debug_enabled()
+            and not _is_dummy_forward()
+            and not getattr(self, "_debug_layout_logged", False)
+        ):
+            self._debug_layout_logged = True
+            logger.info(
+                "PPLX_DEBUG_LAYOUT a1q_scale=%s expert_x_scale=%s repeat_cols=%d",
+                _tensor_layout(a1q_scale),
+                _tensor_layout(expert_x_scale),
+                repeat_cols,
             )
 
         # This argument is optional, defaults to indices.size(0)
