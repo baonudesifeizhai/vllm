@@ -537,8 +537,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         )
         assert output.size(1) == fused_expert_output.size(-1)
 
-        output.zero_()
-
         # Set weights to 1 if we did them in dispatch. This is hacky.
         if apply_router_weight_on_input:
             topk_weights = torch.ones_like(topk_weights)

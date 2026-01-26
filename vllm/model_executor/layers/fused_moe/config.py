@@ -866,7 +866,8 @@ class FusedMoEParallelConfig:
 
     @property
     def use_all2all_kernels(self):
-        return self.dp_size > 1 and self.use_ep
+        # Modified to allow single GPU (>= 1) for testing PPLX
+        return self.dp_size >= 1 and self.use_ep
 
     @property
     def use_pplx_kernels(self):
