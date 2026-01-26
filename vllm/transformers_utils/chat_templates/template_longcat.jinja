@@ -1,0 +1,21 @@
+{%- set enable_thinking = enable_thinking | default(false) -%}
+{%- for message in messages -%}
+{%- if message['role'] == 'system' -%}
+{{ '<longcat_system>' + message['content'] + '</longcat_system>' }}
+{%- elif message['role'] == 'user' -%}
+{{ '<longcat_user>' + message['content'] + '</longcat_user>' }}
+{%- elif message['role'] == 'assistant' -%}
+{{ '<longcat_assistant>' + message['content'] + '</longcat_assistant>' }}
+{%- endif -%}
+{%- if not loop.last -%}
+{{ '\n' }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt and messages[-1]['role'] != 'assistant' -%}
+{{ '\n\n/think_on <longcat_assistant>' }}
+{%- if enable_thinking -%}
+{{ '<longcat_think>\n' }}
+{%- else -%}
+{{ '<longcat_think>\n\n</longcat_think>' }}
+{%- endif -%}
+{%- endif -%}
