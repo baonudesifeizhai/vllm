@@ -38,13 +38,7 @@ def kernel_warmup(worker: "Worker"):
 
     # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
     if has_flashinfer() and current_platform.has_device_capability(90):
-        if envs.VLLM_SKIP_FLASHINFER_AUTOTUNE:
-            logger.info(
-                "Skipping FlashInfer autotune (VLLM_SKIP_FLASHINFER_AUTOTUNE=1). "
-                "FlashInfer may use heuristics and be slower."
-            )
-        else:
-            flashinfer_autotune(worker.model_runner)
+        flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
