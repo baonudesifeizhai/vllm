@@ -170,7 +170,16 @@ def run_cutlass_moe_fp8(
         w1_scale = w1_scale.reshape(w1_scale.size(0), -1)
         w2_scale = w2_scale.reshape(w2_scale.size(0), -1)
         a1q = a1q.reshape(-1, a1q.size(2))
-        a1q_scale = a1q_scale.reshape(-1, a1q_scale.size(2)).contiguous()
+        # Handle a1q_scale shape: if it has shape (E*M, 4) from PPLX repeat,
+        # take only first column
+        if a1q_scale is not None:
+            if a1q_scale.ndim == 3:
+                a1q_scale = a1q_scale.reshape(-1, a1q_scale.size(2))
+            if a1q_scale.ndim == 2 and a1q_scale.size(1) > 1:
+                # PPLX repeat creates (M, 4) shape, but CUTLASS expects (M, 1) or scalar
+                a1q_scale = a1q_scale[:, 0:1].contiguous()
+            else:
+                a1q_scale = a1q_scale.contiguous()
         # c3x get_group_gemm_starts expects int64 to avoid overflow
         # during offset calculations
         expert_offsets = expert_offsets.to(torch.int64)
@@ -189,6 +198,13 @@ def run_cutlass_moe_fp8(
             expert_map,
             permuted_hidden_states=a1q_perm,
         )
+        # Ensure a1q_scale is contiguous and handle PPLX repeat shape (M, 4) -> (M, 1)
+        if a1q_scale is not None:
+            # If a1q_scale has shape (M, 4) from PPLX repeat, take only first column
+            if a1q_scale.ndim == 2 and a1q_scale.size(1) > 1:
+                a1q_scale = a1q_scale[:, 0:1].contiguous()
+            else:
+                a1q_scale = a1q_scale.contiguous()
         # swap_ab is a CUTLASS grouped-GEMM optimization (M <= 64 reduces padding).
         swap_ab = a1q.size(0) <= 64
         ops.get_cutlass_moe_mm_problem_sizes_from_expert_offsets(
