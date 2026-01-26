@@ -358,7 +358,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         "meta-llama/Llama-4-Scout-17B-16E-Instruct",
     ),
     "LongcatFlashForCausalLM": _HfExamplesInfo(
-        "meituan-longcat/LongCat-Flash-Chat", trust_remote_code=True
+        "meituan-longcat/LongCat-Flash-Chat",
+        trust_remote_code=True,
+        extras={"thinking": "meituan-longcat/LongCat-Flash-Thinking-2601"},
     ),
     "MambaForCausalLM": _HfExamplesInfo("state-spaces/mamba-130m-hf"),
     "Mamba2ForCausalLM": _HfExamplesInfo(

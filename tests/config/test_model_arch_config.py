@@ -18,6 +18,7 @@ BASE_TRUST_REMOTE_CODE_MODELS = {
     # Excluded: Not available online right now
     # "FreedomIntelligence/openPangu-Ultra-MoE-718B-V1.1",
     "meituan-longcat/LongCat-Flash-Chat",
+    "meituan-longcat/LongCat-Flash-Thinking-2601",
 }
 
 BASE_MODELS_TO_TEST = [

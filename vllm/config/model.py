@@ -489,6 +489,17 @@ class ModelConfig:
         self.hf_config = hf_config
         if dict_overrides:
             self._apply_dict_overrides(hf_config, dict_overrides)
+        # LongCat-Flash-Thinking-2601 uses LongcatCausalLM with custom HF config;
+        # ensure model_type and num_hidden_layers for vLLM longcat_flash path.
+        archs = getattr(hf_config, "architectures", []) or []
+        if "LongcatCausalLM" in archs:
+            if getattr(hf_config, "model_type", None) != "longcat_flash":
+                hf_config.model_type = "longcat_flash"
+            if (
+                not getattr(hf_config, "num_hidden_layers", None)
+                and getattr(hf_config, "num_layers", None) is not None
+            ):
+                hf_config.num_hidden_layers = hf_config.num_layers
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.attention_chunk_size = getattr(
             self.hf_text_config, "attention_chunk_size", None

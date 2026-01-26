@@ -355,5 +355,22 @@
         "is_deepseek_mla": true,
         "is_multimodal_model": false,
         "dtype": "torch.float32"
+    },
+    "meituan-longcat/LongCat-Flash-Thinking-2601": {
+        "architectures": [
+            "LongcatCausalLM"
+        ],
+        "model_type": "longcat_flash",
+        "text_model_type": "longcat_flash",
+        "hidden_size": 6144,
+        "total_num_hidden_layers": 28,
+        "total_num_attention_heads": 64,
+        "head_size": 576,
+        "vocab_size": 131072,
+        "total_num_kv_heads": 64,
+        "num_experts": 512,
+        "is_deepseek_mla": true,
+        "is_multimodal_model": false,
+        "dtype": "torch.bfloat16"
     }
 }
