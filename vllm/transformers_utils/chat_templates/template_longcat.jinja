@@ -7,7 +7,7 @@
 {%- elif message['role'] == 'assistant' -%}
 {{ '<longcat_assistant>' + message['content'] + '</longcat_assistant>' }}
 {%- endif -%}
-{%- if not loop.last -%}
+{%- if not loop.last and message['role'] != 'system' -%}
 {{ '\n' }}
 {%- endif -%}
 {%- endfor -%}
