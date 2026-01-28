@@ -700,6 +700,16 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         trust_remote_code=True,
         min_transformers_version="5.0.0",
     ),
+    "VibeVoiceForASRTraining": _HfExamplesInfo(
+        "microsoft/VibeVoice-ASR",
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
+    "VibeVoiceASRForConditionalGeneration": _HfExamplesInfo(
+        "microsoft/VibeVoice-ASR",
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
     "GraniteVision": _HfExamplesInfo("ibm-granite/granite-vision-3.3-2b"),
     "GraniteSpeechForConditionalGeneration": _HfExamplesInfo(
         "ibm-granite/granite-speech-3.3-2b"

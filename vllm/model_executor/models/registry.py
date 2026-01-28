@@ -319,6 +319,14 @@ _MULTIMODAL_MODELS = {
         "Gemma3nForConditionalGeneration",
     ),
     "GlmAsrForConditionalGeneration": ("glmasr", "GlmAsrForConditionalGeneration"),
+    "VibeVoiceForASRTraining": (
+        "vibevoice_asr",
+        "VibeVoiceASRForConditionalGeneration",
+    ),
+    "VibeVoiceASRForConditionalGeneration": (
+        "vibevoice_asr",
+        "VibeVoiceASRForConditionalGeneration",
+    ),
     "GLM4VForCausalLM": ("glm4v", "GLM4VForCausalLM"),
     "Glm4vForConditionalGeneration": ("glm4_1v", "Glm4vForConditionalGeneration"),
     "Glm4vMoeForConditionalGeneration": ("glm4_1v", "Glm4vMoeForConditionalGeneration"),
