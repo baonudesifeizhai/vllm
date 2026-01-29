@@ -12,8 +12,9 @@
 {%- endif -%}
 {%- endfor -%}
 {%- if add_generation_prompt and messages[-1]['role'] != 'assistant' -%}
-{{ '\n\n/think_on <longcat_assistant>' }}
 {%- if enable_thinking -%}
-{{ '<longcat_think>\n' }}
+{{ '\n\n/think_on <longcat_assistant><longcat_think>\n' }}
+{%- else -%}
+{{ '\n\n<longcat_assistant>' }}
 {%- endif -%}
 {%- endif -%}
