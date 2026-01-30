@@ -109,23 +109,6 @@ def resolve_chat_template(
         if chat_template is not None:
             return chat_template
 
-    # 2.5 For longcat_flash, prefer our fallback over the tokenizer's template.
-    # The HF tokenizer template omits </longcat_system>, </longcat_user>, and
-    # /think_on; we use template_longcat.jinja to match the trajectory format.
-    if tools is None:
-        mt = getattr(model_config.hf_config, "model_type", None)
-        if mt == "longcat_flash":
-            path = get_chat_template_fallback_path(
-                model_type="longcat_flash",
-                tokenizer_name_or_path=tokenizer.name_or_path,
-            )
-            if path is not None:
-                logger.info_once(
-                    "Using LongCat fallback chat template for %s.",
-                    tokenizer.name_or_path,
-                )
-                return load_chat_template(path)
-
     # 3rd priority: AutoTokenizer chat template
     try:
         return tokenizer.get_chat_template(chat_template, tools=tools)

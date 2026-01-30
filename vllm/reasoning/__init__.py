@@ -56,10 +56,6 @@ _REASONING_PARSERS_TO_REGISTER = {
         "deepseek_r1_reasoning_parser",
         "DeepSeekR1ReasoningParser",
     ),
-    "longcat": (
-        "longcat_reasoning_parser",
-        "LongcatReasoningParser",
-    ),
     "minimax_m2": (
         "minimax_m2_reasoning_parser",
         "MiniMaxM2ReasoningParser",
