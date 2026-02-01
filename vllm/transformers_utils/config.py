@@ -487,6 +487,12 @@ def _maybe_remap_hf_config_attrs(config: PretrainedConfig) -> PretrainedConfig:
             if not hasattr(config, new_attr):
                 config.update({new_attr: getattr(config, old_attr)})
             logger.debug("Remapped config attribute '%s' to '%s'", old_attr, new_attr)
+    architectures = getattr(config, "architectures", None) or []
+    if (
+        "LongcatCausalLM" in architectures
+        and getattr(config, "model_type", None) != "longcat_flash"
+    ):
+        config.update({"model_type": "longcat_flash"})
     return config
 
 
