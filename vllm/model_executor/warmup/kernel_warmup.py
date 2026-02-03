@@ -36,8 +36,12 @@ def kernel_warmup(worker: "Worker"):
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
 
-    # FlashInfer autotune for Hopper (SM 9.0) and Blackwell (SM 10.0) GPUs
-    if has_flashinfer() and current_platform.has_device_capability(90):
+    # FlashInfer autotune for SM90+ GPUs (Hopper/Blackwell, incl. B-series)
+    if (
+        envs.VLLM_ENABLE_FLASHINFER_AUTOTUNE
+        and has_flashinfer()
+        and current_platform.has_device_capability(90)
+    ):
         flashinfer_autotune(worker.model_runner)
 
     # FlashInfer attention warmup

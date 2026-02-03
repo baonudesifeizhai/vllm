@@ -157,6 +157,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = False
+    VLLM_ENABLE_FLASHINFER_AUTOTUNE: bool = True
     VLLM_USE_FLASHINFER_MOE_FP16: bool = False
     VLLM_USE_FLASHINFER_MOE_FP8: bool = False
     VLLM_USE_FLASHINFER_MOE_FP4: bool = False
@@ -1217,6 +1218,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(
         int(os.getenv("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "0"))
+    ),
+    # Enable FlashInfer autotuning during warmup (SM90+).
+    "VLLM_ENABLE_FLASHINFER_AUTOTUNE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_FLASHINFER_AUTOTUNE", "1"))
     ),
     # Allow use of FlashInfer BF16 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_FP16": lambda: bool(
