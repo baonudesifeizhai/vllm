@@ -4,6 +4,7 @@
 
 import gc
 import os
+import time
 from contextlib import AbstractContextManager, nullcontext
 from types import NoneType
 from typing import TYPE_CHECKING, Any, cast
@@ -432,6 +433,8 @@ class Worker(WorkerBase):
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> None:
         warmup_sizes = []
+        if hasattr(self.model_runner, "reset_dummy_run_phase_stats"):
+            self.model_runner.reset_dummy_run_phase_stats()
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
             # warm up sizes that are not in cudagraph capture sizes,
@@ -459,7 +462,19 @@ class Worker(WorkerBase):
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
-            self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            if hasattr(self.model_runner, "_timed_dummy_run"):
+                self.model_runner._timed_dummy_run(
+                    size,
+                    phase="compile_warmup",
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
+            else:
+                self.model_runner._dummy_run(
+                    size,
+                    skip_eplb=True,
+                    remove_lora=False,
+                )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
@@ -538,15 +553,52 @@ class Worker(WorkerBase):
             )
 
             # We skip EPLB here since we don't want to record dummy metrics
-            hidden_states, last_hidden_states = self.model_runner._dummy_run(
-                num_tokens=max_num_reqs,
-                skip_eplb=True,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            )
+            if hasattr(self.model_runner, "_timed_dummy_run"):
+                hidden_states, last_hidden_states = self.model_runner._timed_dummy_run(
+                    num_tokens=max_num_reqs,
+                    phase="sampler_warmup",
+                    skip_eplb=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                )
+            else:
+                start_time = time.perf_counter()
+                hidden_states, last_hidden_states = self.model_runner._dummy_run(
+                    num_tokens=max_num_reqs,
+                    skip_eplb=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                )
+                elapsed = time.perf_counter() - start_time
+                logger.info(
+                    "dummy_run phase=sampler_warmup count=1 total=%.3fs avg=%.3fs",
+                    elapsed,
+                    elapsed,
+                )
             if self.model_runner.is_pooling_model:
                 self.model_runner._dummy_pooler_run(hidden_states)
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
+
+        if hasattr(self.model_runner, "get_dummy_run_phase_stats"):
+            phase_stats = self.model_runner.get_dummy_run_phase_stats()
+            for phase in (
+                "compile_warmup",
+                "cudagraph_warmup",
+                "cudagraph_capture",
+                "sampler_warmup",
+            ):
+                stats = phase_stats.get(phase)
+                if stats is None:
+                    continue
+                count = int(stats["count"])
+                total = float(stats["total_time_s"])
+                avg = total / count if count > 0 else 0.0
+                logger.info(
+                    "dummy_run phase=%s count=%d total=%.3fs avg=%.3fs",
+                    phase,
+                    count,
+                    total,
+                    avg,
+                )
 
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.

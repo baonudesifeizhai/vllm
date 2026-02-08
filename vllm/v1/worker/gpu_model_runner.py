@@ -376,6 +376,7 @@ class GPUModelRunner(
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         self.max_num_reqs = scheduler_config.max_num_seqs
+        self._dummy_run_phase_stats: dict[str, dict[str, float | int]] = {}
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -4603,6 +4604,39 @@ class GPUModelRunner(
             )
         )
 
+    def _record_dummy_run_phase_stat(self, phase: str, elapsed_s: float) -> None:
+        stat = self._dummy_run_phase_stats.setdefault(
+            phase,
+            {"count": 0, "total_time_s": 0.0},
+        )
+        stat["count"] = int(stat["count"]) + 1
+        stat["total_time_s"] = float(stat["total_time_s"]) + elapsed_s
+
+    def _timed_dummy_run(
+        self,
+        num_tokens: int,
+        *,
+        phase: str,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        start_time = time.perf_counter()
+        try:
+            return self._dummy_run(num_tokens=num_tokens, **kwargs)
+        finally:
+            self._record_dummy_run_phase_stat(phase, time.perf_counter() - start_time)
+
+    def reset_dummy_run_phase_stats(self) -> None:
+        self._dummy_run_phase_stats.clear()
+
+    def get_dummy_run_phase_stats(self) -> dict[str, dict[str, float | int]]:
+        return {
+            phase: {
+                "count": int(stats["count"]),
+                "total_time_s": float(stats["total_time_s"]),
+            }
+            for phase, stats in self._dummy_run_phase_stats.items()
+        }
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -5255,7 +5289,7 @@ class GPUModelRunner(
         force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
 
         dummy_run = functools.partial(
-            self._dummy_run,
+            self._timed_dummy_run,
             uniform_decode=uniform_decode,
             skip_eplb=True,
             remove_lora=False,
@@ -5301,6 +5335,7 @@ class GPUModelRunner(
                 # attention while `PIECEWISE` implies no attention.
                 dummy_run(
                     num_tokens,
+                    phase="cudagraph_warmup",
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
                     allow_microbatching=allow_microbatching,
                     num_active_loras=num_active_loras,
@@ -5309,6 +5344,7 @@ class GPUModelRunner(
             # Capture run
             dummy_run(
                 num_tokens,
+                phase="cudagraph_capture",
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 allow_microbatching=allow_microbatching,
                 num_active_loras=num_active_loras,
