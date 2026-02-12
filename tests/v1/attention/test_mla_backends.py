@@ -164,15 +164,20 @@ def create_and_prepopulate_kv_cache(
     slot_mapping = common_attn_metadata.slot_mapping
 
     use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
+    use_nvfp4 = kv_cache_dtype == "nvfp4"
 
-    if use_fp8_ds_mla:
+    if use_fp8_ds_mla or use_nvfp4:
         if not kv_c_contexts:
             raise ValueError(
-                "kv_c_contexts cannot be empty when using fp8_ds_mla cache dtype"
+                "kv_c_contexts cannot be empty when using specialized kv cache dtype"
             )
         kv_lora_rank = kv_c_contexts[0].shape[-1]
         rope_dim = k_pe_contexts[0].shape[-1]
-        entry_size = kv_lora_rank + 4 * 4 + 2 * rope_dim
+        head_dim = kv_lora_rank + rope_dim
+        if use_fp8_ds_mla:
+            entry_size = kv_lora_rank + 4 * 4 + 2 * rope_dim
+        else:
+            entry_size = head_dim // 2 + (head_dim // 16) * 4
         kv_cache = torch.zeros(
             num_blocks, block_size, entry_size, dtype=torch.uint8, device=device
         )
@@ -201,14 +206,14 @@ def create_and_prepopulate_kv_cache(
 
         start = start_block_idx * block_size
 
-        if use_fp8_ds_mla:
+        if use_fp8_ds_mla or use_nvfp4:
             slots = torch.arange(context_len, device=device, dtype=torch.long) + start
             ops.concat_and_cache_mla(
                 kv_c_context,
                 k_pe_context.squeeze(1),
                 kv_cache,
                 slots,
-                kv_cache_dtype="fp8_ds_mla",
+                kv_cache_dtype=kv_cache_dtype or "auto",
                 scale=scale_tensor,
             )
         else:
@@ -395,6 +400,7 @@ class MockMLAAttentionLayer(AttentionLayerBase):
         kv_lora_rank: int,
         device: torch.device,
         kv_b_proj,
+        kv_cache_dtype: str = "auto",
     ):
         self.impl = impl
         self.num_heads = num_heads
@@ -402,6 +408,7 @@ class MockMLAAttentionLayer(AttentionLayerBase):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
         self.kv_lora_rank = kv_lora_rank
+        self.kv_cache_dtype = kv_cache_dtype
 
         # Compute weight matrices from kv_b_proj (like MLAAttention does)
         # This replicates MLAAttention.process_weights_after_loading logic
@@ -449,7 +456,7 @@ class MockMLAAttentionLayer(AttentionLayerBase):
                 k_pe.squeeze(1),
                 kv_cache,
                 attn_metadata.slot_mapping.flatten(),
-                kv_cache_dtype="auto",
+                kv_cache_dtype=self.kv_cache_dtype,
                 scale=self._k_scale,
             )
 
@@ -526,6 +533,7 @@ def run_attention_backend(
     qk_rope_head_dim: int,
     v_head_dim: int,
     mock_kv_b_proj,
+    kv_cache_dtype: str = "auto",
 ) -> torch.Tensor:
     """Run attention computation using the specified backend's AttentionImpl."""
 
@@ -550,7 +558,7 @@ def run_attention_backend(
             num_kv_heads=num_kv_heads,
             alibi_slopes=None,
             sliding_window=None,
-            kv_cache_dtype="auto",
+            kv_cache_dtype=kv_cache_dtype,
             logits_soft_cap=None,
             attn_type="decoder",
             kv_sharing_target_layer_name=None,
@@ -582,6 +590,7 @@ def run_attention_backend(
             kv_lora_rank=kv_lora_rank,
             device=device,
             kv_b_proj=mock_kv_b_proj,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
         # Populate static_forward_context with mock attention layers
@@ -1016,6 +1025,7 @@ def test_backend_correctness(
             qk_rope_head_dim,
             v_head_dim,
             mock_kv_b_proj,
+            kv_cache_dtype="auto",
         )
 
         # Use backend_idx to get the correct SDPA output for this backend
@@ -1067,3 +1077,134 @@ def test_backend_correctness(
         summary = f"{len(failures)} backend(s) failed: {', '.join(backend_names)}"
         detailed_msg = "\n".join(failures)
         pytest.fail(f"{summary}\n{detailed_msg}")
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER_MLA not in BACKENDS_TO_TEST,
+    reason="FLASHINFER_MLA backend not available on this platform",
+)
+def test_flashinfer_mla_nvfp4_decode_uses_dequant_op(
+    default_vllm_config,
+    dist_init,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Smoke test for MLA NVFP4 decode path wiring in FlashInfer backend."""
+    batch_spec = BATCH_SPECS["small_decode"]
+    block_size = BACKEND_BLOCK_SIZES[AttentionBackendEnum.FLASHINFER_MLA]
+    required_blocks = sum(
+        (s + block_size - 1) // block_size for s in batch_spec.seq_lens
+    )
+    vllm_config = create_vllm_config(
+        model_name="deepseek-ai/DeepSeek-R1",
+        tensor_parallel_size=1,
+        max_model_len=max(batch_spec.seq_lens),
+        num_gpu_blocks=required_blocks + 1 + 32,
+        block_size=block_size,
+    )
+    vllm_config.cache_config.cache_dtype = "nvfp4"
+
+    device = torch.device("cuda:0")
+    dtype = _convert_dtype_to_torch(vllm_config.model_config.dtype)
+    num_q_heads = vllm_config.model_config.get_num_attention_heads(
+        vllm_config.parallel_config
+    )
+    head_size = vllm_config.model_config.get_head_size()
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    v_head_dim = 128
+
+    common_attn_metadata = create_common_attn_metadata(batch_spec, block_size, device)
+
+    q_list, kv_c_list, k_pe_list = [], [], []
+    kv_c_contexts, k_pe_contexts = [], []
+    for s_len, q_len in zip(batch_spec.seq_lens, batch_spec.query_lens):
+        context_len = s_len - q_len
+        q_i = torch.randn(
+            q_len,
+            num_q_heads,
+            qk_nope_head_dim + qk_rope_head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        kv_c_full = torch.randn(s_len, kv_lora_rank, dtype=dtype, device=device)
+        k_pe_full = torch.randn(s_len, 1, qk_rope_head_dim, dtype=dtype, device=device)
+        q_list.append(q_i)
+        kv_c_list.append(kv_c_full[context_len:])
+        k_pe_list.append(k_pe_full[context_len:])
+        kv_c_contexts.append(kv_c_full[:context_len])
+        k_pe_contexts.append(k_pe_full[:context_len])
+
+    query = torch.cat(q_list, dim=0)
+    kv_c = torch.cat(kv_c_list, dim=0)
+    k_pe = torch.cat(k_pe_list, dim=0)
+
+    kv_cache = create_and_prepopulate_kv_cache(
+        kv_c_contexts=kv_c_contexts,
+        k_pe_contexts=k_pe_contexts,
+        block_size=block_size,
+        head_size=head_size,
+        dtype=torch.uint8,
+        device=device,
+        num_blocks=required_blocks + 1 + 32,
+        common_attn_metadata=common_attn_metadata,
+        randomize_blocks=True,
+        kv_cache_dtype="nvfp4",
+    )
+
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+
+    kv_b_proj = ColumnParallelLinear(
+        input_size=kv_lora_rank,
+        output_size=num_q_heads * (qk_nope_head_dim + v_head_dim),
+        bias=False,
+    ).to(device=device, dtype=dtype)
+
+    kv_cache_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=vllm_config.model_config.get_num_kv_heads(
+            vllm_config.parallel_config
+        ),
+        head_size=head_size,
+        dtype=torch.uint8,
+        sliding_window=vllm_config.model_config.get_sliding_window(),
+        cache_dtype_str="nvfp4",
+    )
+
+    dequant_calls = {"count": 0}
+    from vllm.v1.attention.backends.mla import flashinfer_mla as flashinfer_mla_mod
+
+    orig_dequant = flashinfer_mla_mod.ops.dequantize_mla_kv_cache_nvfp4
+
+    def _wrapped_dequant(*args, **kwargs):
+        dequant_calls["count"] += 1
+        return orig_dequant(*args, **kwargs)
+
+    monkeypatch.setattr(
+        flashinfer_mla_mod.ops, "dequantize_mla_kv_cache_nvfp4", _wrapped_dequant
+    )
+
+    out = run_attention_backend(
+        AttentionBackendEnum.FLASHINFER_MLA,
+        kv_cache_spec,
+        ["placeholder"],
+        vllm_config,
+        device,
+        common_attn_metadata,
+        query,
+        kv_c,
+        k_pe,
+        kv_cache,
+        kv_lora_rank,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        v_head_dim,
+        kv_b_proj,
+        kv_cache_dtype="nvfp4",
+    )
+
+    assert out.shape[0] == query.shape[0]
+    assert torch.isfinite(out).all(), (
+        "FLASHINFER_MLA NVFP4 path produced non-finite values"
+    )
+    assert dequant_calls["count"] > 0, "Expected NVFP4 MLA dequant op to be invoked"
