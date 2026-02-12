@@ -1867,7 +1867,10 @@ void indexer_k_quant_and_cache(
     dim3 grid(num_tokens, (head_dim + quant_block_size * vec_size - 1) /
                               (quant_block_size * vec_size));
     dim3 block(32, vec_size);
-    DISPATCH_BY_KV_CACHE_DTYPE(k.dtype(), scale_fmt,
+    // `scale_fmt` controls scale encoding (e.g. ue8m0), not KV cache dtype.
+    // This kernel path always writes FP8-E4M3 KV data with optional ue8m0
+    // scale.
+    DISPATCH_BY_KV_CACHE_DTYPE(k.dtype(), "fp8_e4m3",
                                CALL_INDEXER_K_QUANT_AND_CACHE);
   }
 }
