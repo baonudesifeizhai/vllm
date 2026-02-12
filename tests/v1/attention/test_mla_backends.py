@@ -1115,6 +1115,23 @@ def test_flashinfer_mla_nvfp4_decode_uses_dequant_op(
     v_head_dim = 128
 
     common_attn_metadata = create_common_attn_metadata(batch_spec, block_size, device)
+    # FlashInfer MLA requires:
+    # block_num % (128 / block_size) == 0
+    required_divisor = int(128 / block_size)
+    current_block_num = common_attn_metadata.block_table_tensor.shape[1]
+    if current_block_num % required_divisor != 0:
+        padded_block_num = (
+            (current_block_num + required_divisor - 1) // required_divisor
+        ) * required_divisor
+        padding_cols = padded_block_num - current_block_num
+        padding = torch.zeros(
+            (common_attn_metadata.block_table_tensor.shape[0], padding_cols),
+            dtype=torch.int32,
+            device=device,
+        )
+        common_attn_metadata.block_table_tensor = torch.cat(
+            [common_attn_metadata.block_table_tensor, padding], dim=1
+        )
 
     q_list, kv_c_list, k_pe_list = [], [], []
     kv_c_contexts, k_pe_contexts = [], []
