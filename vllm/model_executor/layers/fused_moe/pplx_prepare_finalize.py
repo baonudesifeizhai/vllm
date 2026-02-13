@@ -177,6 +177,30 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             f"{0 if a1q_scale is None else (a1q_scale.ndim, a1q_scale.shape)}"
         )
 
+        if mk.moe_trace_enabled():
+            kernel_id = id(self)
+            trace_context = lambda: " | ".join(
+                [
+                    f"quant_dtype={quant_config.quant_dtype}",
+                    f"per_act_token={quant_config.per_act_token_quant}",
+                    f"block_shape={quant_config.block_shape}",
+                    f"repeat_rows={repeat_rows}",
+                    f"repeat_cols={repeat_cols}",
+                    mk.moe_trace_tensor_desc("a1", a1),
+                    mk.moe_trace_tensor_desc("topk_ids", topk_ids),
+                    mk.moe_trace_tensor_desc("topk_weights", topk_weights),
+                ]
+            )
+            mk.log_moe_trace_tensor(
+                "a1q_pre_dispatch", kernel_id, a1q, context=trace_context
+            )
+            mk.log_moe_trace_tensor(
+                "a1q_scale_pre_dispatch",
+                kernel_id,
+                a1q_scale,
+                context=trace_context,
+            )
+
         expert_num_tokens = torch.empty(
             self.num_local_experts,
             dtype=torch.int32,
@@ -267,6 +291,36 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         if expert_x_scale is not None:
             expert_x_scale = expert_x_scale[:, :, :orig_a_scale_block_shape]
             assert expert_x_scale.ndim == 3
+
+        if mk.moe_trace_enabled():
+            kernel_id = id(self)
+            trace_context = lambda: " | ".join(
+                [
+                    mk.moe_trace_expert_tokens_desc(expert_num_tokens),
+                    mk.moe_trace_tensor_desc("expert_x", expert_x),
+                    mk.moe_trace_tensor_desc("expert_x_scale", expert_x_scale),
+                ]
+            )
+            mk.log_moe_trace_tensor(
+                "expert_num_tokens",
+                kernel_id,
+                expert_num_tokens,
+                context=trace_context,
+            )
+            mk.log_moe_trace_batched_tensor(
+                "expert_x_recv",
+                kernel_id,
+                expert_x,
+                expert_num_tokens,
+                context=trace_context,
+            )
+            mk.log_moe_trace_batched_tensor(
+                "expert_x_scale_recv",
+                kernel_id,
+                expert_x_scale,
+                expert_num_tokens,
+                context=trace_context,
+            )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
             expert_num_tokens=expert_num_tokens, expert_num_tokens_cpu=None

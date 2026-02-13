@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -39,6 +40,192 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+_VLLM_MOE_TRACE_NUMERICS = os.environ.get("VLLM_MOE_TRACE_NUMERICS", "0") == "1"
+_MOE_TRACE_REPORTED_STAGES: set[str] = set()
+
+
+def moe_trace_enabled() -> bool:
+    return _VLLM_MOE_TRACE_NUMERICS
+
+
+def _tensor_stats_str(x: torch.Tensor) -> str:
+    if x.numel() == 0:
+        return f"shape={tuple(x.shape)} dtype={x.dtype} numel=0"
+
+    x_f = x.detach().to(torch.float32)
+    finite_mask = torch.isfinite(x_f)
+    finite_count = int(finite_mask.sum().item())
+    nan_count = int(torch.isnan(x_f).sum().item())
+    inf_count = int(torch.isinf(x_f).sum().item())
+
+    if finite_count > 0:
+        finite_vals = x_f[finite_mask]
+        min_val = finite_vals.min().item()
+        max_val = finite_vals.max().item()
+        mean_val = finite_vals.mean().item()
+    else:
+        min_val = float("nan")
+        max_val = float("nan")
+        mean_val = float("nan")
+
+    return (
+        f"shape={tuple(x.shape)} dtype={x.dtype} "
+        f"min={min_val:.6g} max={max_val:.6g} mean={mean_val:.6g} "
+        f"finite={finite_count}/{x.numel()} nan={nan_count} inf={inf_count}"
+    )
+
+
+def _tensor_has_non_finite(x: torch.Tensor) -> bool:
+    x_f = x.detach().to(torch.float32)
+    return bool((~torch.isfinite(x_f)).any().item())
+
+
+def _batched_expert_tensor_stats(
+    x: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+) -> tuple[str, bool]:
+    if x.ndim != 3:
+        return _tensor_stats_str(x), _tensor_has_non_finite(x)
+
+    # Only inspect rows that correspond to routed tokens; padded slots can be
+    # uninitialized and pollute diagnostics.
+    tokens = expert_num_tokens.detach().cpu().tolist()
+    per_expert_capacity = x.size(1)
+    used_tokens = 0
+
+    finite_count = 0
+    nan_count = 0
+    inf_count = 0
+    min_val = float("inf")
+    max_val = float("-inf")
+    sum_val = 0.0
+
+    num_experts = min(len(tokens), x.size(0))
+    for expert_idx in range(num_experts):
+        n = max(0, min(int(tokens[expert_idx]), per_expert_capacity))
+        if n == 0:
+            continue
+        used_tokens += n
+
+        part = x[expert_idx, :n].detach().to(torch.float32)
+        finite_mask = torch.isfinite(part)
+        part_finite_count = int(finite_mask.sum().item())
+        finite_count += part_finite_count
+        nan_count += int(torch.isnan(part).sum().item())
+        inf_count += int(torch.isinf(part).sum().item())
+
+        if part_finite_count > 0:
+            finite_vals = part[finite_mask]
+            min_val = min(min_val, finite_vals.min().item())
+            max_val = max(max_val, finite_vals.max().item())
+            sum_val += finite_vals.sum().item()
+
+    if finite_count == 0:
+        min_val = float("nan")
+        max_val = float("nan")
+        mean_val = float("nan")
+    else:
+        mean_val = sum_val / finite_count
+
+    padded_tokens = x.size(0) * x.size(1) - used_tokens
+    stats = (
+        f"shape={tuple(x.shape)} dtype={x.dtype} "
+        f"used_tokens={used_tokens} padded_tokens={padded_tokens} "
+        f"min={min_val:.6g} max={max_val:.6g} mean={mean_val:.6g} "
+        f"finite={finite_count} nan={nan_count} inf={inf_count}"
+    )
+    return stats, (nan_count > 0 or inf_count > 0)
+
+
+def moe_trace_tensor_desc(name: str, x: torch.Tensor | None) -> str:
+    if x is None:
+        return f"{name}=None"
+    return f"{name}={_tensor_stats_str(x)}"
+
+
+def moe_trace_expert_tokens_desc(expert_num_tokens: torch.Tensor | None) -> str:
+    if expert_num_tokens is None:
+        return "expert_num_tokens=None"
+    vals = expert_num_tokens.detach().cpu().tolist()
+    return (
+        "expert_num_tokens="
+        f"shape={tuple(expert_num_tokens.shape)} "
+        f"sum={sum(int(v) for v in vals)} values={vals}"
+    )
+
+
+def log_moe_trace_tensor(
+    stage: str,
+    kernel_id: int,
+    x: torch.Tensor | None,
+    context: str | Callable[[], str] | None = None,
+) -> None:
+    if not _VLLM_MOE_TRACE_NUMERICS:
+        return
+    if x is None:
+        return
+    if not _tensor_has_non_finite(x):
+        return
+    if stage in _MOE_TRACE_REPORTED_STAGES:
+        return
+    _MOE_TRACE_REPORTED_STAGES.add(stage)
+    stats = _tensor_stats_str(x)
+    if context is None:
+        logger.warning(
+            "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s",
+            stage,
+            kernel_id,
+            stats,
+        )
+    else:
+        context_s = context() if callable(context) else context
+        logger.warning(
+            "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s context={%s}",
+            stage,
+            kernel_id,
+            stats,
+            context_s,
+        )
+
+
+def log_moe_trace_batched_tensor(
+    stage: str,
+    kernel_id: int,
+    x: torch.Tensor | None,
+    expert_num_tokens: torch.Tensor | None,
+    context: str | Callable[[], str] | None = None,
+) -> None:
+    if not _VLLM_MOE_TRACE_NUMERICS:
+        return
+    if x is None:
+        return
+    if expert_num_tokens is None:
+        log_moe_trace_tensor(stage, kernel_id, x, context=context)
+        return
+    stats, has_non_finite = _batched_expert_tensor_stats(x, expert_num_tokens)
+    if not has_non_finite:
+        return
+    if stage in _MOE_TRACE_REPORTED_STAGES:
+        return
+    _MOE_TRACE_REPORTED_STAGES.add(stage)
+    if context is None:
+        logger.warning(
+            "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s",
+            stage,
+            kernel_id,
+            stats,
+        )
+    else:
+        context_s = context() if callable(context) else context
+        logger.warning(
+            "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s context={%s}",
+            stage,
+            kernel_id,
+            stats,
+            context_s,
+        )
+
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -1366,6 +1553,34 @@ class FusedMoEModularKernel(torch.nn.Module):
             apply_router_weight_on_input,
         )
 
+        if _VLLM_MOE_TRACE_NUMERICS:
+            kernel_id = id(self)
+            expert_num_tokens = None
+            if expert_tokens_meta is not None:
+                expert_num_tokens = expert_tokens_meta.expert_num_tokens
+            trace_context = lambda: " | ".join(
+                [
+                    moe_trace_tensor_desc("hidden_states", hidden_states),
+                    moe_trace_tensor_desc("topk_ids", topk_ids),
+                    moe_trace_tensor_desc("topk_weights", topk_weights),
+                    moe_trace_expert_tokens_desc(expert_num_tokens),
+                ]
+            )
+            log_moe_trace_batched_tensor(
+                stage="a1q_recv",
+                kernel_id=kernel_id,
+                x=a1q,
+                expert_num_tokens=expert_num_tokens,
+                context=trace_context,
+            )
+            log_moe_trace_batched_tensor(
+                stage="a1q_scale_recv",
+                kernel_id=kernel_id,
+                x=a1q_scale,
+                expert_num_tokens=expert_num_tokens,
+                context=trace_context,
+            )
+
         fused_out = self._fused_experts(
             in_dtype=hidden_states.dtype,
             a1q=a1q,
@@ -1381,6 +1596,29 @@ class FusedMoEModularKernel(torch.nn.Module):
             apply_router_weight_on_input=apply_router_weight_on_input,
             expert_tokens_meta=expert_tokens_meta,
         )
+
+        if _VLLM_MOE_TRACE_NUMERICS:
+            kernel_id = id(self)
+            expert_num_tokens = None
+            if expert_tokens_meta is not None:
+                expert_num_tokens = expert_tokens_meta.expert_num_tokens
+            trace_context = lambda: " | ".join(
+                [
+                    moe_trace_tensor_desc("hidden_states", hidden_states),
+                    moe_trace_tensor_desc("a1q_recv", a1q),
+                    moe_trace_tensor_desc("a1q_scale_recv", a1q_scale),
+                    moe_trace_tensor_desc("topk_ids", topk_ids),
+                    moe_trace_tensor_desc("topk_weights", topk_weights),
+                    moe_trace_expert_tokens_desc(expert_num_tokens),
+                ]
+            )
+            log_moe_trace_batched_tensor(
+                stage="fused_out",
+                kernel_id=kernel_id,
+                x=fused_out,
+                expert_num_tokens=expert_num_tokens,
+                context=trace_context,
+            )
 
         return self._finalize(
             output,
