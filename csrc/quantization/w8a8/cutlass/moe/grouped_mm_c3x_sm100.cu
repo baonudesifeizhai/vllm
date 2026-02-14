@@ -20,30 +20,31 @@ bool pplx_debug_enabled() {
   return env != nullptr && std::atoi(env) != 0;
 }
 
+bool sm100_disable_n8192() {
+  auto* env = std::getenv("VLLM_CUTLASS_MOE_SM100_DISABLE_N8192");
+  return env != nullptr && std::atoi(env) != 0;
+}
+
 void maybe_log_sm100_grouped_moe_config(
     const char* branch_name, bool swap_ab, torch::Tensor const& out_tensors,
     torch::Tensor const& a_tensors, torch::Tensor const& b_tensors,
     torch::Tensor const& a_scales, torch::Tensor const& b_scales,
     torch::Tensor const& expert_offsets, torch::Tensor const& problem_sizes,
-    bool per_act_token, bool per_out_ch) {
+    bool per_act_token, bool per_out_ch, bool disable_n8192) {
   if (!pplx_debug_enabled()) {
     return;
   }
 
-  static bool logged_m64 = false;
-  static bool logged_n8192 = false;
-  static bool logged_default = false;
+  static bool logged_m64_nonzero = false;
+  static bool logged_n8192_nonzero = false;
+  static bool logged_default_nonzero = false;
 
-  bool* logged = &logged_default;
+  bool* logged = &logged_default_nonzero;
   if (std::strcmp(branch_name, "M64") == 0) {
-    logged = &logged_m64;
+    logged = &logged_m64_nonzero;
   } else if (std::strcmp(branch_name, "N8192") == 0) {
-    logged = &logged_n8192;
+    logged = &logged_n8192_nonzero;
   }
-  if (*logged) {
-    return;
-  }
-  *logged = true;
 
   int64_t const num_experts = expert_offsets.size(0);
   bool const inferred_per_act_token = a_scales.numel() != 1;
@@ -56,26 +57,38 @@ void maybe_log_sm100_grouped_moe_config(
   int32_t m_min = std::numeric_limits<int32_t>::max();
   int32_t m_max = 0;
   int32_t m_zero_count = 0;
+  int32_t m_positive_count = 0;
+  int64_t m_sum = 0;
   for (int64_t e = 0; e < num_experts; ++e) {
     int32_t m = ps[e * 3 + m_idx];
     m_min = std::min(m_min, m);
     m_max = std::max(m_max, m);
+    m_sum += m;
     if (m == 0) {
       ++m_zero_count;
+    } else {
+      ++m_positive_count;
     }
   }
+
+  if (m_positive_count == 0 || *logged) {
+    return;
+  }
+  *logged = true;
 
   TORCH_WARN(
       "PPLX_SM100_MOE_MM_CONFIG branch=", branch_name, " swap_ab=", swap_ab,
       " out=(", out_tensors.size(0), ",", out_tensors.size(1), ")", " a=(",
       a_tensors.size(0), ",", a_tensors.size(1), ")", " b=(", b_tensors.size(0),
       ",", b_tensors.size(1), ",", b_tensors.size(2), ")",
-      " per_act_token=", per_act_token, " per_out_ch=", per_out_ch,
+      " disable_n8192=", disable_n8192, " per_act_token=", per_act_token,
+      " per_out_ch=", per_out_ch,
       " inferred_per_act_token=", inferred_per_act_token,
       " inferred_per_out_ch=", inferred_per_out_ch,
       " a_scales_numel=", a_scales.numel(),
       " b_scales_numel=", b_scales.numel(), " experts=", num_experts,
-      " m_min=", m_min, " m_max=", m_max, " m_zero_count=", m_zero_count);
+      " m_min=", m_min, " m_max=", m_max, " m_sum=", m_sum,
+      " m_positive_count=", m_positive_count, " m_zero_count=", m_zero_count);
 }
 
 template <typename InType, typename OutType,
@@ -155,19 +168,22 @@ void run_cutlass_moe_mm_sm100(
 
   uint32_t const m = a_tensors.size(0);
   uint32_t const n = out_tensors.size(1);
+  bool const disable_n8192 = sm100_disable_n8192();
 
   if (m <= 64) {
     maybe_log_sm100_grouped_moe_config(
         "M64", true, out_tensors, a_tensors, b_tensors, a_scales, b_scales,
-        expert_offsets, problem_sizes, per_act_token, per_out_ch);
+        expert_offsets, problem_sizes, per_act_token, per_out_ch,
+        disable_n8192);
     cutlass_group_gemm_caller<Cutlass3xGemmM64>(
         out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, c_strides, per_act_token,
         per_out_ch);
-  } else if (n >= 8192) {
+  } else if (n >= 8192 && !disable_n8192) {
     maybe_log_sm100_grouped_moe_config(
         "N8192", false, out_tensors, a_tensors, b_tensors, a_scales, b_scales,
-        expert_offsets, problem_sizes, per_act_token, per_out_ch);
+        expert_offsets, problem_sizes, per_act_token, per_out_ch,
+        disable_n8192);
     cutlass_group_gemm_caller<Cutlass3xGemmN8192>(
         out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, c_strides, per_act_token,
@@ -175,7 +191,8 @@ void run_cutlass_moe_mm_sm100(
   } else {
     maybe_log_sm100_grouped_moe_config(
         "DEFAULT", false, out_tensors, a_tensors, b_tensors, a_scales, b_scales,
-        expert_offsets, problem_sizes, per_act_token, per_out_ch);
+        expert_offsets, problem_sizes, per_act_token, per_out_ch,
+        disable_n8192);
     cutlass_group_gemm_caller<Cutlass3xGemmDefault>(
         out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, c_strides, per_act_token,
