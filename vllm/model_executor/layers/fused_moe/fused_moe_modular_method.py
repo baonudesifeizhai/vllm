@@ -55,6 +55,8 @@ class FusedMoEModularMethod(FusedMoEMethodBase, CustomOp):
                 shared_experts,
                 moe_parallel_config=moe_layer.moe_parallel_config,
                 inplace=inplace,
+                layer_name=getattr(moe_layer, "layer_name", None),
+                layer_id=getattr(moe_layer, "layer_id", None),
             ),
         )
 

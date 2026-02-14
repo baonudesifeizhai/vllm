@@ -39,6 +39,7 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+_PPLX_FIRST_EXPLOSION_LOGGED = False
 
 
 def _pplx_debug_enabled() -> bool:
@@ -50,6 +51,12 @@ def _tensor_is_all_zero(tensor: torch.Tensor) -> bool:
     if tensor.numel() == 0:
         return True
     return bool(tensor.eq(0).all().item())
+
+
+def _tensor_abs_max(tensor: torch.Tensor | None) -> float:
+    if tensor is None or tensor.numel() == 0:
+        return 0.0
+    return float(tensor.float().abs().max().item())
 
 
 def _tensor_debug_stats(tensor: torch.Tensor | None) -> str:
@@ -867,12 +874,16 @@ class FusedMoEModularKernel(torch.nn.Module):
         shared_experts: torch.nn.Module | None = None,
         moe_parallel_config: FusedMoEParallelConfig | None = None,
         inplace: bool = False,
+        layer_name: str | None = None,
+        layer_id: int | None = None,
     ):
         super().__init__()
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
         self.shared_experts = shared_experts
         self.inplace = inplace
+        self.layer_name = layer_name
+        self.layer_id = layer_id
 
         # prefer an explicit FusedMoEParallelConfig when available (from
         # FusedMoE layers / tests).
@@ -1386,11 +1397,14 @@ class FusedMoEModularKernel(torch.nn.Module):
             output_stats = _tensor_debug_stats(output)
 
         logger.info(
-            "PPLX_DEBUG kernel_id=%s prepare_finalize=%s fused_experts=%s "
+            "PPLX_DEBUG layer_id=%s layer_name=%s kernel_id=%s "
+            "prepare_finalize=%s fused_experts=%s "
             "apply_router_weight_on_input=%s global_experts=%d "
             "local_experts=%d topk=%d hidden_states=%s a1q=%s a1q_scale=%s "
             "a1q_valid=%s a1q_scale_valid=%s topk_ids=%s topk_weights=%s "
             "expert_num_tokens=%s fused_out=%s output=%s",
+            self.layer_id,
+            self.layer_name,
             id(self),
             self.prepare_finalize.__class__.__name__,
             self.fused_experts.__class__.__name__,
@@ -1408,6 +1422,54 @@ class FusedMoEModularKernel(torch.nn.Module):
             _tensor_debug_stats(expert_num_tokens),
             _tensor_debug_stats(fused_out),
             output_stats,
+        )
+
+    def _maybe_log_first_explosion(
+        self,
+        hidden_states: torch.Tensor,
+        fused_out: torch.Tensor,
+        output: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        expert_tokens_meta: ExpertTokensMetadata | None,
+    ) -> None:
+        global _PPLX_FIRST_EXPLOSION_LOGGED
+        if _PPLX_FIRST_EXPLOSION_LOGGED:
+            return
+
+        expert_num_tokens = (
+            None if expert_tokens_meta is None else expert_tokens_meta.expert_num_tokens
+        )
+        hidden_abs_max = _tensor_abs_max(hidden_states)
+        fused_abs_max = _tensor_abs_max(fused_out)
+        if isinstance(output, tuple):
+            output_shared_abs_max = _tensor_abs_max(output[0])
+            output_fused_abs_max = _tensor_abs_max(output[1])
+        else:
+            output_shared_abs_max = _tensor_abs_max(output)
+            output_fused_abs_max = 0.0
+
+        # Heuristic: values above O(1e2) are where this run starts to diverge.
+        explode_threshold = 100.0
+        if (
+            fused_abs_max < explode_threshold
+            and output_shared_abs_max < explode_threshold
+            and output_fused_abs_max < explode_threshold
+        ):
+            return
+
+        _PPLX_FIRST_EXPLOSION_LOGGED = True
+        logger.warning(
+            "PPLX_EXPLOSION_FIRST layer_id=%s layer_name=%s kernel_id=%s "
+            "hidden_abs_max=%.6g fused_out_abs_max=%.6g "
+            "output_shared_abs_max=%.6g output_fused_abs_max=%.6g "
+            "expert_num_tokens=%s",
+            self.layer_id,
+            self.layer_name,
+            id(self),
+            hidden_abs_max,
+            fused_abs_max,
+            output_shared_abs_max,
+            output_fused_abs_max,
+            _tensor_debug_stats(expert_num_tokens),
         )
 
     def forward(
@@ -1498,6 +1560,14 @@ class FusedMoEModularKernel(torch.nn.Module):
             apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
         )
+
+        if moe_debug:
+            self._maybe_log_first_explosion(
+                hidden_states,
+                fused_out,
+                final_output,
+                expert_tokens_meta,
+            )
 
         if moe_debug and not getattr(self, "_pplx_debug_logged", False):
             log_this = True

@@ -7,7 +7,6 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
@@ -24,13 +23,6 @@ logger = init_logger(__name__)
 
 def _pplx_debug_enabled() -> bool:
     return envs.VLLM_PPLX_DEBUG
-
-
-def _is_dummy_forward() -> bool:
-    if not is_forward_context_available():
-        return False
-    ctx = get_forward_context()
-    return bool(ctx.additional_kwargs.get("is_dummy_run"))
 
 
 def _has_non_finite(tensor: torch.Tensor | None) -> bool:
@@ -51,30 +43,6 @@ def _tensor_stats(tensor: torch.Tensor | None) -> str:
         f"max={stats.max().item():.4g} mean={stats.mean().item():.4g} "
         f"sum={stats.sum().item():.4g}"
     )
-
-
-def _tensor_layout(tensor: torch.Tensor | None) -> str:
-    if tensor is None:
-        return "none"
-    return f"shape={tuple(tensor.shape)} stride={tensor.stride()} dtype={tensor.dtype}"
-
-
-def _valid_expert_stats(
-    expert_x: torch.Tensor, expert_num_tokens: torch.Tensor
-) -> tuple[str, int]:
-    total_valid = (
-        int(expert_num_tokens.sum().item()) if expert_num_tokens.numel() else 0
-    )
-    if total_valid == 0:
-        return "empty", 0
-    valid_slices = []
-    for expert_idx, count in enumerate(expert_num_tokens.tolist()):
-        if count:
-            valid_slices.append(expert_x[expert_idx, :count, :])
-    if not valid_slices:
-        return "empty", 0
-    valid = torch.cat(valid_slices, dim=0)
-    return _tensor_stats(valid), total_valid
 
 
 def pplx_hidden_dim_scale_bytes(
@@ -271,30 +239,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 _tensor_stats(a1q),
             )
 
-        if (
-            _pplx_debug_enabled()
-            and not _is_dummy_forward()
-            and not getattr(self, "_debug_prepare_logged", False)
-        ):
-            self._debug_prepare_logged = True
-            logger.info(
-                "PPLX_DEBUG_PREPARE tokens=%d hidden_dim=%d num_experts=%d "
-                "num_local_experts=%d num_dispatchers=%d "
-                "apply_router_weight_on_input=%s a1=%s a1q=%s a1q_scale=%s "
-                "topk_ids=%s topk_weights=%s",
-                num_tokens,
-                hidden_dim,
-                num_experts,
-                self.num_local_experts,
-                self.num_dispatchers(),
-                apply_router_weight_on_input,
-                _tensor_stats(a1),
-                _tensor_stats(a1q),
-                _tensor_stats(a1q_scale),
-                _tensor_stats(topk_ids),
-                _tensor_stats(topk_weights),
-            )
-
         orig_a_scale_block_shape: int | None = None
 
         if a1q_scale is not None:
@@ -382,19 +326,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             # Initialize scales to avoid undefined padding values.
             expert_x_scale.zero_()
 
-        if (
-            _pplx_debug_enabled()
-            and not _is_dummy_forward()
-            and not getattr(self, "_debug_layout_logged", False)
-        ):
-            self._debug_layout_logged = True
-            logger.info(
-                "PPLX_DEBUG_LAYOUT a1q_scale=%s expert_x_scale=%s repeat_cols=%d",
-                _tensor_layout(a1q_scale),
-                _tensor_layout(expert_x_scale),
-                repeat_cols,
-            )
-
         # This argument is optional, defaults to indices.size(0)
         # There's not much point setting this unless it is != indices.size(0)
         bound_m: torch.Tensor | None = None
@@ -458,35 +389,6 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             assert expert_num_tokens_max <= max_tokens, (
                 "PPLX saw expert_num_tokens out of range. "
                 f"max={expert_num_tokens_max} limit={max_tokens}."
-            )
-
-        if (
-            _pplx_debug_enabled()
-            and not _is_dummy_forward()
-            and not getattr(self, "_debug_receiver_logged", False)
-        ):
-            self._debug_receiver_logged = True
-            valid_x_stats, total_valid = _valid_expert_stats(
-                expert_x, expert_num_tokens
-            )
-            if expert_x_scale is not None and expert_num_tokens.numel():
-                valid_scale_stats, _ = _valid_expert_stats(
-                    expert_x_scale, expert_num_tokens
-                )
-            else:
-                valid_scale_stats = "none"
-            full_scale_stats = (
-                _tensor_stats(expert_x_scale) if expert_x_scale is not None else "none"
-            )
-            logger.info(
-                "PPLX_DEBUG_RECEIVER total_valid=%d expert_num_tokens=%s "
-                "expert_x_valid=%s expert_x_scale_valid=%s "
-                "expert_x_scale_full=%s",
-                total_valid,
-                _tensor_stats(expert_num_tokens),
-                valid_x_stats,
-                valid_scale_stats,
-                full_scale_stats,
             )
 
         expert_tokens_meta = mk.ExpertTokensMetadata(
