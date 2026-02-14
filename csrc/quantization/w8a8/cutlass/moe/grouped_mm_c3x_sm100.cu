@@ -80,8 +80,6 @@ void run_cutlass_moe_mm_sm100(
 
   using Cutlass3xGemmDefault = typename sm100_fp8_config_default<
       InType, OutType, vllm::c3x::ScaledEpilogueArray>::Cutlass3xGemm;
-  using Cutlass3xGemmN8192 = typename sm100_fp8_config_N8192<
-      InType, OutType, vllm::c3x::ScaledEpilogueArray>::Cutlass3xGemm;
   using Cutlass3xGemmM64 = typename sm100_fp8_config_M64<
       InType, OutType, vllm::c3x::ScaledEpilogueArray>::Cutlass3xGemm;
 
@@ -93,12 +91,11 @@ void run_cutlass_moe_mm_sm100(
         out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, c_strides, per_act_token,
         per_out_ch);
-  } else if (n >= 8192) {
-    cutlass_group_gemm_caller<Cutlass3xGemmN8192>(
-        out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
-        problem_sizes, a_strides, b_strides, c_strides, per_act_token,
-        per_out_ch);
   } else {
+    // NOTE: Temporarily avoid the N8192 specialized path for MoE grouped GEMM.
+    // In PPLX + batched CUTLASS runs, mm1 (N=16384) shows non-finite / extreme
+    // outputs while the default path is expected to be numerically stable.
+    // Keep this fallback local until the N8192 specialization is root-caused.
     cutlass_group_gemm_caller<Cutlass3xGemmDefault>(
         out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
         problem_sizes, a_strides, b_strides, c_strides, per_act_token,
