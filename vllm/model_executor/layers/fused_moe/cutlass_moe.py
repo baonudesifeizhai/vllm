@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -48,6 +50,7 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = False
+_PPLX_ZERO_GROUP_FILTER_LOGGED = False
 
 
 def _pplx_debug_enabled() -> bool:
@@ -121,6 +124,11 @@ def _maybe_log_cutlass_first_context(
         _tensor_debug_stats(mm1_out),
         _tensor_debug_stats(mm2_out),
     )
+
+
+def _filter_zero_groups_enabled() -> bool:
+    # Debug-only switch for isolating grouped GEMM behavior with zero-token experts.
+    return os.getenv("VLLM_CUTLASS_MOE_FILTER_ZERO_GROUPS", "0") == "1"
 
 
 def run_cutlass_moe_fp8(
@@ -301,20 +309,67 @@ def run_cutlass_moe_fp8(
         # Clear workspace to avoid propagating garbage from padded/unused rows.
         mm1_out.zero_()
 
-    ops.cutlass_moe_mm(
-        mm1_out,
-        a1q,
-        w1,
-        a1q_scale,
-        w1_scale,
-        expert_offsets,
-        problem_sizes1,
-        ab_strides1,
-        ab_strides1,
-        c_strides1,
-        per_act_token,
-        per_out_ch,
-    )
+    w1_mm = w1
+    w2_mm = w2
+    w1_scale_mm = w1_scale
+    w2_scale_mm = w2_scale
+    expert_offsets_mm = expert_offsets
+    problem_sizes1_mm = problem_sizes1
+    problem_sizes2_mm = problem_sizes2
+    ab_strides1_mm = ab_strides1
+    ab_strides2_mm = ab_strides2
+    c_strides1_mm = c_strides1
+    c_strides2_mm = c_strides2
+    skip_grouped_mm = False
+
+    if (
+        use_batched_format
+        and expert_num_tokens is not None
+        and _filter_zero_groups_enabled()
+    ):
+        active_experts = torch.nonzero(expert_num_tokens > 0, as_tuple=False).flatten()
+        if active_experts.numel() == 0:
+            skip_grouped_mm = True
+        elif active_experts.numel() < local_E:
+            w1_mm = w1.index_select(0, active_experts)
+            w2_mm = w2.index_select(0, active_experts)
+            w1_scale_mm = w1_scale.index_select(0, active_experts)
+            w2_scale_mm = w2_scale.index_select(0, active_experts)
+            expert_offsets_mm = expert_offsets.index_select(0, active_experts)
+            problem_sizes1_mm = problem_sizes1.index_select(0, active_experts)
+            problem_sizes2_mm = problem_sizes2.index_select(0, active_experts)
+            ab_strides1_mm = ab_strides1.index_select(0, active_experts)
+            ab_strides2_mm = ab_strides2.index_select(0, active_experts)
+            c_strides1_mm = c_strides1.index_select(0, active_experts)
+            c_strides2_mm = c_strides2.index_select(0, active_experts)
+
+        global _PPLX_ZERO_GROUP_FILTER_LOGGED
+        if _pplx_debug_enabled() and not _PPLX_ZERO_GROUP_FILTER_LOGGED:
+            _PPLX_ZERO_GROUP_FILTER_LOGGED = True
+            logger.warning(
+                "PPLX_ZERO_GROUP_FILTER enabled local_E=%d active_experts=%d "
+                "skip_grouped_mm=%s expert_num_tokens=%s",
+                local_E,
+                int(active_experts.numel()),
+                skip_grouped_mm,
+                _tensor_debug_stats(expert_num_tokens),
+            )
+
+    if not skip_grouped_mm:
+        ops.cutlass_moe_mm(
+            mm1_out,
+            a1q,
+            w1_mm,
+            a1q_scale,
+            w1_scale_mm,
+            expert_offsets_mm,
+            problem_sizes1_mm,
+            ab_strides1_mm,
+            ab_strides1_mm,
+            c_strides1_mm,
+            per_act_token,
+            per_out_ch,
+        )
 
     apply_moe_activation(activation, act_out, mm1_out)
 
@@ -328,20 +383,21 @@ def run_cutlass_moe_fp8(
         # Clear padded rows; CUTLASS writes only valid tokens per expert.
         mm2_out.zero_()
 
-    ops.cutlass_moe_mm(
-        mm2_out,
-        a2q,
-        w2,
-        a2q_scale,
-        w2_scale,
-        expert_offsets,
-        problem_sizes2,
-        ab_strides2,
-        ab_strides2,
-        c_strides2,
-        per_act_token,
-        per_out_ch,
-    )
+    if not skip_grouped_mm:
+        ops.cutlass_moe_mm(
+            mm2_out,
+            a2q,
+            w2_mm,
+            a2q_scale,
+            w2_scale_mm,
+            expert_offsets_mm,
+            problem_sizes2_mm,
+            ab_strides2_mm,
+            ab_strides2_mm,
+            c_strides2_mm,
+            per_act_token,
+            per_out_ch,
+        )
     if _pplx_debug_enabled():
         _maybe_log_cutlass_first_context(
             use_batched_format=use_batched_format,
@@ -349,11 +405,11 @@ def run_cutlass_moe_fp8(
             per_out_ch=per_out_ch,
             a1q=a1q,
             a1q_scale=a1q_scale,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
+            w1_scale=w1_scale_mm,
+            w2_scale=w2_scale_mm,
             expert_num_tokens=expert_num_tokens,
-            problem_sizes1=problem_sizes1,
-            problem_sizes2=problem_sizes2,
+            problem_sizes1=problem_sizes1_mm,
+            problem_sizes2=problem_sizes2_mm,
             mm1_out=mm1_out,
             mm2_out=mm2_out,
         )
