@@ -77,6 +77,39 @@ def _tensor_debug_stats(tensor: torch.Tensor | None) -> str:
     )
 
 
+def _batched_valid_row_mask(
+    total_rows: int, expert_num_tokens: torch.Tensor | None
+) -> torch.Tensor | None:
+    if expert_num_tokens is None:
+        return None
+    if expert_num_tokens.numel() == 0 or total_rows == 0:
+        return None
+    local_e = int(expert_num_tokens.numel())
+    if total_rows % local_e != 0:
+        return None
+    padded_m = total_rows // local_e
+    tokens = expert_num_tokens.to(dtype=torch.int64).clamp_(min=0, max=padded_m)
+    row_ids = torch.arange(
+        total_rows, device=expert_num_tokens.device, dtype=torch.int64
+    )
+    expert_ids = torch.div(row_ids, padded_m, rounding_mode="floor")
+    row_in_expert = row_ids.remainder(padded_m)
+    return row_in_expert < tokens.index_select(0, expert_ids)
+
+
+def _tensor_row_subset_debug_stats(
+    tensor: torch.Tensor, row_mask: torch.Tensor | None, *, invert: bool
+) -> str:
+    if row_mask is None:
+        return "none"
+    if row_mask.numel() != tensor.size(0):
+        return "none"
+    mask = (~row_mask) if invert else row_mask
+    if not mask.any().item():
+        return f"shape={(0, tensor.size(1))} dtype={tensor.dtype} empty"
+    return _tensor_debug_stats(tensor[mask])
+
+
 def _maybe_log_cutlass_first_context(
     *,
     use_batched_format: bool,
@@ -105,13 +138,27 @@ def _maybe_log_cutlass_first_context(
         return
 
     _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = True
+    valid_mask = None
+    mm1_valid = "none"
+    mm1_invalid = "none"
+    mm2_valid = "none"
+    mm2_invalid = "none"
+    if use_batched_format and expert_num_tokens is not None:
+        valid_mask = _batched_valid_row_mask(mm1_out.size(0), expert_num_tokens)
+        mm1_valid = _tensor_row_subset_debug_stats(mm1_out, valid_mask, invert=False)
+        mm1_invalid = _tensor_row_subset_debug_stats(mm1_out, valid_mask, invert=True)
+        mm2_valid = _tensor_row_subset_debug_stats(mm2_out, valid_mask, invert=False)
+        mm2_invalid = _tensor_row_subset_debug_stats(mm2_out, valid_mask, invert=True)
+
     logger.warning(
         "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
         "per_act_token=%s per_out_ch=%s "
         "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
         "expert_num_tokens=%s "
         "problem_sizes1=%s problem_sizes2=%s "
-        "mm1_out=%s mm2_out=%s",
+        "mm1_out=%s mm2_out=%s "
+        "mm1_valid_rows=%s mm1_invalid_rows=%s "
+        "mm2_valid_rows=%s mm2_invalid_rows=%s",
         use_batched_format,
         per_act_token,
         per_out_ch,
@@ -124,6 +171,10 @@ def _maybe_log_cutlass_first_context(
         _tensor_debug_stats(problem_sizes2),
         _tensor_debug_stats(mm1_out),
         _tensor_debug_stats(mm2_out),
+        mm1_valid,
+        mm1_invalid,
+        mm2_valid,
+        mm2_invalid,
     )
 
 

@@ -25,6 +25,24 @@ bool sm100_disable_n8192() {
   return env != nullptr && std::atoi(env) != 0;
 }
 
+bool sm100_use_trivial_epilogue() {
+  auto* env = std::getenv("VLLM_CUTLASS_MOE_SM100_TRIVIAL_EPILOGUE");
+  return env != nullptr && std::atoi(env) != 0;
+}
+
+void maybe_log_sm100_epilogue_mode(bool use_trivial_epilogue) {
+  if (!pplx_debug_enabled()) {
+    return;
+  }
+  static bool logged = false;
+  if (logged) {
+    return;
+  }
+  logged = true;
+  TORCH_WARN("PPLX_SM100_MOE_MM_EPILOGUE mode=",
+             use_trivial_epilogue ? "TRIVIAL" : "SCALED");
+}
+
 void maybe_log_sm100_grouped_moe_config(
     const char* branch_name, bool swap_ab, torch::Tensor const& out_tensors,
     torch::Tensor const& a_tensors, torch::Tensor const& b_tensors,
@@ -143,7 +161,7 @@ struct sm100_fp8_config_N8192 {
 };
 
 template <typename InType, typename OutType>
-void run_cutlass_moe_mm_sm100(
+void run_cutlass_moe_mm_sm100_scaled_epilogue(
     torch::Tensor& out_tensors, torch::Tensor const& a_tensors,
     torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
     torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
@@ -199,6 +217,65 @@ void run_cutlass_moe_mm_sm100(
         per_out_ch);
   }
 }
+
+template <typename InType, typename OutType>
+void run_cutlass_moe_mm_sm100_trivial_epilogue(
+    torch::Tensor& out_tensors, torch::Tensor const& a_tensors,
+    torch::Tensor const& b_tensors, torch::Tensor const& a_scales,
+    torch::Tensor const& b_scales, torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
+    torch::Tensor const& b_strides, torch::Tensor const& c_strides,
+    bool per_act_token, bool per_out_ch) {
+  TORCH_CHECK(a_tensors.size(0) > 0, "No input A tensors provided.");
+  TORCH_CHECK(b_tensors.size(0) > 0, "No input B tensors provided.");
+  TORCH_CHECK(out_tensors.size(0) > 0, "No output tensors provided.");
+
+  TORCH_CHECK(a_tensors.dtype() == torch::kFloat8_e4m3fn,
+              "A tensors must be of type float8_e4m3fn.");
+  TORCH_CHECK(b_tensors.dtype() == torch::kFloat8_e4m3fn,
+              "B tensors must be of type float8_e4m3fn.");
+
+  using Cutlass3xGemmDefault = typename sm100_fp8_config_default<
+      InType, OutType, vllm::c3x::TrivialEpilogue>::Cutlass3xGemm;
+  using Cutlass3xGemmN8192 = typename sm100_fp8_config_N8192<
+      InType, OutType, vllm::c3x::TrivialEpilogue>::Cutlass3xGemm;
+  using Cutlass3xGemmM64 =
+      typename sm100_fp8_config_M64<InType, OutType,
+                                    vllm::c3x::TrivialEpilogue>::Cutlass3xGemm;
+
+  uint32_t const m = a_tensors.size(0);
+  uint32_t const n = out_tensors.size(1);
+  bool const disable_n8192 = sm100_disable_n8192();
+
+  if (m <= 64) {
+    maybe_log_sm100_grouped_moe_config(
+        "M64", true, out_tensors, a_tensors, b_tensors, a_scales, b_scales,
+        expert_offsets, problem_sizes, per_act_token, per_out_ch,
+        disable_n8192);
+    cutlass_group_gemm_caller<Cutlass3xGemmM64>(
+        out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+        problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+        per_out_ch);
+  } else if (n >= 8192 && !disable_n8192) {
+    maybe_log_sm100_grouped_moe_config(
+        "N8192", false, out_tensors, a_tensors, b_tensors, a_scales, b_scales,
+        expert_offsets, problem_sizes, per_act_token, per_out_ch,
+        disable_n8192);
+    cutlass_group_gemm_caller<Cutlass3xGemmN8192>(
+        out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+        problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+        per_out_ch);
+  } else {
+    maybe_log_sm100_grouped_moe_config(
+        "DEFAULT", false, out_tensors, a_tensors, b_tensors, a_scales, b_scales,
+        expert_offsets, problem_sizes, per_act_token, per_out_ch,
+        disable_n8192);
+    cutlass_group_gemm_caller<Cutlass3xGemmDefault>(
+        out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+        problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+        per_out_ch);
+  }
+}
 }  // namespace
 
 void dispatch_moe_mm_sm100(
@@ -208,16 +285,36 @@ void dispatch_moe_mm_sm100(
     torch::Tensor const& problem_sizes, torch::Tensor const& a_strides,
     torch::Tensor const& b_strides, torch::Tensor const& c_strides,
     bool per_act_token, bool per_out_ch) {
+  bool const use_trivial_epilogue = sm100_use_trivial_epilogue();
+  maybe_log_sm100_epilogue_mode(use_trivial_epilogue);
   if (out_tensors.dtype() == torch::kBFloat16) {
-    run_cutlass_moe_mm_sm100<cutlass::float_e4m3_t, cutlass::bfloat16_t>(
-        out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
-        problem_sizes, a_strides, b_strides, c_strides, per_act_token,
-        per_out_ch);
+    if (use_trivial_epilogue) {
+      run_cutlass_moe_mm_sm100_trivial_epilogue<cutlass::float_e4m3_t,
+                                                cutlass::bfloat16_t>(
+          out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+          problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+          per_out_ch);
+    } else {
+      run_cutlass_moe_mm_sm100_scaled_epilogue<cutlass::float_e4m3_t,
+                                               cutlass::bfloat16_t>(
+          out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+          problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+          per_out_ch);
+    }
   } else {
-    run_cutlass_moe_mm_sm100<cutlass::float_e4m3_t, cutlass::half_t>(
-        out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
-        problem_sizes, a_strides, b_strides, c_strides, per_act_token,
-        per_out_ch);
+    if (use_trivial_epilogue) {
+      run_cutlass_moe_mm_sm100_trivial_epilogue<cutlass::float_e4m3_t,
+                                                cutlass::half_t>(
+          out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+          problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+          per_out_ch);
+    } else {
+      run_cutlass_moe_mm_sm100_scaled_epilogue<cutlass::float_e4m3_t,
+                                               cutlass::half_t>(
+          out_tensors, a_tensors, b_tensors, a_scales, b_scales, expert_offsets,
+          problem_sizes, a_strides, b_strides, c_strides, per_act_token,
+          per_out_ch);
+    }
   }
 }
 
