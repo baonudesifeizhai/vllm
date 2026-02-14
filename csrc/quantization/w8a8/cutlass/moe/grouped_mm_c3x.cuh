@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdlib>
+
 #include "cutlass/cutlass.h"
 
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -13,6 +15,12 @@
 using namespace cute;
 
 namespace {
+
+inline bool force_row_scale_reload_each_loop() {
+  auto* env =
+      std::getenv("VLLM_CUTLASS_MOE_FORCE_ROW_BROADCAST_RELOAD_EACH_LOOP");
+  return env != nullptr && std::atoi(env) != 0;
+}
 
 using ProblemShape =
     cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
@@ -140,6 +148,7 @@ void cutlass_group_gemm_caller(
 
   // Currently, we are only able to do broadcast on either all or none a_scales
   // and on either all or none b_scales
+  bool const force_row_reload = force_row_scale_reload_each_loop();
   typename GemmKernel::EpilogueArguments epilogue_args{
       Gemm::Epilogue::prepare_args(
           swap_ab ? static_cast<const ElementAccumulator**>(
@@ -151,7 +160,7 @@ void cutlass_group_gemm_caller(
                   : static_cast<const ElementAccumulator**>(
                         b_scales_ptrs.data_ptr()),
           swap_ab ? per_out_ch : per_act_token,
-          swap_ab ? per_act_token : per_out_ch),
+          swap_ab ? per_act_token : per_out_ch, force_row_reload),
       nullptr, static_cast<StrideC*>(c_strides.data_ptr()),
       static_cast<ElementD**>(out_ptrs.data_ptr()),
       static_cast<StrideC*>(c_strides.data_ptr())};

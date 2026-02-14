@@ -436,11 +436,12 @@ struct ScaledEpilogueArray
 
   static ArgumentType prepare_args(float const* const* a_scales_ptr,
                                    float const* const* b_scales_ptr,
-                                   bool a_col_broadcast, bool b_row_broadcast) {
+                                   bool a_col_broadcast, bool b_row_broadcast,
+                                   bool force_b_row_reload_every_loop = false) {
     auto a_args = SUPER::template args_from_tensor<ScaleAArray, float>(
         a_scales_ptr, a_col_broadcast);
-    auto b_args = SUPER::template args_from_tensor<ScaleBArray, float>(
-        b_scales_ptr, b_row_broadcast);
+    typename ScaleBArray::Arguments b_args{
+        b_scales_ptr, b_row_broadcast, {}, force_b_row_reload_every_loop};
 
     typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
     return ArgumentType{a_args, evt0_args, {}};

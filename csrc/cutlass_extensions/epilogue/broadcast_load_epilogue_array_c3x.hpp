@@ -86,6 +86,7 @@ struct Sm90RowOrScalarBroadcastArray {
     const Element* const* ptr_row_array = nullptr;
     bool row_broadcast = true;
     StrideMNL dRow = {};
+    bool force_reload_every_loop = false;
   };
 
   using Params = Arguments;
@@ -209,8 +210,11 @@ struct Sm90RowOrScalarBroadcastArray {
 
     CUTLASS_DEVICE void
     begin_loop(int epi_m, int epi_n) {
-      if (epi_m == 0) { // Assumes M-major subtile loop
-        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar 
+      // Default behavior assumes M-major subtile loop and only refreshes row
+      // scales at epi_m == 0. For debugging sm100 grouped epilogue behavior,
+      // allow refreshing every loop to avoid stale row-scale reuse.
+      if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
+      if (epi_m == 0 || params.force_reload_every_loop) {
         Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_,_,_,epi_m,epi_n));
         Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
         copy(tSR_sRow_flt, tSR_rRow_flt);
