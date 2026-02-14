@@ -228,6 +228,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             backend=self.unquantized_backend,
             quant_config=self.moe_quant_config,
             moe_config=self.moe,
+            layer_name=getattr(layer, "layer_name", None),
+            layer_id=getattr(layer, "layer_id", None),
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:

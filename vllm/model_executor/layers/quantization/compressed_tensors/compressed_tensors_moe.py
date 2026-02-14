@@ -342,6 +342,8 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
                 experts_cls=self.experts_cls,
                 shared_experts=layer.shared_experts,
                 routing_tables=layer._maybe_init_expert_routing_tables(),
+                layer_name=getattr(layer, "layer_name", None),
+                layer_id=getattr(layer, "layer_id", None),
             )
 
     def apply(
@@ -575,6 +577,8 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
                 experts_cls=self.experts_cls,
                 shared_experts=layer.shared_experts,
                 routing_tables=layer._maybe_init_expert_routing_tables(),
+                layer_name=getattr(layer, "layer_name", None),
+                layer_id=getattr(layer, "layer_id", None),
             )
 
     def maybe_make_prepare_finalize(
@@ -976,6 +980,8 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._maybe_init_expert_routing_tables(),
                 shared_experts=layer.shared_experts,
+                layer_name=getattr(layer, "layer_name", None),
+                layer_id=getattr(layer, "layer_id", None),
             )
 
     def maybe_make_prepare_finalize(

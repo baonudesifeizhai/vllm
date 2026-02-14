@@ -165,6 +165,8 @@ def make_unquantized_moe_kernel(
     backend: UnquantizedMoeBackend,
     quant_config: FusedMoEQuantConfig,
     moe_config: FusedMoEConfig,
+    layer_name: str | None = None,
+    layer_id: int | None = None,
 ) -> mk.FusedMoEModularKernel | None:
     if backend in UNSUPPORTED_BACKEND:
         return None
@@ -181,6 +183,8 @@ def make_unquantized_moe_kernel(
                 quant_config=quant_config,
             ),
             inplace=False,
+            layer_name=layer_name,
+            layer_id=layer_id,
         )
 
     elif backend == UnquantizedMoeBackend.AITER:
@@ -195,6 +199,8 @@ def make_unquantized_moe_kernel(
                 quant_config=quant_config,
             ),
             inplace=not moe_config.disable_inplace,
+            layer_name=layer_name,
+            layer_id=layer_id,
         )
     elif backend == UnquantizedMoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe import TritonExperts
@@ -206,6 +212,8 @@ def make_unquantized_moe_kernel(
                 quant_config=quant_config,
             ),
             inplace=not moe_config.disable_inplace,
+            layer_name=layer_name,
+            layer_id=layer_id,
         )
     elif backend == UnquantizedMoeBackend.XPU:
         from vllm.model_executor.layers.fused_moe import XPUExperts
@@ -217,5 +225,7 @@ def make_unquantized_moe_kernel(
                 quant_config=quant_config,
             ),
             inplace=not moe_config.disable_inplace,
+            layer_name=layer_name,
+            layer_id=layer_id,
         )
     return kernel

@@ -870,6 +870,8 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 experts_cls=self.experts_cls,
                 routing_tables=layer._maybe_init_expert_routing_tables(),
                 shared_experts=layer.shared_experts,
+                layer_name=getattr(layer, "layer_name", None),
+                layer_id=getattr(layer, "layer_id", None),
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -1446,6 +1448,8 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                 experts_cls=self.experts_cls,
                 shared_experts=layer.shared_experts,
                 routing_tables=layer._maybe_init_expert_routing_tables(),
+                layer_name=getattr(layer, "layer_name", None),
+                layer_id=getattr(layer, "layer_id", None),
             )
 
     @property

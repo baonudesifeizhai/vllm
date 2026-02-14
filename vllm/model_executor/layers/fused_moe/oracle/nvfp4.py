@@ -397,6 +397,8 @@ def make_nvfp4_moe_kernel(
     experts_cls: type[mk.FusedMoEPermuteExpertsUnpermute],
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     shared_experts: torch.nn.Module | None = None,
+    layer_name: str | None = None,
+    layer_id: int | None = None,
 ) -> mk.FusedMoEModularKernel:
     # Create Prepare/Finalize.
     prepare_finalize = maybe_make_prepare_finalize(
@@ -438,6 +440,8 @@ def make_nvfp4_moe_kernel(
         ),
         moe_parallel_config=moe_config.moe_parallel_config,
         inplace=False,
+        layer_name=layer_name,
+        layer_id=layer_id,
     )
 
     # TODO(rob): update inplace logic to be part of the kernel.

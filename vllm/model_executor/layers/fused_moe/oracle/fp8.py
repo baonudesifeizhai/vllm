@@ -482,6 +482,8 @@ def make_fp8_moe_kernel(
     fp8_backend: Fp8MoeBackend,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     shared_experts: torch.nn.Module | None = None,
+    layer_name: str | None = None,
+    layer_id: int | None = None,
 ) -> mk.FusedMoEModularKernel:
     # Create Prepare/Finalize.
     prepare_finalize = maybe_make_prepare_finalize(
@@ -526,6 +528,8 @@ def make_fp8_moe_kernel(
             not moe_config.disable_inplace
             and fp8_backend != Fp8MoeBackend.FLASHINFER_CUTLASS
         ),
+        layer_name=layer_name,
+        layer_id=layer_id,
     )
 
     return kernel
