@@ -87,6 +87,11 @@ def _maybe_log_cutlass_first_context(
     w1_scale: torch.Tensor | None,
     w2_scale: torch.Tensor | None,
     expert_num_tokens: torch.Tensor | None,
+    expert_offsets: torch.Tensor,
+    ab_strides1: torch.Tensor,
+    ab_strides2: torch.Tensor,
+    c_strides1: torch.Tensor,
+    c_strides2: torch.Tensor,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     mm1_out: torch.Tensor,
@@ -109,7 +114,9 @@ def _maybe_log_cutlass_first_context(
         "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
         "per_act_token=%s per_out_ch=%s "
         "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
-        "expert_num_tokens=%s problem_sizes1=%s problem_sizes2=%s "
+        "expert_num_tokens=%s expert_offsets=%s "
+        "ab_strides1=%s ab_strides2=%s c_strides1=%s c_strides2=%s "
+        "problem_sizes1=%s problem_sizes2=%s "
         "mm1_out=%s mm2_out=%s",
         use_batched_format,
         per_act_token,
@@ -119,6 +126,11 @@ def _maybe_log_cutlass_first_context(
         _tensor_debug_stats(w1_scale),
         _tensor_debug_stats(w2_scale),
         _tensor_debug_stats(expert_num_tokens),
+        _tensor_debug_stats(expert_offsets),
+        _tensor_debug_stats(ab_strides1),
+        _tensor_debug_stats(ab_strides2),
+        _tensor_debug_stats(c_strides1),
+        _tensor_debug_stats(c_strides2),
         _tensor_debug_stats(problem_sizes1),
         _tensor_debug_stats(problem_sizes2),
         _tensor_debug_stats(mm1_out),
@@ -408,6 +420,11 @@ def run_cutlass_moe_fp8(
             w1_scale=w1_scale_mm,
             w2_scale=w2_scale_mm,
             expert_num_tokens=expert_num_tokens,
+            expert_offsets=expert_offsets_mm,
+            ab_strides1=ab_strides1_mm,
+            ab_strides2=ab_strides2_mm,
+            c_strides1=c_strides1_mm,
+            c_strides2=c_strides2_mm,
             problem_sizes1=problem_sizes1_mm,
             problem_sizes2=problem_sizes2_mm,
             mm1_out=mm1_out,
