@@ -145,6 +145,49 @@ void cutlass_group_gemm_caller(
   using StrideB = Stride<int64_t, Int<1>, Int<0>>;
   using StrideC = typename GemmKernel::InternalStrideC;
 
+  static_assert(sizeof(StrideA) % sizeof(int64_t) == 0);
+  static_assert(sizeof(StrideB) % sizeof(int64_t) == 0);
+  static_assert(sizeof(StrideC) % sizeof(int64_t) == 0);
+  constexpr int64_t kStrideAI64 = sizeof(StrideA) / sizeof(int64_t);
+  constexpr int64_t kStrideBI64 = sizeof(StrideB) / sizeof(int64_t);
+  constexpr int64_t kStrideCI64 = sizeof(StrideC) / sizeof(int64_t);
+
+  TORCH_CHECK(a_strides.dtype() == torch::kInt64 &&
+                  b_strides.dtype() == torch::kInt64 &&
+                  c_strides.dtype() == torch::kInt64,
+              "Grouped GEMM stride tensors must be int64.");
+  TORCH_CHECK(a_strides.is_contiguous() && b_strides.is_contiguous() &&
+                  c_strides.is_contiguous(),
+              "Grouped GEMM stride tensors must be contiguous.");
+  TORCH_CHECK(
+      a_strides.numel() == num_experts * kStrideAI64,
+      "A stride layout mismatch: expected numel=", num_experts * kStrideAI64,
+      " (num_experts=", num_experts, ", sizeof(StrideA)=", sizeof(StrideA),
+      " bytes), got ", a_strides.numel());
+  TORCH_CHECK(
+      b_strides.numel() == num_experts * kStrideBI64,
+      "B stride layout mismatch: expected numel=", num_experts * kStrideBI64,
+      " (num_experts=", num_experts, ", sizeof(StrideB)=", sizeof(StrideB),
+      " bytes), got ", b_strides.numel());
+  TORCH_CHECK(
+      c_strides.numel() == num_experts * kStrideCI64,
+      "C stride layout mismatch: expected numel=", num_experts * kStrideCI64,
+      " (num_experts=", num_experts, ", sizeof(StrideC)=", sizeof(StrideC),
+      " bytes), got ", c_strides.numel());
+
+  if (grouped_moe_pplx_debug_enabled()) {
+    static bool logged_stride_layout = false;
+    if (!logged_stride_layout) {
+      logged_stride_layout = true;
+      TORCH_WARN("PPLX_GROUPED_STRIDE_LAYOUT swap_ab=", swap_ab,
+                 " sizeof(StrideA)=", sizeof(StrideA),
+                 " sizeof(StrideB)=", sizeof(StrideB),
+                 " sizeof(StrideC)=", sizeof(StrideC),
+                 " a_numel=", a_strides.numel(), " b_numel=", b_strides.numel(),
+                 " c_numel=", c_strides.numel(), " num_experts=", num_experts);
+    }
+  }
+
   ProblemShape::UnderlyingProblemShape* problem_sizes_as_shapes =
       static_cast<ProblemShape::UnderlyingProblemShape*>(
           problem_sizes.data_ptr());
