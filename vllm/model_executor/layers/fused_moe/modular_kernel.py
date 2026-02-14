@@ -224,6 +224,10 @@ class FusedMoEPrepareAndFinalize(ABC):
     described above.
     """
 
+    # Optional layer identity for debug/diagnostics propagation.
+    layer_id: int | None = None
+    layer_name: str | None = None
+
     def post_init_setup(self, fused_experts: "FusedMoEPermuteExpertsUnpermute"):
         """
         Initialize FusedMoEPrepareAndFinalize settings that depend on
@@ -477,6 +481,9 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         self.quant_config = quant_config
         self.max_num_tokens = max_num_tokens
         self.num_dispatchers = num_dispatchers
+        # Optional layer identity for debug/diagnostics propagation.
+        self.layer_id: int | None = None
+        self.layer_name: str | None = None
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -911,6 +918,11 @@ class FusedMoEModularKernel(torch.nn.Module):
         Resolve any leftover setup dependencies between self.prepare_finalize
         and self.fused_experts here.
         """
+        # Propagate layer identity to subcomponents for low-noise diagnostics.
+        self.prepare_finalize.layer_id = self.layer_id
+        self.prepare_finalize.layer_name = self.layer_name
+        self.fused_experts.layer_id = self.layer_id
+        self.fused_experts.layer_name = self.layer_name
         self.prepare_finalize.post_init_setup(self.fused_experts)
 
     def supports_expert_map(self) -> bool:
@@ -1524,8 +1536,6 @@ class FusedMoEModularKernel(torch.nn.Module):
         local_num_experts = w1.size(0)
         if global_num_experts == -1:
             global_num_experts = local_num_experts
-        moe_debug = _pplx_debug_enabled()
-
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             hidden_states,
             topk_weights,
@@ -1560,35 +1570,5 @@ class FusedMoEModularKernel(torch.nn.Module):
             apply_router_weight_on_input,
             shared_experts_input=shared_experts_input,
         )
-
-        if moe_debug:
-            self._maybe_log_first_explosion(
-                hidden_states,
-                fused_out,
-                final_output,
-                expert_tokens_meta,
-            )
-
-        if moe_debug and not getattr(self, "_pplx_debug_logged", False):
-            log_this = True
-            if is_forward_context_available():
-                ctx = get_forward_context()
-                if ctx.additional_kwargs.get("is_dummy_run"):
-                    log_this = False
-            if log_this and not _tensor_is_all_zero(hidden_states):
-                self._pplx_debug_logged = True
-                self._log_moe_debug(
-                    hidden_states,
-                    a1q,
-                    a1q_scale,
-                    topk_weights,
-                    topk_ids,
-                    fused_out,
-                    final_output,
-                    expert_tokens_meta,
-                    apply_router_weight_on_input,
-                    global_num_experts,
-                    local_num_experts,
-                )
 
         return final_output

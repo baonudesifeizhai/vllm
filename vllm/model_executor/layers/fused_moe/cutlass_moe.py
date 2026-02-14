@@ -265,30 +265,6 @@ def run_cutlass_moe_fp8(
                 a1q_scale = a1q_scale[:, 0:1].contiguous()
             else:
                 a1q_scale = a1q_scale.contiguous()
-            if _pplx_debug_enabled():
-                inferred_per_act_token = a1q_scale.numel() != 1
-                if inferred_per_act_token != per_act_token:
-                    logger.warning_once(
-                        "CUTLASS_MOE_FP8 scale-mode mismatch: "
-                        "python per_act_token=%s but C++ inference from "
-                        "a_scales.numel()!=1 is %s. a1q_scale=%s",
-                        per_act_token,
-                        inferred_per_act_token,
-                        _tensor_debug_stats(a1q_scale),
-                        scope="local",
-                    )
-            if _pplx_debug_enabled() and not per_act_token and a1q_scale.numel() > 1:
-                scale_stats = a1q_scale.float()
-                # For per-tensor quant, repeated scales should be uniform.
-                # If they are not, the grouped GEMM scalar-vs-token interpretation
-                # can silently diverge.
-                if float((scale_stats.max() - scale_stats.min()).item()) > 1e-7:
-                    logger.warning_once(
-                        "CUTLASS_MOE_FP8 saw non-uniform a1q_scale while "
-                        "per_act_token=False. a1q_scale=%s",
-                        _tensor_debug_stats(a1q_scale),
-                        scope="local",
-                    )
         # c3x get_group_gemm_starts expects int64 to avoid overflow
         # during offset calculations
         expert_offsets = expert_offsets.to(torch.int64)

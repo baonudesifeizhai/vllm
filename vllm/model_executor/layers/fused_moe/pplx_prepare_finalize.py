@@ -19,6 +19,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
+_PPLX_COMBINE_FIRST_CONTEXT_LOGGED = False
 
 
 def _pplx_debug_enabled() -> bool:
@@ -42,6 +43,55 @@ def _tensor_stats(tensor: torch.Tensor | None) -> str:
         f"shape={shape} dtype={tensor.dtype} min={stats.min().item():.4g} "
         f"max={stats.max().item():.4g} mean={stats.mean().item():.4g} "
         f"sum={stats.sum().item():.4g}"
+    )
+
+
+def _tensor_abs_max(tensor: torch.Tensor | None) -> float:
+    if tensor is None or tensor.numel() == 0:
+        return 0.0
+    return float(tensor.float().abs().max().item())
+
+
+def _maybe_log_combine_first_context(
+    *,
+    stage: str,
+    layer_id: int | None,
+    layer_name: str | None,
+    apply_router_weight_on_input: bool,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    fused_expert_output: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    global _PPLX_COMBINE_FIRST_CONTEXT_LOGGED
+    if _PPLX_COMBINE_FIRST_CONTEXT_LOGGED:
+        return
+
+    fused_abs_max = _tensor_abs_max(fused_expert_output)
+    output_abs_max = _tensor_abs_max(output)
+    suspicious = (
+        _has_non_finite(fused_expert_output)
+        or _has_non_finite(topk_weights)
+        or _has_non_finite(output)
+        or fused_abs_max >= 1e4
+        or output_abs_max >= 1e4
+    )
+    if not suspicious:
+        return
+
+    _PPLX_COMBINE_FIRST_CONTEXT_LOGGED = True
+    logger.warning(
+        "PPLX_COMBINE_FIRST_CONTEXT layer_id=%s layer_name=%s stage=%s "
+        "apply_router_weight_on_input=%s topk_ids=%s topk_weights=%s "
+        "fused_expert_output=%s output=%s",
+        layer_id,
+        layer_name,
+        stage,
+        apply_router_weight_on_input,
+        _tensor_stats(topk_ids),
+        _tensor_stats(topk_weights),
+        _tensor_stats(fused_expert_output),
+        _tensor_stats(output),
     )
 
 
@@ -104,6 +154,8 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         self.max_num_tokens = max_num_tokens
         self.num_local_experts = num_local_experts
         self.num_dispatchers_ = num_dispatchers
+        self.layer_id: int | None = None
+        self.layer_name: str | None = None
 
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
@@ -480,6 +532,17 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             f"{topk_weights.stride()}."
         )
         topk_ids_u32 = topk_ids.view(dtype=torch.uint32)
+        if _pplx_debug_enabled():
+            _maybe_log_combine_first_context(
+                stage="before_send",
+                layer_id=self.layer_id,
+                layer_name=self.layer_name,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                topk_ids=topk_ids_u32,
+                topk_weights=topk_weights,
+                fused_expert_output=fused_expert_output,
+                output=output,
+            )
 
         self.a2a.combine(
             out_tokens=output,
@@ -507,6 +570,17 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                 do_send=False,
                 do_recv=True,
             )
+            if _pplx_debug_enabled():
+                _maybe_log_combine_first_context(
+                    stage="after_recv",
+                    layer_id=self.layer_id,
+                    layer_name=self.layer_name,
+                    apply_router_weight_on_input=apply_router_weight_on_input,
+                    topk_ids=topk_ids_u32,
+                    topk_weights=topk_weights,
+                    fused_expert_output=fused_expert_output,
+                    output=output,
+                )
 
         return recv_combine
 
