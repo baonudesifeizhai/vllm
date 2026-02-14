@@ -42,11 +42,22 @@ from vllm.v1.worker.workspace import current_workspace_manager
 logger = init_logger(__name__)
 
 _VLLM_MOE_TRACE_NUMERICS = os.environ.get("VLLM_MOE_TRACE_NUMERICS", "0") == "1"
+_VLLM_MOE_ASSERT_ON_NONFINITE = (
+    os.environ.get(
+        "VLLM_MOE_ASSERT_ON_NONFINITE",
+        "1" if _VLLM_MOE_TRACE_NUMERICS else "0",
+    )
+    == "1"
+)
 _MOE_TRACE_REPORTED_STAGES: set[str] = set()
 
 
 def moe_trace_enabled() -> bool:
     return _VLLM_MOE_TRACE_NUMERICS
+
+
+def moe_assert_on_nonfinite_enabled() -> bool:
+    return _VLLM_MOE_ASSERT_ON_NONFINITE
 
 
 def _tensor_stats_str(x: torch.Tensor) -> str:
@@ -171,6 +182,7 @@ def log_moe_trace_tensor(
         return
     _MOE_TRACE_REPORTED_STAGES.add(stage)
     stats = _tensor_stats_str(x)
+    context_s = context() if callable(context) else context
     if context is None:
         logger.warning(
             "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s",
@@ -179,13 +191,18 @@ def log_moe_trace_tensor(
             stats,
         )
     else:
-        context_s = context() if callable(context) else context
         logger.warning(
             "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s context={%s}",
             stage,
             kernel_id,
             stats,
             context_s,
+        )
+    if _VLLM_MOE_ASSERT_ON_NONFINITE:
+        raise AssertionError(
+            "MOE_TRACE_NONFINITE "
+            f"stage={stage} kernel_id={kernel_id} {stats} "
+            f"context={context_s if context_s is not None else 'None'}"
         )
 
 
@@ -209,6 +226,7 @@ def log_moe_trace_batched_tensor(
     if stage in _MOE_TRACE_REPORTED_STAGES:
         return
     _MOE_TRACE_REPORTED_STAGES.add(stage)
+    context_s = context() if callable(context) else context
     if context is None:
         logger.warning(
             "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s",
@@ -217,13 +235,18 @@ def log_moe_trace_batched_tensor(
             stats,
         )
     else:
-        context_s = context() if callable(context) else context
         logger.warning(
             "MOE_TRACE_NONFINITE stage=%s kernel_id=%s %s context={%s}",
             stage,
             kernel_id,
             stats,
             context_s,
+        )
+    if _VLLM_MOE_ASSERT_ON_NONFINITE:
+        raise AssertionError(
+            "MOE_TRACE_NONFINITE "
+            f"stage={stage} kernel_id={kernel_id} {stats} "
+            f"context={context_s if context_s is not None else 'None'}"
         )
 
 
