@@ -132,6 +132,17 @@ def _filter_zero_groups_enabled() -> bool:
     return os.getenv("VLLM_CUTLASS_MOE_FILTER_ZERO_GROUPS", "0") == "1"
 
 
+def _mm1_per_act_token_override() -> bool | None:
+    value = os.getenv("VLLM_CUTLASS_MOE_MM1_PER_ACT_TOKEN_OVERRIDE")
+    if value is None:
+        return None
+    if value == "0":
+        return False
+    if value == "1":
+        return True
+    raise ValueError("VLLM_CUTLASS_MOE_MM1_PER_ACT_TOKEN_OVERRIDE must be '0' or '1'.")
+
+
 def run_cutlass_moe_fp8(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -357,9 +368,12 @@ def run_cutlass_moe_fp8(
             )
 
     if not skip_grouped_mm:
-        # Debug isolation: mm1 uses per-tensor B scale (disable per-out-channel)
-        # to test whether the B per-channel scale path triggers instability.
-        mm1_per_out_ch = False
+        mm1_per_act_token_override = _mm1_per_act_token_override()
+        mm1_per_act_token = (
+            per_act_token
+            if mm1_per_act_token_override is None
+            else mm1_per_act_token_override
+        )
         ops.cutlass_moe_mm(
             mm1_out,
             a1q,
@@ -371,8 +385,8 @@ def run_cutlass_moe_fp8(
             ab_strides1_mm,
             ab_strides1_mm,
             c_strides1_mm,
-            per_act_token,
-            mm1_per_out_ch,
+            mm1_per_act_token,
+            per_out_ch,
         )
 
     apply_moe_activation(activation, act_out, mm1_out)
