@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -46,6 +47,80 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
+_PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = False
+
+
+def _pplx_debug_enabled() -> bool:
+    return envs.VLLM_PPLX_DEBUG
+
+
+def _has_non_finite(tensor: torch.Tensor | None) -> bool:
+    if tensor is None:
+        return False
+    return not torch.isfinite(tensor.float()).all().item()
+
+
+def _tensor_debug_stats(tensor: torch.Tensor | None) -> str:
+    if tensor is None:
+        return "none"
+    shape = tuple(tensor.shape)
+    if tensor.numel() == 0:
+        return f"shape={shape} dtype={tensor.dtype} empty"
+    stats = tensor.float()
+    return (
+        f"shape={shape} stride={tensor.stride()} dtype={tensor.dtype} "
+        f"min={stats.min().item():.4g} max={stats.max().item():.4g} "
+        f"mean={stats.mean().item():.4g} sum={stats.sum().item():.4g}"
+    )
+
+
+def _maybe_log_cutlass_first_context(
+    *,
+    use_batched_format: bool,
+    per_act_token: bool,
+    per_out_ch: bool,
+    a1q: torch.Tensor,
+    a1q_scale: torch.Tensor | None,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    expert_num_tokens: torch.Tensor | None,
+    problem_sizes1: torch.Tensor,
+    problem_sizes2: torch.Tensor,
+    mm1_out: torch.Tensor,
+    mm2_out: torch.Tensor,
+) -> None:
+    global _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED
+    if _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED:
+        return
+
+    mm1_abs_max = float(mm1_out.float().abs().max().item()) if mm1_out.numel() else 0.0
+    mm2_abs_max = float(mm2_out.float().abs().max().item()) if mm2_out.numel() else 0.0
+    has_non_finite = _has_non_finite(mm1_out) or _has_non_finite(mm2_out)
+    # Heuristic threshold. This is a debug aid only.
+    suspicious = has_non_finite or mm1_abs_max >= 1e4 or mm2_abs_max >= 1e4
+    if not suspicious:
+        return
+
+    _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = True
+    logger.warning(
+        "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
+        "per_act_token=%s per_out_ch=%s "
+        "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
+        "expert_num_tokens=%s problem_sizes1=%s problem_sizes2=%s "
+        "mm1_out=%s mm2_out=%s",
+        use_batched_format,
+        per_act_token,
+        per_out_ch,
+        _tensor_debug_stats(a1q),
+        _tensor_debug_stats(a1q_scale),
+        _tensor_debug_stats(w1_scale),
+        _tensor_debug_stats(w2_scale),
+        _tensor_debug_stats(expert_num_tokens),
+        _tensor_debug_stats(problem_sizes1),
+        _tensor_debug_stats(problem_sizes2),
+        _tensor_debug_stats(mm1_out),
+        _tensor_debug_stats(mm2_out),
+    )
 
 
 def run_cutlass_moe_fp8(
@@ -190,6 +265,30 @@ def run_cutlass_moe_fp8(
                 a1q_scale = a1q_scale[:, 0:1].contiguous()
             else:
                 a1q_scale = a1q_scale.contiguous()
+            if _pplx_debug_enabled():
+                inferred_per_act_token = a1q_scale.numel() != 1
+                if inferred_per_act_token != per_act_token:
+                    logger.warning_once(
+                        "CUTLASS_MOE_FP8 scale-mode mismatch: "
+                        "python per_act_token=%s but C++ inference from "
+                        "a_scales.numel()!=1 is %s. a1q_scale=%s",
+                        per_act_token,
+                        inferred_per_act_token,
+                        _tensor_debug_stats(a1q_scale),
+                        scope="local",
+                    )
+            if _pplx_debug_enabled() and not per_act_token and a1q_scale.numel() > 1:
+                scale_stats = a1q_scale.float()
+                # For per-tensor quant, repeated scales should be uniform.
+                # If they are not, the grouped GEMM scalar-vs-token interpretation
+                # can silently diverge.
+                if float((scale_stats.max() - scale_stats.min()).item()) > 1e-7:
+                    logger.warning_once(
+                        "CUTLASS_MOE_FP8 saw non-uniform a1q_scale while "
+                        "per_act_token=False. a1q_scale=%s",
+                        _tensor_debug_stats(a1q_scale),
+                        scope="local",
+                    )
         # c3x get_group_gemm_starts expects int64 to avoid overflow
         # during offset calculations
         expert_offsets = expert_offsets.to(torch.int64)
@@ -267,6 +366,21 @@ def run_cutlass_moe_fp8(
         per_act_token,
         per_out_ch,
     )
+    if _pplx_debug_enabled():
+        _maybe_log_cutlass_first_context(
+            use_batched_format=use_batched_format,
+            per_act_token=per_act_token,
+            per_out_ch=per_out_ch,
+            a1q=a1q,
+            a1q_scale=a1q_scale,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            expert_num_tokens=expert_num_tokens,
+            problem_sizes1=problem_sizes1,
+            problem_sizes2=problem_sizes2,
+            mm1_out=mm1_out,
+            mm2_out=mm2_out,
+        )
 
     if use_batched_format:
         output.copy_(mm2_out.reshape(local_E, padded_M, K), non_blocking=True)
