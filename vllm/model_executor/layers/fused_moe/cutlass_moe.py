@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -48,6 +50,7 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = False
+_PPLX_MM1_FORCE_PER_TENSOR_LOGGED = False
 
 
 def _pplx_debug_enabled() -> bool:
@@ -121,6 +124,11 @@ def _maybe_log_cutlass_first_context(
         _tensor_debug_stats(mm1_out),
         _tensor_debug_stats(mm2_out),
     )
+
+
+def _force_mm1_per_tensor_scale_enabled() -> bool:
+    # Debug-only switch for isolating per-token scale broadcast issues in mm1.
+    return os.getenv("VLLM_PPLX_MM1_FORCE_PER_TENSOR_SCALE", "0") == "1"
 
 
 def run_cutlass_moe_fp8(
@@ -301,18 +309,36 @@ def run_cutlass_moe_fp8(
         # Clear workspace to avoid propagating garbage from padded/unused rows.
         mm1_out.zero_()
 
+    mm1_a1q_scale = a1q_scale
+    mm1_per_act_token = per_act_token
+    if _force_mm1_per_tensor_scale_enabled() and a1q_scale is not None:
+        # Isolate mm1 numeric behavior by forcing scalar activation scale.
+        # This should make CUTLASS treat A scale as per-tensor for mm1 only.
+        mm1_a1q_scale = a1q_scale.float().amax().reshape(1).to(a1q_scale.dtype)
+        mm1_per_act_token = False
+        global _PPLX_MM1_FORCE_PER_TENSOR_LOGGED
+        if not _PPLX_MM1_FORCE_PER_TENSOR_LOGGED:
+            _PPLX_MM1_FORCE_PER_TENSOR_LOGGED = True
+            logger.warning(
+                "PPLX_MM1_FORCE_PER_TENSOR_SCALE enabled: "
+                "mm1_per_act_token=%s original_a1q_scale=%s forced_a1q_scale=%s",
+                mm1_per_act_token,
+                _tensor_debug_stats(a1q_scale),
+                _tensor_debug_stats(mm1_a1q_scale),
+            )
+
     ops.cutlass_moe_mm(
         mm1_out,
         a1q,
         w1,
-        a1q_scale,
+        mm1_a1q_scale,
         w1_scale,
         expert_offsets,
         problem_sizes1,
         ab_strides1,
         ab_strides1,
         c_strides1,
-        per_act_token,
+        mm1_per_act_token,
         per_out_ch,
     )
 
