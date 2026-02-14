@@ -16,10 +16,29 @@ using namespace cute;
 
 namespace {
 
+inline bool pplx_debug_enabled() {
+  auto* env = std::getenv("VLLM_PPLX_DEBUG");
+  return env != nullptr && std::atoi(env) != 0;
+}
+
 inline bool force_row_scale_reload_each_loop() {
   auto* env =
       std::getenv("VLLM_CUTLASS_MOE_FORCE_ROW_BROADCAST_RELOAD_EACH_LOOP");
   return env != nullptr && std::atoi(env) != 0;
+}
+
+inline void maybe_log_row_reload_config(bool force_row_reload,
+                                        bool per_act_token, bool per_out_ch) {
+  if (!pplx_debug_enabled()) {
+    return;
+  }
+  static bool logged = false;
+  if (logged) {
+    return;
+  }
+  logged = true;
+  TORCH_WARN("PPLX_ROW_BROADCAST_RELOAD force_row_reload=", force_row_reload,
+             " per_act_token=", per_act_token, " per_out_ch=", per_out_ch);
 }
 
 using ProblemShape =
@@ -149,6 +168,7 @@ void cutlass_group_gemm_caller(
   // Currently, we are only able to do broadcast on either all or none a_scales
   // and on either all or none b_scales
   bool const force_row_reload = force_row_scale_reload_each_loop();
+  maybe_log_row_reload_config(force_row_reload, per_act_token, per_out_ch);
   typename GemmKernel::EpilogueArguments epilogue_args{
       Gemm::Epilogue::prepare_args(
           swap_ab ? static_cast<const ElementAccumulator**>(
