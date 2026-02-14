@@ -16,7 +16,7 @@ using namespace cute;
 
 namespace {
 
-inline bool pplx_debug_enabled() {
+inline bool grouped_moe_pplx_debug_enabled() {
   auto* env = std::getenv("VLLM_PPLX_DEBUG");
   return env != nullptr && std::atoi(env) != 0;
 }
@@ -29,7 +29,7 @@ inline bool force_row_scale_reload_each_loop() {
 
 inline void maybe_log_row_reload_config(bool force_row_reload,
                                         bool per_act_token, bool per_out_ch) {
-  if (!pplx_debug_enabled()) {
+  if (!grouped_moe_pplx_debug_enabled()) {
     return;
   }
   static bool logged = false;
