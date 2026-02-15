@@ -51,6 +51,7 @@ logger = init_logger(__name__)
 
 _PPLX_MM1_GUARD_CALLS = 0
 _PPLX_MM1_GUARD_LOGGED = False
+_PPLX_MM1_REF_GUARD_CALLS = 0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -138,6 +139,83 @@ def _batched_valid_snapshot(
         f"valid_rows={valid_rows} min={tf.min().item():.6g} "
         f"max={tf.max().item():.6g} mean={tf.mean().item():.6g}"
     )
+
+
+def _mm1_ref_max_error(
+    mm1_out: torch.Tensor,
+    a1q: torch.Tensor,
+    a1q_scale: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    local_E: int,
+    padded_M: int,
+    per_act_token: bool,
+    max_experts: int,
+    max_rows_per_expert: int,
+) -> tuple[bool, str, float, float, int, int]:
+    a1q_b = a1q.reshape(local_E, padded_M, a1q.size(-1))
+    a1s_b = a1q_scale.reshape(local_E, padded_M, a1q_scale.size(-1))
+    out_b = mm1_out.reshape(local_E, padded_M, mm1_out.size(-1))
+
+    max_abs_err = 0.0
+    max_rel_err = 0.0
+    experts_checked = 0
+    rows_checked = 0
+
+    for e in range(local_E):
+        rows = int(expert_num_tokens[e].item())
+        if rows <= 0:
+            continue
+        if experts_checked >= max_experts:
+            break
+        experts_checked += 1
+
+        rows = min(rows, max_rows_per_expert)
+        rows_checked += rows
+
+        aq = a1q_b[e, :rows, :].float()
+        # w1 is stored as [E, 2N, K]; GEMM uses B as [K, 2N].
+        acc = aq @ w1[e].float().transpose(0, 1)
+
+        # Apply B scales.
+        b_sc = w1_scale[e].reshape(-1).float()
+        if b_sc.numel() == 1:
+            acc = acc * b_sc
+        elif b_sc.numel() == acc.size(1):
+            acc = acc * b_sc.view(1, -1)
+        else:
+            return (
+                False,
+                f"unsupported w1_scale shape for ref check: {tuple(w1_scale.shape)}",
+                0.0,
+                0.0,
+                experts_checked,
+                rows_checked,
+            )
+
+        # Apply A scales.
+        a_sc = a1s_b[e, :rows, :].float()
+        if a_sc.size(1) != 1:
+            return (
+                False,
+                f"unsupported a1q_scale shape for ref check: {tuple(a1q_scale.shape)}",
+                0.0,
+                0.0,
+                experts_checked,
+                rows_checked,
+            )
+        acc = acc * a_sc if per_act_token else acc * a_sc[0:1, :]
+
+        out = out_b[e, :rows, :].float()
+        diff = (out - acc).abs()
+        abs_err = float(diff.max().item())
+        rel_err = float((diff / acc.abs().clamp_min(1e-5)).max().item())
+
+        max_abs_err = max(max_abs_err, abs_err)
+        max_rel_err = max(max_rel_err, rel_err)
+
+    return True, "", max_abs_err, max_rel_err, experts_checked, rows_checked
 
 
 def run_cutlass_moe_fp8(
@@ -366,6 +444,59 @@ def run_cutlass_moe_fp8(
                         f"(finite={finite}, abs_max={abs_max:.6g}, "
                         f"threshold={threshold:.6g})"
                     )
+
+    # Optional sampled reference check for finite-but-wrong mm1 outputs.
+    if use_batched_format and _env_flag("VLLM_PPLX_MM1_REF_GUARD", default=False):
+        global _PPLX_MM1_REF_GUARD_CALLS
+        _PPLX_MM1_REF_GUARD_CALLS += 1
+        interval = max(1, _env_int("VLLM_PPLX_MM1_REF_GUARD_INTERVAL", 32))
+        if _PPLX_MM1_REF_GUARD_CALLS % interval == 0:
+            max_experts = max(1, _env_int("VLLM_PPLX_MM1_REF_GUARD_MAX_EXPERTS", 1))
+            max_rows = max(1, _env_int("VLLM_PPLX_MM1_REF_GUARD_MAX_ROWS", 4))
+            supported, reason, abs_err, rel_err, checked_e, checked_r = (
+                _mm1_ref_max_error(
+                    mm1_out=mm1_out,
+                    a1q=a1q,
+                    a1q_scale=a1q_scale,
+                    w1=w1,
+                    w1_scale=w1_scale,
+                    expert_num_tokens=expert_num_tokens,
+                    local_E=local_E,
+                    padded_M=padded_M,
+                    per_act_token=per_act_token,
+                    max_experts=max_experts,
+                    max_rows_per_expert=max_rows,
+                )
+            )
+
+            if not supported:
+                logger.warning_once("PPLX_MM1_REF_GUARD_SKIPPED reason=%s", reason)
+            elif checked_r > 0:
+                abs_tol = _env_float("VLLM_PPLX_MM1_REF_GUARD_ABS_TOL", 0.5)
+                rel_tol = _env_float("VLLM_PPLX_MM1_REF_GUARD_REL_TOL", 0.1)
+                bad = abs_err > abs_tol or rel_err > rel_tol
+                if bad:
+                    logger.error(
+                        "PPLX_MM1_REF_GUARD_HIT call=%d checked_experts=%d "
+                        "checked_rows=%d abs_err=%.6g rel_err=%.6g "
+                        "abs_tol=%.6g rel_tol=%.6g per_act_token=%s "
+                        "per_out_ch=%s",
+                        _PPLX_MM1_REF_GUARD_CALLS,
+                        checked_e,
+                        checked_r,
+                        abs_err,
+                        rel_err,
+                        abs_tol,
+                        rel_tol,
+                        per_act_token,
+                        per_out_ch,
+                    )
+                    if _env_flag("VLLM_PPLX_MM1_REF_GUARD_FAIL", default=True):
+                        raise RuntimeError(
+                            "PPLX mm1 ref guard triggered "
+                            f"(abs_err={abs_err:.6g}, rel_err={rel_err:.6g}, "
+                            f"abs_tol={abs_tol:.6g}, rel_tol={rel_tol:.6g})"
+                        )
 
     apply_moe_activation(activation, act_out, mm1_out)
 
