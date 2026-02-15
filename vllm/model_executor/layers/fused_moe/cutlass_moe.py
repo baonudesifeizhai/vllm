@@ -89,6 +89,57 @@ def _tensor_snapshot(t: torch.Tensor) -> str:
     )
 
 
+def _batched_valid_stats(
+    x: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    local_E: int,
+    padded_M: int,
+) -> tuple[bool, float, int]:
+    x_b = x.reshape(local_E, padded_M, x.size(-1))
+    finite = True
+    abs_max = 0.0
+    valid_rows = 0
+    for e in range(local_E):
+        rows = int(expert_num_tokens[e].item())
+        if rows <= 0:
+            continue
+        valid_rows += rows
+        cur = x_b[e, :rows, :]
+        finite = finite and bool(torch.isfinite(cur).all().item())
+        cur_abs_max = float(cur.abs().amax().item())
+        abs_max = max(abs_max, cur_abs_max)
+    return finite, abs_max, valid_rows
+
+
+def _batched_valid_snapshot(
+    x: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    local_E: int,
+    padded_M: int,
+) -> str:
+    x_b = x.reshape(local_E, padded_M, x.size(-1))
+    parts: list[torch.Tensor] = []
+    valid_rows = 0
+    for e in range(local_E):
+        rows = int(expert_num_tokens[e].item())
+        if rows <= 0:
+            continue
+        valid_rows += rows
+        parts.append(x_b[e, :rows, :])
+    if valid_rows == 0:
+        return (
+            f"shape={tuple(x.shape)} stride={tuple(x.stride())} dtype={x.dtype} "
+            "valid_rows=0"
+        )
+    x_valid = torch.cat(parts, dim=0)
+    tf = x_valid.float()
+    return (
+        f"shape={tuple(x.shape)} stride={tuple(x.stride())} dtype={x.dtype} "
+        f"valid_rows={valid_rows} min={tf.min().item():.6g} "
+        f"max={tf.max().item():.6g} mean={tf.mean().item():.6g}"
+    )
+
+
 def run_cutlass_moe_fp8(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -275,28 +326,37 @@ def run_cutlass_moe_fp8(
         _PPLX_MM1_GUARD_CALLS += 1
         interval = max(1, _env_int("VLLM_PPLX_MM1_GUARD_INTERVAL", 1))
         if _PPLX_MM1_GUARD_CALLS % interval == 0:
-            abs_max = mm1_out.abs().amax().item()
-            finite = bool(torch.isfinite(mm1_out).all().item())
+            finite, abs_max, valid_rows = _batched_valid_stats(
+                mm1_out, expert_num_tokens, local_E, padded_M
+            )
             threshold = _env_float("VLLM_PPLX_MM1_GUARD_ABS_MAX_THRESHOLD", 1e6)
-            bad = (not finite) or abs_max > threshold
+            bad = valid_rows > 0 and ((not finite) or abs_max > threshold)
             if bad:
                 if not _PPLX_MM1_GUARD_LOGGED:
                     _PPLX_MM1_GUARD_LOGGED = True
                     logger.error(
                         "PPLX_MM1_GUARD_HIT call=%d finite=%s abs_max=%.6g "
-                        "threshold=%.6g per_act_token=%s per_out_ch=%s "
-                        "a1q=%s a1q_scale=%s w1_scale=%s mm1_out=%s "
-                        "expert_num_tokens=%s problem_sizes1=%s",
+                        "threshold=%.6g valid_rows=%d per_act_token=%s "
+                        "per_out_ch=%s a1q_valid=%s a1q_scale_valid=%s "
+                        "w1_scale=%s mm1_out_valid=%s expert_num_tokens=%s "
+                        "problem_sizes1=%s",
                         _PPLX_MM1_GUARD_CALLS,
                         finite,
                         abs_max,
                         threshold,
+                        valid_rows,
                         per_act_token,
                         per_out_ch,
-                        _tensor_snapshot(a1q),
-                        _tensor_snapshot(a1q_scale),
+                        _batched_valid_snapshot(
+                            a1q, expert_num_tokens, local_E, padded_M
+                        ),
+                        _batched_valid_snapshot(
+                            a1q_scale, expert_num_tokens, local_E, padded_M
+                        ),
                         _tensor_snapshot(w1_scale),
-                        _tensor_snapshot(mm1_out),
+                        _batched_valid_snapshot(
+                            mm1_out, expert_num_tokens, local_E, padded_M
+                        ),
                         _tensor_snapshot(expert_num_tokens),
                         _tensor_snapshot(problem_sizes1),
                     )
