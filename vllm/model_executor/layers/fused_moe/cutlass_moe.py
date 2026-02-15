@@ -50,7 +50,6 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = False
-_PPLX_ZERO_GROUP_FILTER_LOGGED = False
 
 
 def _pplx_debug_enabled() -> bool:
@@ -122,17 +121,35 @@ def _maybe_log_cutlass_first_context(
     expert_num_tokens: torch.Tensor | None,
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
-    mm1_out: torch.Tensor,
     mm1_out_post_mm1: torch.Tensor | None,
-    mm2_out: torch.Tensor,
+    act_out_post_act: torch.Tensor | None,
+    a2q_post_quant: torch.Tensor | None,
+    a2q_scale_post_quant: torch.Tensor | None,
+    mm2_out_post_mm2: torch.Tensor | None,
 ) -> None:
     global _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED
     if _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED:
         return
 
-    mm1_abs_max = float(mm1_out.float().abs().max().item()) if mm1_out.numel() else 0.0
-    mm2_abs_max = float(mm2_out.float().abs().max().item()) if mm2_out.numel() else 0.0
-    has_non_finite = _has_non_finite(mm1_out) or _has_non_finite(mm2_out)
+    mm1_source = mm1_out_post_mm1 if mm1_out_post_mm1 is not None else a1q
+    mm2_source = mm2_out_post_mm2 if mm2_out_post_mm2 is not None else a2q_post_quant
+    mm1_abs_max = (
+        float(mm1_source.float().abs().max().item())
+        if mm1_source is not None and mm1_source.numel()
+        else 0.0
+    )
+    mm2_abs_max = (
+        float(mm2_source.float().abs().max().item())
+        if mm2_source is not None and mm2_source.numel()
+        else 0.0
+    )
+    has_non_finite = (
+        _has_non_finite(mm1_source)
+        or _has_non_finite(act_out_post_act)
+        or _has_non_finite(a2q_post_quant)
+        or _has_non_finite(a2q_scale_post_quant)
+        or _has_non_finite(mm2_source)
+    )
     # Heuristic threshold. This is a debug aid only.
     suspicious = has_non_finite or mm1_abs_max >= 1e4 or mm2_abs_max >= 1e4
     if not suspicious:
@@ -140,17 +157,17 @@ def _maybe_log_cutlass_first_context(
 
     _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = True
     valid_mask = None
-    mm1_valid = "none"
-    mm1_invalid = "none"
     mm1_post_mm1 = "none"
     mm1_post_mm1_valid = "none"
     mm1_post_mm1_invalid = "none"
-    mm2_valid = "none"
-    mm2_invalid = "none"
+    act_post = "none"
+    a2q_post = "none"
+    a2q_scale_post = "none"
+    mm2_post = "none"
+    mm2_post_valid = "none"
+    mm2_post_invalid = "none"
     if use_batched_format and expert_num_tokens is not None:
-        valid_mask = _batched_valid_row_mask(mm1_out.size(0), expert_num_tokens)
-        mm1_valid = _tensor_row_subset_debug_stats(mm1_out, valid_mask, invert=False)
-        mm1_invalid = _tensor_row_subset_debug_stats(mm1_out, valid_mask, invert=True)
+        valid_mask = _batched_valid_row_mask(mm1_source.size(0), expert_num_tokens)
         if mm1_out_post_mm1 is not None:
             mm1_post_mm1 = _tensor_debug_stats(mm1_out_post_mm1)
             mm1_post_mm1_valid = _tensor_row_subset_debug_stats(
@@ -159,10 +176,30 @@ def _maybe_log_cutlass_first_context(
             mm1_post_mm1_invalid = _tensor_row_subset_debug_stats(
                 mm1_out_post_mm1, valid_mask, invert=True
             )
-        mm2_valid = _tensor_row_subset_debug_stats(mm2_out, valid_mask, invert=False)
-        mm2_invalid = _tensor_row_subset_debug_stats(mm2_out, valid_mask, invert=True)
+        if act_out_post_act is not None:
+            act_post = _tensor_debug_stats(act_out_post_act)
+        if a2q_post_quant is not None:
+            a2q_post = _tensor_debug_stats(a2q_post_quant)
+        if a2q_scale_post_quant is not None:
+            a2q_scale_post = _tensor_debug_stats(a2q_scale_post_quant)
+        if mm2_out_post_mm2 is not None:
+            mm2_post = _tensor_debug_stats(mm2_out_post_mm2)
+            mm2_post_valid = _tensor_row_subset_debug_stats(
+                mm2_out_post_mm2, valid_mask, invert=False
+            )
+            mm2_post_invalid = _tensor_row_subset_debug_stats(
+                mm2_out_post_mm2, valid_mask, invert=True
+            )
     elif mm1_out_post_mm1 is not None:
         mm1_post_mm1 = _tensor_debug_stats(mm1_out_post_mm1)
+    if act_out_post_act is not None and act_post == "none":
+        act_post = _tensor_debug_stats(act_out_post_act)
+    if a2q_post_quant is not None and a2q_post == "none":
+        a2q_post = _tensor_debug_stats(a2q_post_quant)
+    if a2q_scale_post_quant is not None and a2q_scale_post == "none":
+        a2q_scale_post = _tensor_debug_stats(a2q_scale_post_quant)
+    if mm2_out_post_mm2 is not None and mm2_post == "none":
+        mm2_post = _tensor_debug_stats(mm2_out_post_mm2)
 
     logger.warning(
         "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
@@ -170,10 +207,11 @@ def _maybe_log_cutlass_first_context(
         "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
         "expert_num_tokens=%s "
         "problem_sizes1=%s problem_sizes2=%s "
-        "mm1_out=%s mm1_out_post_mm1=%s mm2_out=%s "
-        "mm1_valid_rows=%s mm1_invalid_rows=%s "
+        "mm1_out_post_mm1=%s act_out_post_act=%s "
+        "a2q_post_quant=%s a2q_scale_post_quant=%s "
+        "mm2_out_post_mm2=%s "
         "mm1_post_mm1_valid_rows=%s mm1_post_mm1_invalid_rows=%s "
-        "mm2_valid_rows=%s mm2_invalid_rows=%s",
+        "mm2_post_mm2_valid_rows=%s mm2_post_mm2_invalid_rows=%s",
         use_batched_format,
         per_act_token,
         per_out_ch,
@@ -184,15 +222,15 @@ def _maybe_log_cutlass_first_context(
         _tensor_debug_stats(expert_num_tokens),
         _tensor_debug_stats(problem_sizes1),
         _tensor_debug_stats(problem_sizes2),
-        _tensor_debug_stats(mm1_out),
         mm1_post_mm1,
-        _tensor_debug_stats(mm2_out),
-        mm1_valid,
-        mm1_invalid,
+        act_post,
+        a2q_post,
+        a2q_scale_post,
+        mm2_post,
         mm1_post_mm1_valid,
         mm1_post_mm1_invalid,
-        mm2_valid,
-        mm2_invalid,
+        mm2_post_valid,
+        mm2_post_invalid,
     )
 
 
@@ -424,18 +462,6 @@ def run_cutlass_moe_fp8(
             c_strides1_mm = c_strides1.index_select(0, active_experts)
             c_strides2_mm = c_strides2.index_select(0, active_experts)
 
-        global _PPLX_ZERO_GROUP_FILTER_LOGGED
-        if _pplx_debug_enabled() and not _PPLX_ZERO_GROUP_FILTER_LOGGED:
-            _PPLX_ZERO_GROUP_FILTER_LOGGED = True
-            logger.warning(
-                "PPLX_ZERO_GROUP_FILTER enabled local_E=%d active_experts=%d "
-                "skip_grouped_mm=%s expert_num_tokens=%s",
-                local_E,
-                int(active_experts.numel()),
-                skip_grouped_mm,
-                _tensor_debug_stats(expert_num_tokens),
-            )
-
     if not skip_grouped_mm:
         mm1_per_act_token_override = _mm1_per_act_token_override()
         mm1_per_act_token = (
@@ -457,19 +483,29 @@ def run_cutlass_moe_fp8(
             mm1_per_act_token,
             per_out_ch,
         )
+    trace_post_chain = _pplx_debug_enabled() and not _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED
     mm1_out_post_mm1: torch.Tensor | None = None
-    if _pplx_debug_enabled() and not _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED:
+    if trace_post_chain:
         # mm1_out and quant_out may alias workspace13; preserve a post-mm1 snapshot
         # before subsequent kernels overwrite the workspace for reliable forensics.
         mm1_out_post_mm1 = mm1_out.detach().clone()
 
     apply_moe_activation(activation, act_out, mm1_out)
+    act_out_post_act: torch.Tensor | None = None
+    if trace_post_chain:
+        # act_out and mm2_out may alias workspace2 in batched mode.
+        act_out_post_act = act_out.detach().clone()
 
     a2q, a2q_scale = ops.scaled_fp8_quant(
         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
     )
     # Ensure scale layout is contiguous for CUTLASS scale pointer arithmetic.
     a2q_scale = a2q_scale.contiguous()
+    a2q_post_quant: torch.Tensor | None = None
+    a2q_scale_post_quant: torch.Tensor | None = None
+    if trace_post_chain:
+        a2q_post_quant = a2q.detach().clone()
+        a2q_scale_post_quant = a2q_scale.detach().clone()
 
     if use_batched_format and expert_num_tokens is not None:
         # Clear padded rows; CUTLASS writes only valid tokens per expert.
@@ -490,6 +526,9 @@ def run_cutlass_moe_fp8(
             per_act_token,
             per_out_ch,
         )
+    mm2_out_post_mm2: torch.Tensor | None = None
+    if trace_post_chain:
+        mm2_out_post_mm2 = mm2_out.detach().clone()
     if _pplx_debug_enabled():
         _maybe_log_cutlass_first_context(
             use_batched_format=use_batched_format,
@@ -502,9 +541,11 @@ def run_cutlass_moe_fp8(
             expert_num_tokens=expert_num_tokens,
             problem_sizes1=problem_sizes1_mm,
             problem_sizes2=problem_sizes2_mm,
-            mm1_out=mm1_out,
             mm1_out_post_mm1=mm1_out_post_mm1,
-            mm2_out=mm2_out,
+            act_out_post_act=act_out_post_act,
+            a2q_post_quant=a2q_post_quant,
+            a2q_scale_post_quant=a2q_scale_post_quant,
+            mm2_out_post_mm2=mm2_out_post_mm2,
         )
 
     if use_batched_format:

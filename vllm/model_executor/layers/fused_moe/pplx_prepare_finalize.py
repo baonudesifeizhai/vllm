@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
 import pplx_kernels as pplx
@@ -19,7 +20,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
-_PPLX_COMBINE_FIRST_CONTEXT_LOGGED = False
+_PPLX_COMBINE_FIRST_CONTEXT_LOGGED: set[str] = set()
 
 
 def _pplx_debug_enabled() -> bool:
@@ -52,6 +53,19 @@ def _tensor_abs_max(tensor: torch.Tensor | None) -> float:
     return float(tensor.float().abs().max().item())
 
 
+def _combine_abs_max_threshold() -> float:
+    value = os.getenv("VLLM_CUTLASS_MOE_MM_OUTPUT_ABS_MAX_THRESHOLD")
+    if value is None:
+        return 1e4
+    try:
+        threshold = float(value)
+    except ValueError:
+        return 1e4
+    if threshold > 0.0:
+        return threshold
+    return 1e4
+
+
 def _maybe_log_combine_first_context(
     *,
     stage: str,
@@ -62,36 +76,62 @@ def _maybe_log_combine_first_context(
     topk_weights: torch.Tensor,
     fused_expert_output: torch.Tensor,
     output: torch.Tensor,
+    output_before_recv: torch.Tensor | None = None,
 ) -> None:
     global _PPLX_COMBINE_FIRST_CONTEXT_LOGGED
-    if _PPLX_COMBINE_FIRST_CONTEXT_LOGGED:
+    if stage in _PPLX_COMBINE_FIRST_CONTEXT_LOGGED:
         return
 
+    threshold = _combine_abs_max_threshold()
     fused_abs_max = _tensor_abs_max(fused_expert_output)
     output_abs_max = _tensor_abs_max(output)
+    output_before_abs_max = _tensor_abs_max(output_before_recv)
+    output_delta_stats = "none"
+    output_delta_abs_max = 0.0
+    if (
+        output_before_recv is not None
+        and output_before_recv.shape == output.shape
+        and output_before_recv.dtype == output.dtype
+    ):
+        output_delta = output - output_before_recv
+        output_delta_abs_max = _tensor_abs_max(output_delta)
+        output_delta_stats = _tensor_stats(output_delta)
+
     suspicious = (
         _has_non_finite(fused_expert_output)
         or _has_non_finite(topk_weights)
+        or _has_non_finite(output_before_recv)
         or _has_non_finite(output)
-        or fused_abs_max >= 1e4
-        or output_abs_max >= 1e4
+        or fused_abs_max >= threshold
+        or output_abs_max >= threshold
+        or output_delta_abs_max >= threshold
     )
     if not suspicious:
         return
 
-    _PPLX_COMBINE_FIRST_CONTEXT_LOGGED = True
+    _PPLX_COMBINE_FIRST_CONTEXT_LOGGED.add(stage)
     logger.warning(
         "PPLX_COMBINE_FIRST_CONTEXT layer_id=%s layer_name=%s stage=%s "
+        "abs_max_threshold=%s "
         "apply_router_weight_on_input=%s topk_ids=%s topk_weights=%s "
-        "fused_expert_output=%s output=%s",
+        "fused_expert_output=%s output_before_recv=%s output=%s "
+        "fused_abs_max=%s output_before_abs_max=%s output_abs_max=%s "
+        "output_delta_abs_max=%s output_delta=%s",
         layer_id,
         layer_name,
         stage,
+        threshold,
         apply_router_weight_on_input,
         _tensor_stats(topk_ids),
         _tensor_stats(topk_weights),
         _tensor_stats(fused_expert_output),
+        _tensor_stats(output_before_recv),
         _tensor_stats(output),
+        fused_abs_max,
+        output_before_abs_max,
+        output_abs_max,
+        output_delta_abs_max,
+        output_delta_stats,
     )
 
 
@@ -561,6 +601,9 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         def recv_combine():
             # Ensure send phase completes before recv
             current_stream().synchronize()
+            output_before_recv = (
+                output.detach().clone() if _pplx_debug_enabled() else None
+            )
             self.a2a.combine(
                 out_tokens=output,
                 indices=topk_ids_u32,
@@ -580,6 +623,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
                     topk_weights=topk_weights,
                     fused_expert_output=fused_expert_output,
                     output=output,
+                    output_before_recv=output_before_recv,
                 )
 
         return recv_combine
