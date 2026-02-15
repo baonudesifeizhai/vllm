@@ -97,8 +97,49 @@ void cutlass_group_gemm_caller(
   using ElementD = typename Gemm::ElementD;
 
   int num_experts = static_cast<int>(expert_offsets.size(0));
+  int64_t const out_n = out_tensors.size(1);
 
   auto stream = at::cuda::getCurrentCUDAStream(a_tensors.device().index());
+
+  // Grouped c3x epilogue contracts:
+  // - per_act_token=true expects a_scales laid out as [M, 1] with stride (1, 1)
+  //   because ScaleA uses ColOrScalarBroadcast with fixed row stride 1.
+  // - per_out_ch=true expects b_scales laid out as [E, N] with contiguous
+  //   per-expert slices, because ScaleB uses RowOrScalarBroadcast with fixed
+  //   contiguous row access.
+  if (per_act_token) {
+    TORCH_CHECK(a_scales.dim() == 2,
+                "cutlass_group_gemm_caller: per_act_token requires a_scales "
+                "to be 2D [M,1], got dim=",
+                a_scales.dim());
+    TORCH_CHECK(a_scales.size(1) == 1,
+                "cutlass_group_gemm_caller: per_act_token requires a_scales "
+                "shape [M,1], got ",
+                a_scales.sizes());
+    TORCH_CHECK(a_scales.stride(0) == 1 && a_scales.stride(1) == 1,
+                "cutlass_group_gemm_caller: per_act_token requires a_scales "
+                "stride=(1,1), got stride=(",
+                a_scales.stride(0), ",", a_scales.stride(1), ")");
+  }
+
+  if (per_out_ch) {
+    TORCH_CHECK(b_scales.dim() == 2,
+                "cutlass_group_gemm_caller: per_out_ch requires b_scales "
+                "to be 2D [E,N], got dim=",
+                b_scales.dim());
+    TORCH_CHECK(b_scales.size(0) == num_experts,
+                "cutlass_group_gemm_caller: per_out_ch requires "
+                "b_scales.size(0)==num_experts, got ",
+                b_scales.size(0), " vs ", num_experts);
+    TORCH_CHECK(b_scales.size(1) == out_n,
+                "cutlass_group_gemm_caller: per_out_ch requires "
+                "b_scales.size(1)==N, got ",
+                b_scales.size(1), " vs ", out_n);
+    TORCH_CHECK(b_scales.stride(1) == 1 && b_scales.stride(0) == out_n,
+                "cutlass_group_gemm_caller: per_out_ch requires contiguous "
+                "b_scales [E,N], got stride=(",
+                b_scales.stride(0), ",", b_scales.stride(1), ")");
+  }
 
   auto options_int =
       torch::TensorOptions().dtype(torch::kInt64).device(a_tensors.device());
