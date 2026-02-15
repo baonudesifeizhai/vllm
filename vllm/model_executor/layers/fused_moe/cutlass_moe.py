@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUTLASS based Fused MoE kernels."""
 
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -46,6 +48,44 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
+
+_PPLX_MM1_GUARD_CALLS = 0
+_PPLX_MM1_GUARD_LOGGED = False
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _tensor_snapshot(t: torch.Tensor) -> str:
+    return (
+        f"shape={tuple(t.shape)} stride={tuple(t.stride())} dtype={t.dtype} "
+        f"min={t.min().item():.6g} max={t.max().item():.6g} "
+        f"mean={t.float().mean().item():.6g}"
+    )
 
 
 def run_cutlass_moe_fp8(
@@ -226,6 +266,45 @@ def run_cutlass_moe_fp8(
         per_act_token,
         per_out_ch,
     )
+
+    # Optional targeted guard for PPLX batched CUTLASS mm1 path.
+    # This helps catch "finite but wrong" explosions that pass shape/stride checks.
+    if use_batched_format and _env_flag("VLLM_PPLX_MM1_GUARD", default=False):
+        global _PPLX_MM1_GUARD_CALLS, _PPLX_MM1_GUARD_LOGGED
+        _PPLX_MM1_GUARD_CALLS += 1
+        interval = max(1, _env_int("VLLM_PPLX_MM1_GUARD_INTERVAL", 1))
+        if _PPLX_MM1_GUARD_CALLS % interval == 0:
+            abs_max = mm1_out.abs().amax().item()
+            finite = bool(torch.isfinite(mm1_out).all().item())
+            threshold = _env_float("VLLM_PPLX_MM1_GUARD_ABS_MAX_THRESHOLD", 1e6)
+            bad = (not finite) or abs_max > threshold
+            if bad:
+                if not _PPLX_MM1_GUARD_LOGGED:
+                    _PPLX_MM1_GUARD_LOGGED = True
+                    logger.error(
+                        "PPLX_MM1_GUARD_HIT call=%d finite=%s abs_max=%.6g "
+                        "threshold=%.6g per_act_token=%s per_out_ch=%s "
+                        "a1q=%s a1q_scale=%s w1_scale=%s mm1_out=%s "
+                        "expert_num_tokens=%s problem_sizes1=%s",
+                        _PPLX_MM1_GUARD_CALLS,
+                        finite,
+                        abs_max,
+                        threshold,
+                        per_act_token,
+                        per_out_ch,
+                        _tensor_snapshot(a1q),
+                        _tensor_snapshot(a1q_scale),
+                        _tensor_snapshot(w1_scale),
+                        _tensor_snapshot(mm1_out),
+                        _tensor_snapshot(expert_num_tokens),
+                        _tensor_snapshot(problem_sizes1),
+                    )
+                if _env_flag("VLLM_PPLX_MM1_GUARD_FAIL", default=True):
+                    raise RuntimeError(
+                        "PPLX mm1 guard triggered "
+                        f"(finite={finite}, abs_max={abs_max:.6g}, "
+                        f"threshold={threshold:.6g})"
+                    )
 
     apply_moe_activation(activation, act_out, mm1_out)
 
