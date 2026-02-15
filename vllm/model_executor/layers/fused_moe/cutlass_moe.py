@@ -123,6 +123,7 @@ def _maybe_log_cutlass_first_context(
     problem_sizes1: torch.Tensor,
     problem_sizes2: torch.Tensor,
     mm1_out: torch.Tensor,
+    mm1_out_post_mm1: torch.Tensor | None,
     mm2_out: torch.Tensor,
 ) -> None:
     global _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED
@@ -141,14 +142,27 @@ def _maybe_log_cutlass_first_context(
     valid_mask = None
     mm1_valid = "none"
     mm1_invalid = "none"
+    mm1_post_mm1 = "none"
+    mm1_post_mm1_valid = "none"
+    mm1_post_mm1_invalid = "none"
     mm2_valid = "none"
     mm2_invalid = "none"
     if use_batched_format and expert_num_tokens is not None:
         valid_mask = _batched_valid_row_mask(mm1_out.size(0), expert_num_tokens)
         mm1_valid = _tensor_row_subset_debug_stats(mm1_out, valid_mask, invert=False)
         mm1_invalid = _tensor_row_subset_debug_stats(mm1_out, valid_mask, invert=True)
+        if mm1_out_post_mm1 is not None:
+            mm1_post_mm1 = _tensor_debug_stats(mm1_out_post_mm1)
+            mm1_post_mm1_valid = _tensor_row_subset_debug_stats(
+                mm1_out_post_mm1, valid_mask, invert=False
+            )
+            mm1_post_mm1_invalid = _tensor_row_subset_debug_stats(
+                mm1_out_post_mm1, valid_mask, invert=True
+            )
         mm2_valid = _tensor_row_subset_debug_stats(mm2_out, valid_mask, invert=False)
         mm2_invalid = _tensor_row_subset_debug_stats(mm2_out, valid_mask, invert=True)
+    elif mm1_out_post_mm1 is not None:
+        mm1_post_mm1 = _tensor_debug_stats(mm1_out_post_mm1)
 
     logger.warning(
         "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
@@ -156,8 +170,9 @@ def _maybe_log_cutlass_first_context(
         "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
         "expert_num_tokens=%s "
         "problem_sizes1=%s problem_sizes2=%s "
-        "mm1_out=%s mm2_out=%s "
+        "mm1_out=%s mm1_out_post_mm1=%s mm2_out=%s "
         "mm1_valid_rows=%s mm1_invalid_rows=%s "
+        "mm1_post_mm1_valid_rows=%s mm1_post_mm1_invalid_rows=%s "
         "mm2_valid_rows=%s mm2_invalid_rows=%s",
         use_batched_format,
         per_act_token,
@@ -170,9 +185,12 @@ def _maybe_log_cutlass_first_context(
         _tensor_debug_stats(problem_sizes1),
         _tensor_debug_stats(problem_sizes2),
         _tensor_debug_stats(mm1_out),
+        mm1_post_mm1,
         _tensor_debug_stats(mm2_out),
         mm1_valid,
         mm1_invalid,
+        mm1_post_mm1_valid,
+        mm1_post_mm1_invalid,
         mm2_valid,
         mm2_invalid,
     )
@@ -439,6 +457,11 @@ def run_cutlass_moe_fp8(
             mm1_per_act_token,
             per_out_ch,
         )
+    mm1_out_post_mm1: torch.Tensor | None = None
+    if _pplx_debug_enabled() and not _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED:
+        # mm1_out and quant_out may alias workspace13; preserve a post-mm1 snapshot
+        # before subsequent kernels overwrite the workspace for reliable forensics.
+        mm1_out_post_mm1 = mm1_out.detach().clone()
 
     apply_moe_activation(activation, act_out, mm1_out)
 
@@ -480,6 +503,7 @@ def run_cutlass_moe_fp8(
             problem_sizes1=problem_sizes1_mm,
             problem_sizes2=problem_sizes2_mm,
             mm1_out=mm1_out,
+            mm1_out_post_mm1=mm1_out_post_mm1,
             mm2_out=mm2_out,
         )
 
