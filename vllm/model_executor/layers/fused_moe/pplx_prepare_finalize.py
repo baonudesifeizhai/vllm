@@ -97,6 +97,10 @@ def _maybe_log_combine_first_context(
         output_delta_abs_max = _tensor_abs_max(output_delta)
         output_delta_stats = _tensor_stats(output_delta)
 
+    # Skip all-zero warmup contexts; keep first meaningful or suspicious context.
+    likely_warmup = (
+        fused_abs_max == 0.0 and output_abs_max == 0.0 and output_delta_abs_max == 0.0
+    )
     suspicious = (
         _has_non_finite(fused_expert_output)
         or _has_non_finite(topk_weights)
@@ -106,6 +110,8 @@ def _maybe_log_combine_first_context(
         or output_abs_max >= threshold
         or output_delta_abs_max >= threshold
     )
+    if likely_warmup and not suspicious:
+        return
 
     _PPLX_COMBINE_FIRST_CONTEXT_LOGGED.add(stage)
     logger.warning(

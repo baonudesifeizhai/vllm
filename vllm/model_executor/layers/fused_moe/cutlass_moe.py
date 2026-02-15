@@ -143,6 +143,7 @@ def _maybe_log_cutlass_first_context(
         if mm2_source is not None and mm2_source.numel()
         else 0.0
     )
+    a1q_abs_max = float(a1q.float().abs().max().item()) if a1q.numel() else 0.0
     has_non_finite = (
         _has_non_finite(mm1_source)
         or _has_non_finite(act_out_post_act)
@@ -150,6 +151,10 @@ def _maybe_log_cutlass_first_context(
         or _has_non_finite(a2q_scale_post_quant)
         or _has_non_finite(mm2_source)
     )
+    # Skip all-zero warmup contexts; keep first meaningful or suspicious context.
+    likely_warmup = a1q_abs_max == 0.0 and mm1_abs_max == 0.0 and mm2_abs_max == 0.0
+    if likely_warmup and not has_non_finite:
+        return
     # Heuristic threshold. This remains a debug signal in the log payload.
     suspicious = has_non_finite or mm1_abs_max >= 1e4 or mm2_abs_max >= 1e4
 
