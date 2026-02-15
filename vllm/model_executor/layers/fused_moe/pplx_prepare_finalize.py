@@ -53,6 +53,13 @@ def _tensor_abs_max(tensor: torch.Tensor | None) -> float:
     return float(tensor.float().abs().max().item())
 
 
+def _row_nonzero_count(tensor: torch.Tensor | None) -> int:
+    if tensor is None or tensor.numel() == 0 or tensor.ndim != 2:
+        return 0
+    row_abs_max = tensor.float().abs().amax(dim=1)
+    return int((row_abs_max > 0).sum().item())
+
+
 def _combine_abs_max_threshold() -> float:
     value = os.getenv("VLLM_CUTLASS_MOE_MM_OUTPUT_ABS_MAX_THRESHOLD")
     if value is None:
@@ -96,8 +103,14 @@ def _maybe_log_combine_first_context(
         output_delta = output - output_before_recv
         output_delta_abs_max = _tensor_abs_max(output_delta)
         output_delta_stats = _tensor_stats(output_delta)
+    else:
+        output_delta = None
 
-    # Skip all-zero warmup contexts; keep first meaningful or suspicious context.
+    output_rows_nonzero = _row_nonzero_count(output)
+    output_delta_rows_nonzero = _row_nonzero_count(output_delta)
+    num_tokens = int(output.size(0)) if output.ndim >= 1 else 0
+
+    # Skip all-zero warmup/tiny contexts; keep first meaningful or suspicious context.
     likely_warmup = (
         fused_abs_max == 0.0 and output_abs_max == 0.0 and output_delta_abs_max == 0.0
     )
@@ -110,22 +123,34 @@ def _maybe_log_combine_first_context(
         or output_abs_max >= threshold
         or output_delta_abs_max >= threshold
     )
-    if likely_warmup and not suspicious:
+    # Chain-level anomaly: recv phase made no observable row updates despite
+    # non-zero expert output on a non-trivial token batch.
+    silent_noop = (
+        stage == "after_recv"
+        and num_tokens >= 32
+        and fused_abs_max > 1e-6
+        and output_delta_rows_nonzero == 0
+    )
+    suspicious = suspicious or silent_noop
+    if (likely_warmup or num_tokens < 32) and not suspicious:
         return
 
     _PPLX_COMBINE_FIRST_CONTEXT_LOGGED.add(stage)
     logger.warning(
         "PPLX_COMBINE_FIRST_CONTEXT layer_id=%s layer_name=%s stage=%s "
-        "abs_max_threshold=%s suspicious=%s "
+        "abs_max_threshold=%s suspicious=%s silent_noop=%s num_tokens=%s "
         "apply_router_weight_on_input=%s topk_ids=%s topk_weights=%s "
         "fused_expert_output=%s output_before_recv=%s output=%s "
         "fused_abs_max=%s output_before_abs_max=%s output_abs_max=%s "
+        "output_rows_nonzero=%s output_delta_rows_nonzero=%s "
         "output_delta_abs_max=%s output_delta=%s",
         layer_id,
         layer_name,
         stage,
         threshold,
         suspicious,
+        silent_noop,
+        num_tokens,
         apply_router_weight_on_input,
         _tensor_stats(topk_ids),
         _tensor_stats(topk_weights),
@@ -135,6 +160,8 @@ def _maybe_log_combine_first_context(
         fused_abs_max,
         output_before_abs_max,
         output_abs_max,
+        output_rows_nonzero,
+        output_delta_rows_nonzero,
         output_delta_abs_max,
         output_delta_stats,
     )

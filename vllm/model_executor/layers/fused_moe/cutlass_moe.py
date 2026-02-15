@@ -144,6 +144,15 @@ def _maybe_log_cutlass_first_context(
         else 0.0
     )
     a1q_abs_max = float(a1q.float().abs().max().item()) if a1q.numel() else 0.0
+    valid_token_rows = (
+        int(expert_num_tokens.to(dtype=torch.int64).sum().item())
+        if use_batched_format
+        and expert_num_tokens is not None
+        and expert_num_tokens.numel()
+        else int(mm1_source.size(0))
+        if mm1_source is not None
+        else 0
+    )
     has_non_finite = (
         _has_non_finite(mm1_source)
         or _has_non_finite(act_out_post_act)
@@ -151,12 +160,12 @@ def _maybe_log_cutlass_first_context(
         or _has_non_finite(a2q_scale_post_quant)
         or _has_non_finite(mm2_source)
     )
-    # Skip all-zero warmup contexts; keep first meaningful or suspicious context.
+    # Skip warmup/tiny contexts; keep first meaningful or suspicious context.
     likely_warmup = a1q_abs_max == 0.0 and mm1_abs_max == 0.0 and mm2_abs_max == 0.0
-    if likely_warmup and not has_non_finite:
-        return
     # Heuristic threshold. This remains a debug signal in the log payload.
     suspicious = has_non_finite or mm1_abs_max >= 1e4 or mm2_abs_max >= 1e4
+    if (likely_warmup or valid_token_rows < 32) and not suspicious:
+        return
 
     _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = True
     valid_mask = None
@@ -207,7 +216,7 @@ def _maybe_log_cutlass_first_context(
     logger.warning(
         "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
         "per_act_token=%s per_out_ch=%s "
-        "suspicious=%s mm1_abs_max=%s mm2_abs_max=%s "
+        "suspicious=%s valid_token_rows=%s mm1_abs_max=%s mm2_abs_max=%s "
         "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
         "expert_num_tokens=%s "
         "problem_sizes1=%s problem_sizes2=%s "
@@ -220,6 +229,7 @@ def _maybe_log_cutlass_first_context(
         per_act_token,
         per_out_ch,
         suspicious,
+        valid_token_rows,
         mm1_abs_max,
         mm2_abs_max,
         _tensor_debug_stats(a1q),
