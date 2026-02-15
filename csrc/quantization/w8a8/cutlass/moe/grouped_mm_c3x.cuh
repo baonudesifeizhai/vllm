@@ -32,6 +32,17 @@ inline bool assert_grouped_mm_output_finite_enabled() {
   return env != nullptr && std::atoi(env) != 0;
 }
 
+inline double grouped_mm_output_abs_max_threshold() {
+  // Debug-only threshold for catching numerically exploded outputs early.
+  // If unset or invalid, use conservative default.
+  auto* env = std::getenv("VLLM_CUTLASS_MOE_MM_OUTPUT_ABS_MAX_THRESHOLD");
+  if (env == nullptr) {
+    return 1e6;
+  }
+  double const threshold = std::atof(env);
+  return threshold > 0.0 ? threshold : 1e6;
+}
+
 inline void maybe_log_row_reload_config(bool force_row_reload,
                                         bool per_act_token, bool per_out_ch) {
   if (!grouped_moe_pplx_debug_enabled()) {
@@ -255,11 +266,17 @@ void cutlass_group_gemm_caller(
   CUTLASS_CHECK(status);
 
   if (assert_grouped_mm_output_finite_enabled()) {
+    double const abs_max_threshold = grouped_mm_output_abs_max_threshold();
     bool const all_finite = torch::isfinite(out_tensors).all().item<bool>();
-    TORCH_CHECK(all_finite,
-                "PPLX_GROUPED_MM_NONFINITE "
-                "swap_ab=",
-                swap_ab, " per_act_token=", per_act_token,
+    double const abs_max =
+        out_tensors.abs().to(torch::kFloat).max().item<double>();
+    bool const abs_max_ok = abs_max <= abs_max_threshold;
+    TORCH_CHECK(all_finite && abs_max_ok,
+                "PPLX_GROUPED_MM_BAD_OUTPUT "
+                "reason_nonfinite=",
+                !all_finite, " reason_absmax=", !abs_max_ok,
+                " abs_max=", abs_max, " abs_max_threshold=", abs_max_threshold,
+                " swap_ab=", swap_ab, " per_act_token=", per_act_token,
                 " per_out_ch=", per_out_ch, " out_shape=(", out_tensors.size(0),
                 ",", out_tensors.size(1), ")", " a_shape=(", a_tensors.size(0),
                 ",", a_tensors.size(1), ")", " b_shape=(", b_tensors.size(0),
