@@ -150,10 +150,8 @@ def _maybe_log_cutlass_first_context(
         or _has_non_finite(a2q_scale_post_quant)
         or _has_non_finite(mm2_source)
     )
-    # Heuristic threshold. This is a debug aid only.
+    # Heuristic threshold. This remains a debug signal in the log payload.
     suspicious = has_non_finite or mm1_abs_max >= 1e4 or mm2_abs_max >= 1e4
-    if not suspicious:
-        return
 
     _PPLX_CUTLASS_FIRST_CONTEXT_LOGGED = True
     valid_mask = None
@@ -204,6 +202,7 @@ def _maybe_log_cutlass_first_context(
     logger.warning(
         "PPLX_CUTLASS_FIRST_CONTEXT use_batched_format=%s "
         "per_act_token=%s per_out_ch=%s "
+        "suspicious=%s mm1_abs_max=%s mm2_abs_max=%s "
         "a1q=%s a1q_scale=%s w1_scale=%s w2_scale=%s "
         "expert_num_tokens=%s "
         "problem_sizes1=%s problem_sizes2=%s "
@@ -215,6 +214,9 @@ def _maybe_log_cutlass_first_context(
         use_batched_format,
         per_act_token,
         per_out_ch,
+        suspicious,
+        mm1_abs_max,
+        mm2_abs_max,
         _tensor_debug_stats(a1q),
         _tensor_debug_stats(a1q_scale),
         _tensor_debug_stats(w1_scale),

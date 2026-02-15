@@ -106,13 +106,11 @@ def _maybe_log_combine_first_context(
         or output_abs_max >= threshold
         or output_delta_abs_max >= threshold
     )
-    if not suspicious:
-        return
 
     _PPLX_COMBINE_FIRST_CONTEXT_LOGGED.add(stage)
     logger.warning(
         "PPLX_COMBINE_FIRST_CONTEXT layer_id=%s layer_name=%s stage=%s "
-        "abs_max_threshold=%s "
+        "abs_max_threshold=%s suspicious=%s "
         "apply_router_weight_on_input=%s topk_ids=%s topk_weights=%s "
         "fused_expert_output=%s output_before_recv=%s output=%s "
         "fused_abs_max=%s output_before_abs_max=%s output_abs_max=%s "
@@ -121,6 +119,7 @@ def _maybe_log_combine_first_context(
         layer_name,
         stage,
         threshold,
+        suspicious,
         apply_router_weight_on_input,
         _tensor_stats(topk_ids),
         _tensor_stats(topk_weights),
