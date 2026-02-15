@@ -27,6 +27,11 @@ inline bool force_row_scale_reload_each_loop() {
   return env != nullptr && std::atoi(env) != 0;
 }
 
+inline bool assert_grouped_mm_output_finite_enabled() {
+  auto* env = std::getenv("VLLM_CUTLASS_MOE_ASSERT_MM_OUTPUT_FINITE");
+  return env != nullptr && std::atoi(env) != 0;
+}
+
 inline void maybe_log_row_reload_config(bool force_row_reload,
                                         bool per_act_token, bool per_out_ch) {
   if (!grouped_moe_pplx_debug_enabled()) {
@@ -248,6 +253,20 @@ void cutlass_group_gemm_caller(
 
   cutlass::Status status = gemm_op.run(args, workspace.data_ptr(), stream);
   CUTLASS_CHECK(status);
+
+  if (assert_grouped_mm_output_finite_enabled()) {
+    bool const all_finite = torch::isfinite(out_tensors).all().item<bool>();
+    TORCH_CHECK(all_finite,
+                "PPLX_GROUPED_MM_NONFINITE "
+                "swap_ab=",
+                swap_ab, " per_act_token=", per_act_token,
+                " per_out_ch=", per_out_ch, " out_shape=(", out_tensors.size(0),
+                ",", out_tensors.size(1), ")", " a_shape=(", a_tensors.size(0),
+                ",", a_tensors.size(1), ")", " b_shape=(", b_tensors.size(0),
+                ",", b_tensors.size(1), ",", b_tensors.size(2), ")",
+                " a_scales_numel=", a_scales.numel(),
+                " b_scales_numel=", b_scales.numel(), " experts=", num_experts);
+  }
 }
 
 }  // namespace
