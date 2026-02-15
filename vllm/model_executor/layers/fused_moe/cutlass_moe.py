@@ -81,10 +81,11 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _tensor_snapshot(t: torch.Tensor) -> str:
+    tf = t.float()
     return (
         f"shape={tuple(t.shape)} stride={tuple(t.stride())} dtype={t.dtype} "
-        f"min={t.min().item():.6g} max={t.max().item():.6g} "
-        f"mean={t.float().mean().item():.6g}"
+        f"min={tf.min().item():.6g} max={tf.max().item():.6g} "
+        f"mean={tf.mean().item():.6g}"
     )
 
 
