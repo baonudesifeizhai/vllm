@@ -109,8 +109,9 @@ def _batched_valid_stats(
             continue
         valid_rows += rows
         cur = x_b[e, :rows, :]
-        finite = finite and bool(torch.isfinite(cur).all().item())
-        cur_abs_max = float(cur.abs().amax().item())
+        curf = cur.float()
+        finite = finite and bool(torch.isfinite(curf).all().item())
+        cur_abs_max = float(curf.abs().amax().item())
         abs_max = max(abs_max, cur_abs_max)
     return finite, abs_max, valid_rows
 
@@ -157,19 +158,20 @@ def _batched_first_anomaly(
         if rows <= 0:
             continue
         cur = x_b[e, :rows, :]
-        nonfinite = ~torch.isfinite(cur)
+        curf = cur.float()
+        nonfinite = ~torch.isfinite(curf)
         if bool(nonfinite.any().item()):
             idx = nonfinite.nonzero(as_tuple=False)[0]
             r = int(idx[0].item())
             c = int(idx[1].item())
-            return ("nonfinite", e, r, c, float(cur[r, c].float().item()))
+            return ("nonfinite", e, r, c, float(curf[r, c].item()))
         if abs_threshold > 0:
-            over = cur.abs() > abs_threshold
+            over = curf.abs() > abs_threshold
             if bool(over.any().item()):
                 idx = over.nonzero(as_tuple=False)[0]
                 r = int(idx[0].item())
                 c = int(idx[1].item())
-                return ("abs_over", e, r, c, float(cur[r, c].float().item()))
+                return ("abs_over", e, r, c, float(curf[r, c].item()))
     return None
 
 
