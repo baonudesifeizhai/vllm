@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
 import pplx_kernels as pplx
@@ -18,6 +19,48 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.utils.math_utils import cdiv, round_up
 
 logger = init_logger(__name__)
+_PPLX_COMBINE_GUARD_CALLS = 0
+_PPLX_COMBINE_GUARD_LOGGED = False
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "off", "no")
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _tensor_snapshot(t: torch.Tensor) -> str:
+    if t.numel() == 0:
+        return (
+            f"shape={tuple(t.shape)} stride={tuple(t.stride())} dtype={t.dtype} numel=0"
+        )
+    tf = t.float()
+    return (
+        f"shape={tuple(t.shape)} stride={tuple(t.stride())} dtype={t.dtype} "
+        f"min={tf.min().item():.6g} max={tf.max().item():.6g} "
+        f"mean={tf.mean().item():.6g}"
+    )
 
 
 def pplx_hidden_dim_scale_bytes(
@@ -310,6 +353,7 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
         assert isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate), (
             "Weight application and reduction happens in the combine kernel."
         )
+        global _PPLX_COMBINE_GUARD_CALLS, _PPLX_COMBINE_GUARD_LOGGED
 
         # This argument is optional
         # There's not much point setting this unless it is != topk_ids.size(0)
@@ -332,6 +376,51 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             topk_weights = torch.ones_like(topk_weights)
 
         topk_ids_u32 = topk_ids.view(dtype=torch.uint32)
+        combine_guard_enabled = _env_flag("VLLM_PPLX_COMBINE_GUARD", default=False)
+        combine_guard_interval = max(
+            1, _env_int("VLLM_PPLX_COMBINE_GUARD_INTERVAL", 32)
+        )
+        combine_guard_fail = _env_flag("VLLM_PPLX_COMBINE_GUARD_FAIL", default=True)
+        combine_guard_threshold = _env_float(
+            "VLLM_PPLX_COMBINE_GUARD_ABS_MAX_THRESHOLD", 1e6
+        )
+        run_guard_this_call = False
+
+        if combine_guard_enabled:
+            _PPLX_COMBINE_GUARD_CALLS += 1
+            run_guard_this_call = (
+                _PPLX_COMBINE_GUARD_CALLS % combine_guard_interval == 0
+            )
+            if run_guard_this_call:
+                finite_in = bool(torch.isfinite(fused_expert_output).all().item())
+                abs_max_in = (
+                    float(fused_expert_output.abs().amax().item())
+                    if fused_expert_output.numel() > 0
+                    else 0.0
+                )
+                bad_in = (not finite_in) or (abs_max_in > combine_guard_threshold)
+                if bad_in:
+                    if not _PPLX_COMBINE_GUARD_LOGGED:
+                        _PPLX_COMBINE_GUARD_LOGGED = True
+                        logger.error(
+                            "PPLX_COMBINE_GUARD_PRE_HIT call=%d finite=%s "
+                            "abs_max=%.6g threshold=%.6g output=%s "
+                            "fused_expert_output=%s topk_ids=%s topk_weights=%s",
+                            _PPLX_COMBINE_GUARD_CALLS,
+                            finite_in,
+                            abs_max_in,
+                            combine_guard_threshold,
+                            _tensor_snapshot(output),
+                            _tensor_snapshot(fused_expert_output),
+                            _tensor_snapshot(topk_ids),
+                            _tensor_snapshot(topk_weights),
+                        )
+                    if combine_guard_fail:
+                        raise RuntimeError(
+                            "PPLX combine pre-guard triggered "
+                            f"(finite={finite_in}, abs_max={abs_max_in:.6g}, "
+                            f"threshold={combine_guard_threshold:.6g})"
+                        )
 
         self.a2a.combine(
             out_tokens=output,
@@ -343,15 +432,48 @@ class PplxPrepareAndFinalize(mk.FusedMoEPrepareAndFinalize):
             do_recv=False,
         )
 
-        return lambda: self.a2a.combine(
-            out_tokens=output,
-            indices=topk_ids_u32,
-            weights=topk_weights,
-            expert_y=fused_expert_output,
-            bound_m=bound_m,
-            do_send=False,
-            do_recv=True,
-        )
+        def receiver() -> None:
+            self.a2a.combine(
+                out_tokens=output,
+                indices=topk_ids_u32,
+                weights=topk_weights,
+                expert_y=fused_expert_output,
+                bound_m=bound_m,
+                do_send=False,
+                do_recv=True,
+            )
+
+            if run_guard_this_call:
+                finite_out = bool(torch.isfinite(output).all().item())
+                abs_max_out = (
+                    float(output.abs().amax().item()) if output.numel() > 0 else 0.0
+                )
+                bad_out = (not finite_out) or (abs_max_out > combine_guard_threshold)
+                if bad_out:
+                    global _PPLX_COMBINE_GUARD_LOGGED
+                    if not _PPLX_COMBINE_GUARD_LOGGED:
+                        _PPLX_COMBINE_GUARD_LOGGED = True
+                        logger.error(
+                            "PPLX_COMBINE_GUARD_POST_HIT call=%d finite=%s "
+                            "abs_max=%.6g threshold=%.6g output=%s "
+                            "fused_expert_output=%s topk_ids=%s topk_weights=%s",
+                            _PPLX_COMBINE_GUARD_CALLS,
+                            finite_out,
+                            abs_max_out,
+                            combine_guard_threshold,
+                            _tensor_snapshot(output),
+                            _tensor_snapshot(fused_expert_output),
+                            _tensor_snapshot(topk_ids),
+                            _tensor_snapshot(topk_weights),
+                        )
+                    if combine_guard_fail:
+                        raise RuntimeError(
+                            "PPLX combine post-guard triggered "
+                            f"(finite={finite_out}, abs_max={abs_max_out:.6g}, "
+                            f"threshold={combine_guard_threshold:.6g})"
+                        )
+
+        return receiver
 
     def finalize(
         self,
