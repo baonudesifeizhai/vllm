@@ -123,22 +123,35 @@ void cutlass_group_gemm_caller(
   }
 
   if (per_out_ch) {
-    TORCH_CHECK(b_scales.dim() == 2,
-                "cutlass_group_gemm_caller: per_out_ch requires b_scales "
-                "to be 2D [E,N], got dim=",
-                b_scales.dim());
+    TORCH_CHECK(
+        b_scales.dim() >= 2,
+        "cutlass_group_gemm_caller: per_out_ch requires b_scales with dim>=2, "
+        "got dim=",
+        b_scales.dim());
     TORCH_CHECK(b_scales.size(0) == num_experts,
                 "cutlass_group_gemm_caller: per_out_ch requires "
                 "b_scales.size(0)==num_experts, got ",
                 b_scales.size(0), " vs ", num_experts);
-    TORCH_CHECK(b_scales.size(1) == out_n,
-                "cutlass_group_gemm_caller: per_out_ch requires "
-                "b_scales.size(1)==N, got ",
-                b_scales.size(1), " vs ", out_n);
-    TORCH_CHECK(b_scales.stride(1) == 1 && b_scales.stride(0) == out_n,
-                "cutlass_group_gemm_caller: per_out_ch requires contiguous "
-                "b_scales [E,N], got stride=(",
-                b_scales.stride(0), ",", b_scales.stride(1), ")");
+    TORCH_CHECK(
+        b_scales.is_contiguous(),
+        "cutlass_group_gemm_caller: per_out_ch requires contiguous b_scales, "
+        "got shape=",
+        b_scales.sizes(), " stride=", b_scales.strides());
+
+    // Pointer math in get_group_gemm_starts uses:
+    //   b_scales_ptr[e] = base + e * N
+    // So each expert must occupy exactly N scale elements in memory.
+    TORCH_CHECK(
+        b_scales.numel() % num_experts == 0,
+        "cutlass_group_gemm_caller: per_out_ch requires b_scales.numel() "
+        "divisible by num_experts, got numel=",
+        b_scales.numel(), " num_experts=", num_experts);
+    int64_t const per_expert_elems = b_scales.numel() / num_experts;
+    TORCH_CHECK(
+        per_expert_elems == out_n,
+        "cutlass_group_gemm_caller: per_out_ch requires exactly N scale elems "
+        "per expert (supports [E,N] or [E,1,N]), got per_expert_elems=",
+        per_expert_elems, " N=", out_n, " shape=", b_scales.sizes());
   }
 
   auto options_int =
