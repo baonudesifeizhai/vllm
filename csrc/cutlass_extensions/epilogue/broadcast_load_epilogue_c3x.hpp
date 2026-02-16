@@ -163,7 +163,6 @@ struct Sm90RowOrScalarBroadcast {
       , tSR_rRow(tSR_rRow_)
       , tCcRow(tCcRow_)
       , residue_tCcRow(residue_tCcRow_)
-      , last_epi_n(-1)
       , params(params_) {}
 
     GS_GTensor tGS_gRow;                                                         // (CPY,CPY_M,CPY_N)
@@ -177,31 +176,25 @@ struct Sm90RowOrScalarBroadcast {
     CTensor tCcRow;                                                              // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
     ThrResidue residue_tCcRow;                                                   // (m, n)
     ThrNum thr_num;
-    int last_epi_n;
     Params const& params;
 
     CUTLASS_DEVICE void
     begin() {
-      last_epi_n = -1;
       if (!params.row_broadcast) {
         fill(tSR_rRow, *(params.ptr_row));
         return;
       }
 
       auto synchronize = [&] () { cutlass::arch::NamedBarrier::sync(thr_num, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier); };
-      Tensor tGS_gRow_flt = filter_zeros(tGS_gRow);
-      Tensor tGS_sRow_flt = filter_zeros(tGS_sRow);
-      Tensor tGS_cRow_flt = make_tensor(tGS_cRow.data(), make_layout(tGS_gRow_flt.shape(), tGS_cRow.stride()));
-
-      for (int i = 0; i < size(tGS_gRow_flt); ++i) {
-        if (get<1>(tGS_cRow_flt(i)) >= size<1>(CtaTileShapeMNK{})) {
+      for (int i = 0; i < size(tGS_gRow); ++i) {
+        if (get<1>(tGS_cRow(i)) >= size<1>(CtaTileShapeMNK{})) {
           continue; // OOB of SMEM, 
         }
-        if (elem_less(tGS_cRow_flt(i), make_coord(get<0>(residue_tCcRow), get<1>(residue_tCcRow)))) {
-          tGS_sRow_flt(i) = tGS_gRow_flt(i);
+        if (elem_less(tGS_cRow(i), make_coord(get<0>(residue_tCcRow), get<1>(residue_tCcRow)))) {
+          tGS_sRow(i) = tGS_gRow(i);
         }
         else {
-          tGS_sRow_flt(i) = Element(0); // Set to Zero when OOB so LDS could be issue without any preds.
+          tGS_sRow(i) = Element(0); // Set to Zero when OOB so LDS could be issue without any preds.
         }
       }
       synchronize();
@@ -209,12 +202,11 @@ struct Sm90RowOrScalarBroadcast {
 
     CUTLASS_DEVICE void
     begin_loop(int epi_m, int epi_n) {
-      if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
-      if (epi_n != last_epi_n) {
+      if (epi_m == 0) { // Assumes M-major subtile loop
+        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
         Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_,_,_,epi_m,epi_n));
         Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
         copy(tSR_sRow_flt, tSR_rRow_flt);
-        last_epi_n = epi_n;
       }
     }
 
