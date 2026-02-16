@@ -432,7 +432,7 @@ def _batched_mm2_ref_max_error(
     per_act_token: bool,
     max_experts: int,
     max_rows_per_expert: int,
-) -> tuple[bool, str, float, float, int, int]:
+) -> tuple[bool, str, float, float, int, int, str]:
     a2q_b = a2q.reshape(local_E, padded_M, a2q.size(-1))
     a2s_b = a2q_scale.reshape(local_E, padded_M, a2q_scale.size(-1))
     out_b = mm2_out.reshape(local_E, padded_M, mm2_out.size(-1))
@@ -441,6 +441,7 @@ def _batched_mm2_ref_max_error(
     max_rel_err = 0.0
     experts_checked = 0
     rows_checked = 0
+    detail = "n/a"
 
     for e in range(local_E):
         rows = int(expert_num_tokens[e].item())
@@ -471,6 +472,7 @@ def _batched_mm2_ref_max_error(
                 0.0,
                 experts_checked,
                 rows_checked,
+                "",
             )
 
         # Apply A scales.
@@ -483,6 +485,7 @@ def _batched_mm2_ref_max_error(
                 0.0,
                 experts_checked,
                 rows_checked,
+                "",
             )
         acc = acc * a_sc if per_act_token else acc * a_sc[0:1, :]
 
@@ -494,7 +497,23 @@ def _batched_mm2_ref_max_error(
         max_abs_err = max(max_abs_err, abs_err)
         max_rel_err = max(max_rel_err, rel_err)
 
-    return True, "", max_abs_err, max_rel_err, experts_checked, rows_checked
+        if abs_err >= max_abs_err:
+            idx = int(diff.reshape(-1).argmax().item())
+            cols = diff.size(1)
+            r = idx // cols
+            c = idx % cols
+            out_v = float(out[r, c].item())
+            ref_v = float(acc[r, c].item())
+            a_scale_v = float(a_sc[r if per_act_token else 0, 0].item())
+            b_scale_v = float(
+                b_sc[c].item() if b_sc.numel() == cols else b_sc[0].item()
+            )
+            detail = (
+                f"bad_e={e} bad_r={r} bad_c={c} out={out_v:.6g} ref={ref_v:.6g} "
+                f"a_scale={a_scale_v:.6g} b_scale={b_scale_v:.6g}"
+            )
+
+    return True, "", max_abs_err, max_rel_err, experts_checked, rows_checked, detail
 
 
 def _standard_mm2_ref_max_error(
@@ -507,7 +526,7 @@ def _standard_mm2_ref_max_error(
     per_act_token: bool,
     max_experts: int,
     max_rows_per_expert: int,
-) -> tuple[bool, str, float, float, int, int]:
+) -> tuple[bool, str, float, float, int, int, str]:
     total_rows = mm2_out.size(0)
     local_E = w2.size(0)
     offsets = expert_offsets.to(torch.int64)
@@ -523,6 +542,7 @@ def _standard_mm2_ref_max_error(
     max_rel_err = 0.0
     experts_checked = 0
     rows_checked = 0
+    detail = "n/a"
 
     for e in range(local_E):
         start = int(offsets[e].item())
@@ -556,6 +576,7 @@ def _standard_mm2_ref_max_error(
                 0.0,
                 experts_checked,
                 rows_checked,
+                "",
             )
 
         if a2_scales.size(1) != 1:
@@ -566,6 +587,7 @@ def _standard_mm2_ref_max_error(
                 0.0,
                 experts_checked,
                 rows_checked,
+                "",
             )
         if a2_scales.size(0) == 1:
             acc = acc * a2_scales[0:1, :]
@@ -578,6 +600,7 @@ def _standard_mm2_ref_max_error(
                     0.0,
                     experts_checked,
                     rows_checked,
+                    "",
                 )
             a_sc = a2_scales[start : start + rows, :]
             acc = acc * a_sc if per_act_token else acc * a_sc[0:1, :]
@@ -590,7 +613,27 @@ def _standard_mm2_ref_max_error(
         max_abs_err = max(max_abs_err, abs_err)
         max_rel_err = max(max_rel_err, rel_err)
 
-    return True, "", max_abs_err, max_rel_err, experts_checked, rows_checked
+        if abs_err >= max_abs_err:
+            idx = int(diff.reshape(-1).argmax().item())
+            cols = diff.size(1)
+            r = idx // cols
+            c = idx % cols
+            g_row = start + r
+            out_v = float(out[r, c].item())
+            ref_v = float(acc[r, c].item())
+            scale_row = r if (per_act_token and a2_scales.size(0) > 1) else 0
+            a_scale_src = a_sc if a2_scales.size(0) > 1 else a2_scales
+            a_scale_v = float(a_scale_src[scale_row, 0].item())
+            b_scale_v = float(
+                b_sc[c].item() if b_sc.numel() == cols else b_sc[0].item()
+            )
+            detail = (
+                f"bad_e={e} bad_row={g_row} bad_c={c} out={out_v:.6g} "
+                f"ref={ref_v:.6g} a_scale={a_scale_v:.6g} "
+                f"b_scale={b_scale_v:.6g}"
+            )
+
+    return True, "", max_abs_err, max_rel_err, experts_checked, rows_checked, detail
 
 
 def run_cutlass_moe_fp8(
@@ -1000,7 +1043,7 @@ def run_cutlass_moe_fp8(
             max_rows = max(1, _env_int("VLLM_PPLX_MM2_REF_GUARD_MAX_ROWS", 4))
             if use_batched_format:
                 mode = "batched"
-                supported, reason, abs_err, rel_err, checked_e, checked_r = (
+                supported, reason, abs_err, rel_err, checked_e, checked_r, detail = (
                     _batched_mm2_ref_max_error(
                         mm2_out=mm2_out,
                         a2q=a2q,
@@ -1017,7 +1060,7 @@ def run_cutlass_moe_fp8(
                 )
             else:
                 mode = "standard"
-                supported, reason, abs_err, rel_err, checked_e, checked_r = (
+                supported, reason, abs_err, rel_err, checked_e, checked_r, detail = (
                     _standard_mm2_ref_max_error(
                         mm2_out=mm2_out,
                         a2q=a2q,
@@ -1044,7 +1087,7 @@ def run_cutlass_moe_fp8(
                         "PPLX_MM2_REF_GUARD_HIT mode=%s call=%d checked_experts=%d "
                         "checked_rows=%d abs_err=%.6g rel_err=%.6g "
                         "abs_tol=%.6g rel_tol=%.6g per_act_token=%s "
-                        "per_out_ch=%s",
+                        "per_out_ch=%s detail=%s",
                         mode,
                         _PPLX_MM2_REF_GUARD_CALLS,
                         checked_e,
@@ -1055,6 +1098,7 @@ def run_cutlass_moe_fp8(
                         rel_tol,
                         per_act_token,
                         per_out_ch,
+                        detail,
                     )
                     if _env_flag("VLLM_PPLX_MM2_REF_GUARD_FAIL", default=True):
                         raise RuntimeError(
