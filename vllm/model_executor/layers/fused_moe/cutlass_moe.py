@@ -141,7 +141,7 @@ def _batched_valid_snapshot(
     )
 
 
-def _mm1_ref_max_error(
+def _batched_mm1_ref_max_error(
     mm1_out: torch.Tensor,
     a1q: torch.Tensor,
     a1q_scale: torch.Tensor,
@@ -208,6 +208,102 @@ def _mm1_ref_max_error(
         acc = acc * a_sc if per_act_token else acc * a_sc[0:1, :]
 
         out = out_b[e, :rows, :].float()
+        diff = (out - acc).abs()
+        abs_err = float(diff.max().item())
+        rel_err = float((diff / acc.abs().clamp_min(1e-5)).max().item())
+
+        max_abs_err = max(max_abs_err, abs_err)
+        max_rel_err = max(max_rel_err, rel_err)
+
+    return True, "", max_abs_err, max_rel_err, experts_checked, rows_checked
+
+
+def _standard_mm1_ref_max_error(
+    mm1_out: torch.Tensor,
+    a1q: torch.Tensor,
+    a1q_scale: torch.Tensor,
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    per_act_token: bool,
+    max_experts: int,
+    max_rows_per_expert: int,
+) -> tuple[bool, str, float, float, int, int]:
+    total_rows = mm1_out.size(0)
+    local_E = w1.size(0)
+    offsets = expert_offsets.to(torch.int64)
+
+    if a1q_scale.dim() == 0:
+        a1_scales = a1q_scale.view(1, 1).float()
+    elif a1q_scale.dim() == 1:
+        a1_scales = a1q_scale.view(-1, 1).float()
+    else:
+        a1_scales = a1q_scale.reshape(a1q_scale.size(0), -1).float()
+
+    max_abs_err = 0.0
+    max_rel_err = 0.0
+    experts_checked = 0
+    rows_checked = 0
+
+    for e in range(local_E):
+        start = int(offsets[e].item())
+        end = int(offsets[e + 1].item()) if e + 1 < offsets.numel() else total_rows
+
+        start = min(max(0, start), total_rows)
+        end = min(max(start, end), total_rows)
+        rows = end - start
+        if rows <= 0:
+            continue
+        if experts_checked >= max_experts:
+            break
+        experts_checked += 1
+
+        rows = min(rows, max_rows_per_expert)
+        rows_checked += rows
+
+        aq = a1q[start : start + rows, :].float()
+        acc = aq @ w1[e].float().transpose(0, 1)
+
+        b_sc = w1_scale[e].reshape(-1).float()
+        if b_sc.numel() == 1:
+            acc = acc * b_sc
+        elif b_sc.numel() == acc.size(1):
+            acc = acc * b_sc.view(1, -1)
+        else:
+            return (
+                False,
+                f"unsupported w1_scale shape for ref check: {tuple(w1_scale.shape)}",
+                0.0,
+                0.0,
+                experts_checked,
+                rows_checked,
+            )
+
+        if a1_scales.size(1) != 1:
+            return (
+                False,
+                f"unsupported a1q_scale shape for ref check: {tuple(a1q_scale.shape)}",
+                0.0,
+                0.0,
+                experts_checked,
+                rows_checked,
+            )
+        if a1_scales.size(0) == 1:
+            acc = acc * a1_scales[0:1, :]
+        else:
+            if start + rows > a1_scales.size(0):
+                return (
+                    False,
+                    "a1q_scale row range is smaller than mm1_out sampled rows",
+                    0.0,
+                    0.0,
+                    experts_checked,
+                    rows_checked,
+                )
+            a_sc = a1_scales[start : start + rows, :]
+            acc = acc * a_sc if per_act_token else acc * a_sc[0:1, :]
+
+        out = mm1_out[start : start + rows, :].float()
         diff = (out - acc).abs()
         abs_err = float(diff.max().item())
         rel_err = float((diff / acc.abs().clamp_min(1e-5)).max().item())
@@ -446,41 +542,61 @@ def run_cutlass_moe_fp8(
                     )
 
     # Optional sampled reference check for finite-but-wrong mm1 outputs.
-    if use_batched_format and _env_flag("VLLM_PPLX_MM1_REF_GUARD", default=False):
+    if _env_flag("VLLM_PPLX_MM1_REF_GUARD", default=False):
         global _PPLX_MM1_REF_GUARD_CALLS
         _PPLX_MM1_REF_GUARD_CALLS += 1
         interval = max(1, _env_int("VLLM_PPLX_MM1_REF_GUARD_INTERVAL", 32))
         if _PPLX_MM1_REF_GUARD_CALLS % interval == 0:
             max_experts = max(1, _env_int("VLLM_PPLX_MM1_REF_GUARD_MAX_EXPERTS", 1))
             max_rows = max(1, _env_int("VLLM_PPLX_MM1_REF_GUARD_MAX_ROWS", 4))
-            supported, reason, abs_err, rel_err, checked_e, checked_r = (
-                _mm1_ref_max_error(
-                    mm1_out=mm1_out,
-                    a1q=a1q,
-                    a1q_scale=a1q_scale,
-                    w1=w1,
-                    w1_scale=w1_scale,
-                    expert_num_tokens=expert_num_tokens,
-                    local_E=local_E,
-                    padded_M=padded_M,
-                    per_act_token=per_act_token,
-                    max_experts=max_experts,
-                    max_rows_per_expert=max_rows,
+            if use_batched_format:
+                mode = "batched"
+                supported, reason, abs_err, rel_err, checked_e, checked_r = (
+                    _batched_mm1_ref_max_error(
+                        mm1_out=mm1_out,
+                        a1q=a1q,
+                        a1q_scale=a1q_scale,
+                        w1=w1,
+                        w1_scale=w1_scale,
+                        expert_num_tokens=expert_num_tokens,
+                        local_E=local_E,
+                        padded_M=padded_M,
+                        per_act_token=per_act_token,
+                        max_experts=max_experts,
+                        max_rows_per_expert=max_rows,
+                    )
                 )
-            )
+            else:
+                mode = "standard"
+                supported, reason, abs_err, rel_err, checked_e, checked_r = (
+                    _standard_mm1_ref_max_error(
+                        mm1_out=mm1_out,
+                        a1q=a1q,
+                        a1q_scale=a1q_scale,
+                        w1=w1,
+                        w1_scale=w1_scale,
+                        expert_offsets=expert_offsets,
+                        per_act_token=per_act_token,
+                        max_experts=max_experts,
+                        max_rows_per_expert=max_rows,
+                    )
+                )
 
             if not supported:
-                logger.warning_once("PPLX_MM1_REF_GUARD_SKIPPED reason=%s", reason)
+                logger.warning_once(
+                    "PPLX_MM1_REF_GUARD_SKIPPED mode=%s reason=%s", mode, reason
+                )
             elif checked_r > 0:
                 abs_tol = _env_float("VLLM_PPLX_MM1_REF_GUARD_ABS_TOL", 0.5)
                 rel_tol = _env_float("VLLM_PPLX_MM1_REF_GUARD_REL_TOL", 0.1)
                 bad = abs_err > abs_tol or rel_err > rel_tol
                 if bad:
                     logger.error(
-                        "PPLX_MM1_REF_GUARD_HIT call=%d checked_experts=%d "
+                        "PPLX_MM1_REF_GUARD_HIT mode=%s call=%d checked_experts=%d "
                         "checked_rows=%d abs_err=%.6g rel_err=%.6g "
                         "abs_tol=%.6g rel_tol=%.6g per_act_token=%s "
                         "per_out_ch=%s",
+                        mode,
                         _PPLX_MM1_REF_GUARD_CALLS,
                         checked_e,
                         checked_r,
