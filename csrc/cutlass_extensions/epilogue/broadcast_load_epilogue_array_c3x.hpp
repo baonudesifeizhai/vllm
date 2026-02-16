@@ -164,6 +164,7 @@ struct Sm90RowOrScalarBroadcastArray {
       , tSR_rRow(tSR_rRow_)
       , tCcRow(tCcRow_)
       , residue_tCcRow(residue_tCcRow_)
+      , last_epi_n(-1)
       , group(group)
       , params(params_) {}
 
@@ -178,11 +179,13 @@ struct Sm90RowOrScalarBroadcastArray {
     CTensor tCcRow;                                                              // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
     ThrResidue residue_tCcRow;                                                   // (m, n)
     ThrNum thr_num;
+    int last_epi_n;
     int group;
     Params const& params;
 
     CUTLASS_DEVICE void
     begin() {
+      last_epi_n = -1;
       if (!params.row_broadcast) {
         fill(tSR_rRow, *(params.ptr_row_array[group]));
         return;
@@ -209,11 +212,12 @@ struct Sm90RowOrScalarBroadcastArray {
 
     CUTLASS_DEVICE void
     begin_loop(int epi_m, int epi_n) {
-      if (epi_m == 0) { // Assumes M-major subtile loop
-        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar 
+      if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
+      if (epi_n != last_epi_n) {
         Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_,_,_,epi_m,epi_n));
         Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
         copy(tSR_sRow_flt, tSR_rRow_flt);
+        last_epi_n = epi_n;
       }
     }
 
