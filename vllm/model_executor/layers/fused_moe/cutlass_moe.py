@@ -84,6 +84,18 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_optional_bool(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in ("1", "true", "on", "yes"):
+        return True
+    if lowered in ("0", "false", "off", "no"):
+        return False
+    return None
+
+
 def _tensor_snapshot(t: torch.Tensor) -> str:
     tf = t.float()
     return (
@@ -739,6 +751,20 @@ def run_cutlass_moe_fp8(
         interval = max(1, _env_int("VLLM_PPLX_STAGE_GUARD_INTERVAL", 1))
         stage_guard_run_this_call = stage_guard_call_idx % interval == 0
 
+    mm2_per_out_ch = per_out_ch
+    if use_batched_format:
+        mm2_per_out_ch_override = _env_optional_bool(
+            "VLLM_PPLX_MM2_PER_OUT_CH_OVERRIDE"
+        )
+        if mm2_per_out_ch_override is not None:
+            mm2_per_out_ch = mm2_per_out_ch_override
+            if mm2_per_out_ch != per_out_ch:
+                logger.warning_once(
+                    "PPLX_MM2_PER_OUT_CH_OVERRIDE active override=%s default=%s",
+                    mm2_per_out_ch,
+                    per_out_ch,
+                )
+
     if use_batched_format:
         mm1_out = _resize_cache(workspace13, (local_E * padded_M, N * 2))
         act_out = _resize_cache(workspace2, (local_E * padded_M, N))
@@ -981,7 +1007,7 @@ def run_cutlass_moe_fp8(
             local_E=local_E,
             padded_M=padded_M,
             per_act_token=per_act_token,
-            per_out_ch=per_out_ch,
+            per_out_ch=mm2_per_out_ch,
             context=f"problem_sizes2={_tensor_snapshot(problem_sizes2)}",
         )
         _maybe_batched_stage_guard(
@@ -994,7 +1020,7 @@ def run_cutlass_moe_fp8(
             local_E=local_E,
             padded_M=padded_M,
             per_act_token=per_act_token,
-            per_out_ch=per_out_ch,
+            per_out_ch=mm2_per_out_ch,
             context=(
                 "a2_scale=None"
                 if a2_scale is None
@@ -1014,7 +1040,7 @@ def run_cutlass_moe_fp8(
         ab_strides2,
         c_strides2,
         per_act_token,
-        per_out_ch,
+        mm2_per_out_ch,
     )
 
     if stage_guard_enabled:
@@ -1029,7 +1055,7 @@ def run_cutlass_moe_fp8(
             local_E=local_E,
             padded_M=padded_M,
             per_act_token=per_act_token,
-            per_out_ch=per_out_ch,
+            per_out_ch=mm2_per_out_ch,
             context=f"w2_scale={_tensor_snapshot(w2_scale)}",
         )
 
@@ -1097,7 +1123,7 @@ def run_cutlass_moe_fp8(
                         abs_tol,
                         rel_tol,
                         per_act_token,
-                        per_out_ch,
+                        mm2_per_out_ch,
                         detail,
                     )
                     if _env_flag("VLLM_PPLX_MM2_REF_GUARD_FAIL", default=True):
