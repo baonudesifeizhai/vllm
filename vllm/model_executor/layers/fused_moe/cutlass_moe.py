@@ -442,6 +442,7 @@ def _batched_mm2_ref_max_error(
     local_E: int,
     padded_M: int,
     per_act_token: bool,
+    per_out_ch: bool,
     max_experts: int,
     max_rows_per_expert: int,
 ) -> tuple[bool, str, float, float, int, int, str]:
@@ -472,20 +473,35 @@ def _batched_mm2_ref_max_error(
 
         # Apply B scales.
         b_sc = w2_scale[e].reshape(-1).float()
-        if b_sc.numel() == 1:
-            acc = acc * b_sc
-        elif b_sc.numel() == acc.size(1):
-            acc = acc * b_sc.view(1, -1)
+        if per_out_ch:
+            if b_sc.numel() == 1:
+                acc = acc * b_sc
+            elif b_sc.numel() == acc.size(1):
+                acc = acc * b_sc.view(1, -1)
+            else:
+                return (
+                    False,
+                    "unsupported w2_scale shape for ref check: "
+                    f"{tuple(w2_scale.shape)}",
+                    0.0,
+                    0.0,
+                    experts_checked,
+                    rows_checked,
+                    "",
+                )
         else:
-            return (
-                False,
-                f"unsupported w2_scale shape for ref check: {tuple(w2_scale.shape)}",
-                0.0,
-                0.0,
-                experts_checked,
-                rows_checked,
-                "",
-            )
+            if b_sc.numel() < 1:
+                return (
+                    False,
+                    "unsupported w2_scale shape for ref check: "
+                    f"{tuple(w2_scale.shape)}",
+                    0.0,
+                    0.0,
+                    experts_checked,
+                    rows_checked,
+                    "",
+                )
+            acc = acc * b_sc[0]
 
         # Apply A scales.
         a_sc = a2s_b[e, :rows, :].float()
@@ -518,7 +534,9 @@ def _batched_mm2_ref_max_error(
             ref_v = float(acc[r, c].item())
             a_scale_v = float(a_sc[r if per_act_token else 0, 0].item())
             b_scale_v = float(
-                b_sc[c].item() if b_sc.numel() == cols else b_sc[0].item()
+                b_sc[c].item()
+                if (per_out_ch and b_sc.numel() == cols)
+                else b_sc[0].item()
             )
             detail = (
                 f"bad_e={e} bad_r={r} bad_c={c} out={out_v:.6g} ref={ref_v:.6g} "
@@ -536,6 +554,7 @@ def _standard_mm2_ref_max_error(
     w2_scale: torch.Tensor,
     expert_offsets: torch.Tensor,
     per_act_token: bool,
+    per_out_ch: bool,
     max_experts: int,
     max_rows_per_expert: int,
 ) -> tuple[bool, str, float, float, int, int, str]:
@@ -576,20 +595,35 @@ def _standard_mm2_ref_max_error(
         acc = aq @ w2[e].float().transpose(0, 1)
 
         b_sc = w2_scale[e].reshape(-1).float()
-        if b_sc.numel() == 1:
-            acc = acc * b_sc
-        elif b_sc.numel() == acc.size(1):
-            acc = acc * b_sc.view(1, -1)
+        if per_out_ch:
+            if b_sc.numel() == 1:
+                acc = acc * b_sc
+            elif b_sc.numel() == acc.size(1):
+                acc = acc * b_sc.view(1, -1)
+            else:
+                return (
+                    False,
+                    "unsupported w2_scale shape for ref check: "
+                    f"{tuple(w2_scale.shape)}",
+                    0.0,
+                    0.0,
+                    experts_checked,
+                    rows_checked,
+                    "",
+                )
         else:
-            return (
-                False,
-                f"unsupported w2_scale shape for ref check: {tuple(w2_scale.shape)}",
-                0.0,
-                0.0,
-                experts_checked,
-                rows_checked,
-                "",
-            )
+            if b_sc.numel() < 1:
+                return (
+                    False,
+                    "unsupported w2_scale shape for ref check: "
+                    f"{tuple(w2_scale.shape)}",
+                    0.0,
+                    0.0,
+                    experts_checked,
+                    rows_checked,
+                    "",
+                )
+            acc = acc * b_sc[0]
 
         if a2_scales.size(1) != 1:
             return (
@@ -637,7 +671,9 @@ def _standard_mm2_ref_max_error(
             a_scale_src = a_sc if a2_scales.size(0) > 1 else a2_scales
             a_scale_v = float(a_scale_src[scale_row, 0].item())
             b_scale_v = float(
-                b_sc[c].item() if b_sc.numel() == cols else b_sc[0].item()
+                b_sc[c].item()
+                if (per_out_ch and b_sc.numel() == cols)
+                else b_sc[0].item()
             )
             detail = (
                 f"bad_e={e} bad_row={g_row} bad_c={c} out={out_v:.6g} "
@@ -830,6 +866,16 @@ def run_cutlass_moe_fp8(
             expert_first_token_offset, problem_sizes1, problem_sizes2, N, K, swap_ab
         )
         expert_offsets = expert_first_token_offset[:-1]
+
+    w2_scale_for_mm2 = w2_scale
+    if (
+        not mm2_per_out_ch
+        and w2_scale_for_mm2.dim() > 1
+        and w2_scale_for_mm2.size(1) > 1
+    ):
+        # If mm2 runs in per-tensor mode but scales are provided per-output-channel,
+        # pass one scalar per expert to match kernel semantics.
+        w2_scale_for_mm2 = w2_scale_for_mm2[:, :1].contiguous()
 
     if not per_act_token and (expert_map is not None or use_batched_format):
         # this is necessary to avoid imprecise scale calculation caused by
@@ -1033,7 +1079,7 @@ def run_cutlass_moe_fp8(
         a2q,
         w2,
         a2q_scale,
-        w2_scale,
+        w2_scale_for_mm2,
         expert_offsets,
         problem_sizes2,
         ab_strides2,
@@ -1056,7 +1102,7 @@ def run_cutlass_moe_fp8(
             padded_M=padded_M,
             per_act_token=per_act_token,
             per_out_ch=mm2_per_out_ch,
-            context=f"w2_scale={_tensor_snapshot(w2_scale)}",
+            context=f"w2_scale={_tensor_snapshot(w2_scale_for_mm2)}",
         )
 
     # Optional sampled reference check for finite-but-wrong mm2 outputs.
@@ -1075,11 +1121,12 @@ def run_cutlass_moe_fp8(
                         a2q=a2q,
                         a2q_scale=a2q_scale,
                         w2=w2,
-                        w2_scale=w2_scale,
+                        w2_scale=w2_scale_for_mm2,
                         expert_num_tokens=expert_num_tokens,
                         local_E=local_E,
                         padded_M=padded_M,
                         per_act_token=per_act_token,
+                        per_out_ch=mm2_per_out_ch,
                         max_experts=max_experts,
                         max_rows_per_expert=max_rows,
                     )
@@ -1092,9 +1139,10 @@ def run_cutlass_moe_fp8(
                         a2q=a2q,
                         a2q_scale=a2q_scale,
                         w2=w2,
-                        w2_scale=w2_scale,
+                        w2_scale=w2_scale_for_mm2,
                         expert_offsets=expert_offsets,
                         per_act_token=per_act_token,
+                        per_out_ch=mm2_per_out_ch,
                         max_experts=max_experts,
                         max_rows_per_expert=max_rows,
                     )
