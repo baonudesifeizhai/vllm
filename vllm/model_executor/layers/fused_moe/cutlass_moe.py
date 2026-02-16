@@ -53,6 +53,8 @@ _PPLX_MM1_GUARD_CALLS = 0
 _PPLX_MM1_GUARD_LOGGED = False
 _PPLX_MM1_REF_GUARD_CALLS = 0
 _PPLX_MM2_REF_GUARD_CALLS = 0
+_PPLX_STAGE_GUARD_CALLS = 0
+_PPLX_STAGE_GUARD_LOGGED: set[str] = set()
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -140,6 +142,107 @@ def _batched_valid_snapshot(
         f"valid_rows={valid_rows} min={tf.min().item():.6g} "
         f"max={tf.max().item():.6g} mean={tf.mean().item():.6g}"
     )
+
+
+def _batched_first_anomaly(
+    x: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    local_E: int,
+    padded_M: int,
+    abs_threshold: float,
+) -> tuple[str, int, int, int, float] | None:
+    x_b = x.reshape(local_E, padded_M, x.size(-1))
+    for e in range(local_E):
+        rows = int(expert_num_tokens[e].item())
+        if rows <= 0:
+            continue
+        cur = x_b[e, :rows, :]
+        nonfinite = ~torch.isfinite(cur)
+        if bool(nonfinite.any().item()):
+            idx = nonfinite.nonzero(as_tuple=False)[0]
+            r = int(idx[0].item())
+            c = int(idx[1].item())
+            return ("nonfinite", e, r, c, float(cur[r, c].float().item()))
+        if abs_threshold > 0:
+            over = cur.abs() > abs_threshold
+            if bool(over.any().item()):
+                idx = over.nonzero(as_tuple=False)[0]
+                r = int(idx[0].item())
+                c = int(idx[1].item())
+                return ("abs_over", e, r, c, float(cur[r, c].float().item()))
+    return None
+
+
+def _maybe_batched_stage_guard(
+    *,
+    enabled: bool,
+    run_this_call: bool,
+    call_idx: int,
+    stage: str,
+    tensor: torch.Tensor,
+    expert_num_tokens: torch.Tensor,
+    local_E: int,
+    padded_M: int,
+    per_act_token: bool,
+    per_out_ch: bool,
+    context: str,
+) -> None:
+    global _PPLX_STAGE_GUARD_LOGGED
+
+    if not (enabled and run_this_call):
+        return
+
+    finite, abs_max, valid_rows = _batched_valid_stats(
+        tensor, expert_num_tokens, local_E, padded_M
+    )
+    threshold = _env_float("VLLM_PPLX_STAGE_GUARD_ABS_MAX_THRESHOLD", 1e6)
+    bad = valid_rows > 0 and ((not finite) or abs_max > threshold)
+    if not bad:
+        return
+
+    anomaly = _batched_first_anomaly(
+        tensor, expert_num_tokens, local_E, padded_M, threshold
+    )
+    reason = "unknown"
+    bad_e = -1
+    bad_r = -1
+    bad_c = -1
+    bad_v = float("nan")
+    if anomaly is not None:
+        reason, bad_e, bad_r, bad_c, bad_v = anomaly
+
+    if stage not in _PPLX_STAGE_GUARD_LOGGED:
+        _PPLX_STAGE_GUARD_LOGGED.add(stage)
+        logger.error(
+            "PPLX_STAGE_GUARD_HIT stage=%s call=%d finite=%s abs_max=%.6g "
+            "threshold=%.6g valid_rows=%d reason=%s bad_e=%d bad_r=%d bad_c=%d "
+            "bad_v=%.6g per_act_token=%s per_out_ch=%s tensor_valid=%s "
+            "expert_num_tokens=%s context=%s",
+            stage,
+            call_idx,
+            finite,
+            abs_max,
+            threshold,
+            valid_rows,
+            reason,
+            bad_e,
+            bad_r,
+            bad_c,
+            bad_v,
+            per_act_token,
+            per_out_ch,
+            _batched_valid_snapshot(tensor, expert_num_tokens, local_E, padded_M),
+            _tensor_snapshot(expert_num_tokens),
+            context,
+        )
+
+    if _env_flag("VLLM_PPLX_STAGE_GUARD_FAIL", default=True):
+        raise RuntimeError(
+            "PPLX stage guard triggered "
+            f"(stage={stage}, finite={finite}, abs_max={abs_max:.6g}, "
+            f"threshold={threshold:.6g}, reason={reason}, bad_e={bad_e}, "
+            f"bad_r={bad_r}, bad_c={bad_c}, bad_v={bad_v:.6g})"
+        )
 
 
 def _batched_mm1_ref_max_error(
@@ -515,6 +618,7 @@ def run_cutlass_moe_fp8(
     topk_weights: torch.Tensor | None,
 ):
     a1q = hidden_states
+    global _PPLX_STAGE_GUARD_CALLS
 
     assert activation.is_gated, "Only gated activation is supported"
     assert w1_scale is not None
@@ -579,6 +683,16 @@ def run_cutlass_moe_fp8(
 
     topk = topk_ids.size(1)
     local_E = w1.size(0)
+    stage_guard_enabled = use_batched_format and _env_flag(
+        "VLLM_PPLX_STAGE_GUARD", default=False
+    )
+    stage_guard_call_idx = 0
+    stage_guard_run_this_call = False
+    if stage_guard_enabled:
+        _PPLX_STAGE_GUARD_CALLS += 1
+        stage_guard_call_idx = _PPLX_STAGE_GUARD_CALLS
+        interval = max(1, _env_int("VLLM_PPLX_STAGE_GUARD_INTERVAL", 1))
+        stage_guard_run_this_call = stage_guard_call_idx % interval == 0
 
     if use_batched_format:
         mm1_out = _resize_cache(workspace13, (local_E * padded_M, N * 2))
@@ -790,9 +904,58 @@ def run_cutlass_moe_fp8(
 
     apply_moe_activation(activation, act_out, mm1_out)
 
+    if stage_guard_enabled:
+        assert expert_num_tokens is not None
+        _maybe_batched_stage_guard(
+            enabled=stage_guard_enabled,
+            run_this_call=stage_guard_run_this_call,
+            call_idx=stage_guard_call_idx,
+            stage="act_out",
+            tensor=act_out,
+            expert_num_tokens=expert_num_tokens,
+            local_E=local_E,
+            padded_M=padded_M,
+            per_act_token=per_act_token,
+            per_out_ch=per_out_ch,
+            context=f"problem_sizes1={_tensor_snapshot(problem_sizes1)}",
+        )
+
     a2q, a2q_scale = ops.scaled_fp8_quant(
         act_out, a2_scale, use_per_token_if_dynamic=per_act_token, output=quant_out
     )
+
+    if stage_guard_enabled:
+        assert expert_num_tokens is not None
+        _maybe_batched_stage_guard(
+            enabled=stage_guard_enabled,
+            run_this_call=stage_guard_run_this_call,
+            call_idx=stage_guard_call_idx,
+            stage="a2q",
+            tensor=a2q,
+            expert_num_tokens=expert_num_tokens,
+            local_E=local_E,
+            padded_M=padded_M,
+            per_act_token=per_act_token,
+            per_out_ch=per_out_ch,
+            context=f"problem_sizes2={_tensor_snapshot(problem_sizes2)}",
+        )
+        _maybe_batched_stage_guard(
+            enabled=stage_guard_enabled,
+            run_this_call=stage_guard_run_this_call,
+            call_idx=stage_guard_call_idx,
+            stage="a2q_scale",
+            tensor=a2q_scale,
+            expert_num_tokens=expert_num_tokens,
+            local_E=local_E,
+            padded_M=padded_M,
+            per_act_token=per_act_token,
+            per_out_ch=per_out_ch,
+            context=(
+                "a2_scale=None"
+                if a2_scale is None
+                else f"a2_scale={_tensor_snapshot(a2_scale)}"
+            ),
+        )
 
     ops.cutlass_moe_mm(
         mm2_out,
@@ -808,6 +971,22 @@ def run_cutlass_moe_fp8(
         per_act_token,
         per_out_ch,
     )
+
+    if stage_guard_enabled:
+        assert expert_num_tokens is not None
+        _maybe_batched_stage_guard(
+            enabled=stage_guard_enabled,
+            run_this_call=stage_guard_run_this_call,
+            call_idx=stage_guard_call_idx,
+            stage="mm2_out",
+            tensor=mm2_out,
+            expert_num_tokens=expert_num_tokens,
+            local_E=local_E,
+            padded_M=padded_M,
+            per_act_token=per_act_token,
+            per_out_ch=per_out_ch,
+            context=f"w2_scale={_tensor_snapshot(w2_scale)}",
+        )
 
     # Optional sampled reference check for finite-but-wrong mm2 outputs.
     if _env_flag("VLLM_PPLX_MM2_REF_GUARD", default=False):
