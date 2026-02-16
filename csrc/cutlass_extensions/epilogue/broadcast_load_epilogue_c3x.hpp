@@ -176,6 +176,7 @@ struct Sm90RowOrScalarBroadcast {
     CTensor tCcRow;                                                              // (CPY,CPY_M,CPY_N,EPI_M,EPI_N)
     ThrResidue residue_tCcRow;                                                   // (m, n)
     ThrNum thr_num;
+    int last_epi_n = -1;
     Params const& params;
 
     CUTLASS_DEVICE void
@@ -205,12 +206,14 @@ struct Sm90RowOrScalarBroadcast {
     }
 
     CUTLASS_DEVICE void
-    begin_loop(int epi_m, int epi_n) {
-      if (epi_m == 0) { // Assumes M-major subtile loop
-        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
-        Tensor tSR_sRow_cur = tSR_sRow(_, _, _, epi_m, epi_n);
-        copy(tSR_sRow_cur, tSR_rRow);
-      }
+    begin_loop(int /*epi_m*/, int epi_n) {
+      if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
+      if (epi_n == last_epi_n) return;
+      // Keep row-broadcast correct regardless of epilogue subtile loop order.
+      Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_, _, _, 0, epi_n));
+      Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
+      copy(tSR_sRow_flt, tSR_rRow_flt);
+      last_epi_n = epi_n;
     }
 
     template <typename ElementAccumulator, int FragmentSize>
