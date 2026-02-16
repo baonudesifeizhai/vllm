@@ -192,14 +192,17 @@ struct Sm90RowOrScalarBroadcast {
       Tensor tGS_cRow_flt = make_tensor(tGS_cRow.data(), make_layout(tGS_gRow_flt.shape(), tGS_cRow.stride()));
 
       for (int i = 0; i < size(tGS_gRow_flt); ++i) {
-        if (get<1>(tGS_cRow_flt(i)) >= size<1>(CtaTileShapeMNK{})) {
-          continue; // OOB of SMEM, 
+        int const n_idx = get<1>(tGS_cRow_flt(i));
+        if (n_idx >= size<1>(CtaTileShapeMNK{})) {
+          continue; // OOB of SMEM
         }
-        if (elem_less(tGS_cRow_flt(i), make_coord(get<0>(residue_tCcRow), get<1>(residue_tCcRow)))) {
+        // Row-broadcast scales are invariant over M. Validity should be
+        // determined by the N residue only; coupling to M can zero out
+        // otherwise-valid columns on tail-M tiles.
+        if (n_idx < get<1>(residue_tCcRow)) {
           tGS_sRow_flt(i) = tGS_gRow_flt(i);
-        }
-        else {
-          tGS_sRow_flt(i) = Element(0); // Set to Zero when OOB so LDS could be issue without any preds.
+        } else {
+          tGS_sRow_flt(i) = Element(0);
         }
       }
       synchronize();
