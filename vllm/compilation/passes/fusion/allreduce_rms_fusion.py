@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
+import time
 from importlib.util import find_spec
 from types import ModuleType
 
@@ -217,6 +219,9 @@ class BasePattern:
         self.device = device
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        raise NotImplementedError
 
 
 class AllReduceRMSNormPattern(BasePattern):
@@ -682,6 +687,25 @@ class AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(BasePattern):
 class AllReduceFusionPass(VllmPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
+        profile_ctor = os.getenv("VLLM_PROFILE_ALLREDUCE_FUSION_INIT", "0") == "1"
+        self._profile_ctor = profile_ctor
+        ctor_start_ns = time.perf_counter_ns()
+
+        def _profile_stage(stage: str, stage_start_ns: int) -> int:
+            if not profile_ctor:
+                return stage_start_ns
+            with contextlib.suppress(Exception):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            stage_end_ns = time.perf_counter_ns()
+            logger.info(
+                "AllReduceFusionPass init stage '%s' took %.2f ms",
+                stage,
+                float(stage_end_ns - stage_start_ns) / 1.0e6,
+            )
+            return stage_end_ns
+
+        stage_start_ns = ctor_start_ns
         self.disabled = True
         self.tp_size = get_tensor_model_parallel_world_size()
         if self.tp_size <= 1:
@@ -737,6 +761,7 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             hidden_dim=self.hidden_dim,
             dtype=self.model_dtype,
         )
+        stage_start_ns = _profile_stage("create_workspace", stage_start_ns)
 
         global _FI_WORKSPACE
         _FI_WORKSPACE = self.workspace
@@ -746,52 +771,108 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         )
 
         self.register_patterns()
+        stage_start_ns = _profile_stage("register_patterns", stage_start_ns)
         self.dump_patterns(config, self.patterns)
+        stage_start_ns = _profile_stage("dump_patterns", stage_start_ns)
+        if profile_ctor:
+            logger.info(
+                "AllReduceFusionPass init total %.2f ms",
+                float(stage_start_ns - ctor_start_ns) / 1.0e6,
+            )
 
     @enable_fake_mode
     def register_patterns(self) -> None:
+        def _register_with_profile(name: str, pattern: BasePattern) -> None:
+            if not getattr(self, "_profile_ctor", False):
+                pattern.register(self.patterns)
+                return
+
+            with contextlib.suppress(Exception):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            pattern_start_ns = time.perf_counter_ns()
+            pattern.register(self.patterns)
+            with contextlib.suppress(Exception):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            pattern_end_ns = time.perf_counter_ns()
+            logger.info(
+                "AllReduceFusionPass register '%s' took %.2f ms",
+                name,
+                float(pattern_end_ns - pattern_start_ns) / 1.0e6,
+            )
+
         for epsilon in [1e-5, 1e-6]:
-            AllReduceFusedRMSNormStaticQuantFP8Pattern(
-                epsilon,
-                self.model_dtype,
-                self.device,
-                self.allreduce_params,
-            ).register(self.patterns)
-            AllReduceFusedAddRMSNormStaticQuantFP8Pattern(
-                epsilon,
-                self.model_dtype,
-                self.device,
-                self.allreduce_params,
-            ).register(self.patterns)
+            _register_with_profile(
+                f"AllReduceFusedRMSNormStaticQuantFP8Pattern(eps={epsilon})",
+                AllReduceFusedRMSNormStaticQuantFP8Pattern(
+                    epsilon,
+                    self.model_dtype,
+                    self.device,
+                    self.allreduce_params,
+                ),
+            )
+            _register_with_profile(
+                f"AllReduceFusedAddRMSNormStaticQuantFP8Pattern(eps={epsilon})",
+                AllReduceFusedAddRMSNormStaticQuantFP8Pattern(
+                    epsilon,
+                    self.model_dtype,
+                    self.device,
+                    self.allreduce_params,
+                ),
+            )
             if current_platform.has_device_capability(100):
-                AllReduceFusedRMSNormStaticQuantNVFP4Pattern(
+                _register_with_profile(
+                    f"AllReduceFusedRMSNormStaticQuantNVFP4Pattern(eps={epsilon})",
+                    AllReduceFusedRMSNormStaticQuantNVFP4Pattern(
+                        epsilon,
+                        self.model_dtype,
+                        self.device,
+                        self.allreduce_params,
+                    ),
+                )
+                _register_with_profile(
+                    f"AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(eps={epsilon})",
+                    AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(
+                        epsilon,
+                        self.model_dtype,
+                        self.device,
+                        self.allreduce_params,
+                    ),
+                )
+            _register_with_profile(
+                f"AllReduceRMSNormPattern(eps={epsilon})",
+                AllReduceRMSNormPattern(
                     epsilon,
                     self.model_dtype,
                     self.device,
                     self.allreduce_params,
-                ).register(self.patterns)
-                AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(
+                ),
+            )
+            _register_with_profile(
+                f"AllReduceFusedAddRMSNormPattern(eps={epsilon})",
+                AllReduceFusedAddRMSNormPattern(
                     epsilon,
                     self.model_dtype,
                     self.device,
                     self.allreduce_params,
-                ).register(self.patterns)
-            AllReduceRMSNormPattern(
-                epsilon,
-                self.model_dtype,
-                self.device,
-                self.allreduce_params,
-            ).register(self.patterns)
-            AllReduceFusedAddRMSNormPattern(
-                epsilon,
-                self.model_dtype,
-                self.device,
-                self.allreduce_params,
-            ).register(self.patterns)
+                ),
+            )
 
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.
+            cache_clear_start = time.perf_counter_ns()
             torch._inductor.pattern_matcher._seen_patterns.clear()
+            if getattr(self, "_profile_ctor", False):
+                with contextlib.suppress(Exception):
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                cache_clear_end = time.perf_counter_ns()
+                logger.info(
+                    "AllReduceFusionPass clear _seen_patterns(eps=%s) took %.2f ms",
+                    epsilon,
+                    float(cache_clear_end - cache_clear_start) / 1.0e6,
+                )
 
         self.disabled = False
 
