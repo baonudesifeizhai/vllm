@@ -69,9 +69,10 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 # Fixed fallback gating for FlashInfer FP4 attn+quant fusion.
-# Only run whole-call unfused fallback for multi-token decode requests.
-# Keep single-token decode on fused path to preserve throughput.
+# Use decode shape + decode load with hysteresis to avoid mode flapping.
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
+FP4_FUSION_DECODE_TOKENS_ENTER_THRESHOLD = 256
+FP4_FUSION_DECODE_TOKENS_EXIT_THRESHOLD = 192
 
 logger = init_logger(__name__)
 
@@ -95,13 +96,22 @@ def _get_q_len_per_req(num_decode_tokens: int, num_decodes: int) -> int:
 
 
 def _should_use_fp4_unfused_fallback(
-    fp4_fusion_requested: bool, num_decode_tokens: int, num_decodes: int
+    fp4_fusion_requested: bool,
+    num_decode_tokens: int,
+    num_decodes: int,
+    fallback_active: bool,
 ) -> tuple[bool, int]:
     if not fp4_fusion_requested or num_decode_tokens <= 0:
         return False, 1
 
     q_len_per_req = _get_q_len_per_req(num_decode_tokens, num_decodes)
-    use_fallback = q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD
+    if q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD:
+        return True, q_len_per_req
+
+    if fallback_active:
+        use_fallback = num_decode_tokens >= FP4_FUSION_DECODE_TOKENS_EXIT_THRESHOLD
+    else:
+        use_fallback = num_decode_tokens >= FP4_FUSION_DECODE_TOKENS_ENTER_THRESHOLD
     return use_fallback, q_len_per_req
 
 
@@ -1249,6 +1259,7 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        self._fp4_unfused_fallback_active = False
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
@@ -1403,6 +1414,10 @@ class FlashInferImpl(AttentionImpl):
             fp4_fusion_requested=fp4_fusion_requested,
             num_decode_tokens=num_decode_tokens,
             num_decodes=attn_metadata.num_decodes,
+            fallback_active=self._fp4_unfused_fallback_active,
+        )
+        self._fp4_unfused_fallback_active = (
+            fp4_fusion_requested and use_fp4_unfused_fallback
         )
 
         attn_output = output
