@@ -74,7 +74,7 @@ FP4_DTYPE = torch.uint8
 # 2) decode token load is high
 # 3) decode token load enters known CUDA graph risk zone
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
-FP4_FUSION_DECODE_TOKENS_THRESHOLD = 256
+FP4_FUSION_DECODE_TOKENS_THRESHOLD = 192
 FP4_FUSION_CUDAGRAPH_GUARD_TOKENS = 512
 
 logger = init_logger(__name__)
