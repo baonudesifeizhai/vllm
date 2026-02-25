@@ -68,11 +68,14 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
-# Fixed gating for FlashInfer FP4 attn+quant fusion fallback.
-# If decode q_len_per_req is above this, and the effective tokens_heads_q is
-# also above the threshold below, run unfused BF16 attention then quantize once.
-FP4_FUSION_Q_THRESHOLD = 1
-FP4_FUSION_TOKENS_HEADS_Q_THRESHOLD = 16
+# Fixed fallback gating for FlashInfer FP4 attn+quant fusion.
+# If any of the following is true, run whole-call unfused fallback:
+# 1) decode per-request q_len is multi-token
+# 2) decode token load is high
+# 3) decode token load enters known CUDA graph risk zone
+FP4_FUSION_DECODE_Q_THRESHOLD = 1
+FP4_FUSION_DECODE_TOKENS_THRESHOLD = 256
+FP4_FUSION_CUDAGRAPH_GUARD_TOKENS = 512
 
 logger = init_logger(__name__)
 
@@ -86,6 +89,28 @@ def _get_trtllm_gen_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_gen_workspace_buffer
+
+
+def _get_q_len_per_req(num_decode_tokens: int, num_decodes: int) -> int:
+    if num_decodes <= 0 or num_decode_tokens % num_decodes != 0:
+        # Triggered by some dummy runs / non-uniform decode groups.
+        return 1
+    return num_decode_tokens // num_decodes
+
+
+def _should_use_fp4_unfused_fallback(
+    fp4_fusion_requested: bool, num_decode_tokens: int, num_decodes: int
+) -> tuple[bool, int]:
+    if not fp4_fusion_requested or num_decode_tokens <= 0:
+        return False, 1
+
+    q_len_per_req = _get_q_len_per_req(num_decode_tokens, num_decodes)
+    is_multi_token_decode = q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD
+    is_high_decode_load = num_decode_tokens >= FP4_FUSION_DECODE_TOKENS_THRESHOLD
+    is_cudagraph_risk = num_decode_tokens > FP4_FUSION_CUDAGRAPH_GUARD_TOKENS
+
+    use_fallback = is_multi_token_decode or is_high_decode_load or is_cudagraph_risk
+    return use_fallback, q_len_per_req
 
 
 @triton.jit
@@ -1382,21 +1407,11 @@ class FlashInferImpl(AttentionImpl):
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
         fp4_fusion_requested = output_scale is not None and output.dtype == FP4_DTYPE
-        use_fp4_unfused_fallback = False
-        q_len_per_req = 1
-        if (
-            fp4_fusion_requested
-            and num_decode_tokens > 0
-            and attn_metadata.num_decodes > 0
-        ):
-            if num_decode_tokens % attn_metadata.num_decodes == 0:
-                q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
-            num_qo_heads_per_kv_head = max(1, self.num_heads // self.num_kv_heads)
-            tokens_heads_q = q_len_per_req * num_qo_heads_per_kv_head
-            use_fp4_unfused_fallback = (
-                q_len_per_req > FP4_FUSION_Q_THRESHOLD
-                and tokens_heads_q > FP4_FUSION_TOKENS_HEADS_Q_THRESHOLD
-            )
+        use_fp4_unfused_fallback, q_len_per_req = _should_use_fp4_unfused_fallback(
+            fp4_fusion_requested=fp4_fusion_requested,
+            num_decode_tokens=num_decode_tokens,
+            num_decodes=attn_metadata.num_decodes,
+        )
 
         attn_output = output
         if use_fp4_unfused_fallback:
@@ -1446,7 +1461,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         key[num_decode_tokens:],
                         value[num_decode_tokens:],
-                        out=output[num_decode_tokens:],
+                        out=attn_output[num_decode_tokens:],
                     )
                 else:
                     assert isinstance(
@@ -1564,7 +1579,7 @@ class FlashInferImpl(AttentionImpl):
                         lse=lse,
                         return_lse=True,
                     )
-                    output[:num_decode_tokens] = cp_lse_ag_out_rs(
+                    attn_output[:num_decode_tokens] = cp_lse_ag_out_rs(
                         output_tmp,
                         lse,
                         get_dcp_group(),
@@ -1608,14 +1623,9 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     out = attn_output[:num_decode_tokens]
 
-                if attn_metadata.num_decodes <= 0:
-                    q_len_per_req = 1
-                elif num_decode_tokens % attn_metadata.num_decodes != 0:
-                    # This gets triggered when the dummy_run forces
-                    # attention to be initialized with q_len = 0
-                    q_len_per_req = 1
-                else:
-                    q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
+                q_len_per_req = _get_q_len_per_req(
+                    num_decode_tokens, attn_metadata.num_decodes
+                )
 
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
