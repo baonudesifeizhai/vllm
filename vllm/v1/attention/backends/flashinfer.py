@@ -68,6 +68,12 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
+# Fixed gating for FlashInfer FP4 attn+quant fusion fallback.
+# If decode q_len_per_req is above this, and the effective tokens_heads_q is
+# also above the threshold below, run unfused BF16 attention then quantize once.
+FP4_FUSION_Q_THRESHOLD = 1
+FP4_FUSION_TOKENS_HEADS_Q_THRESHOLD = 16
+
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
@@ -1375,6 +1381,35 @@ class FlashInferImpl(AttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
+        fp4_fusion_requested = output_scale is not None and output.dtype == FP4_DTYPE
+        use_fp4_unfused_fallback = False
+        q_len_per_req = 1
+        if (
+            fp4_fusion_requested
+            and num_decode_tokens > 0
+            and attn_metadata.num_decodes > 0
+        ):
+            if num_decode_tokens % attn_metadata.num_decodes == 0:
+                q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
+            num_qo_heads_per_kv_head = max(1, self.num_heads // self.num_kv_heads)
+            tokens_heads_q = q_len_per_req * num_qo_heads_per_kv_head
+            use_fp4_unfused_fallback = (
+                q_len_per_req > FP4_FUSION_Q_THRESHOLD
+                and tokens_heads_q > FP4_FUSION_TOKENS_HEADS_Q_THRESHOLD
+            )
+
+        attn_output = output
+        if use_fp4_unfused_fallback:
+            # Run prefill+decode into a temporary BF16 buffer and quantize once
+            # at the end. Avoid mixed fused/unfused writes for FP4 scales.
+            attn_output = torch.empty(
+                (num_actual_tokens, self.num_heads, self.head_size),
+                dtype=torch.bfloat16,
+                device=output.device,
+            )
+
+        trtllm_o_sf_scale = None if use_fp4_unfused_fallback else self.o_sf_scale
+
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
         kv_cache_permute = kv_cache.permute(*stride_order)
 
@@ -1428,7 +1463,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
-                        out=output[num_decode_tokens:],
+                        out=attn_output[num_decode_tokens:],
                     )
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
@@ -1449,17 +1484,16 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(block_tables_prefill)
                 assert is_strictly_contiguous(seq_lens_prefill)
 
-                if output.dtype == FP4_DTYPE:
-                    assert self.o_sf_scale is not None
+                if output.dtype == FP4_DTYPE and not use_fp4_unfused_fallback:
+                    assert trtllm_o_sf_scale is not None
                     out = FP4Tensor(
-                        data=output[num_decode_tokens:],
+                        data=attn_output[num_decode_tokens:],
                         scale=output_block_scale,
                         scale_start_index=num_decode_tokens,
                         original_shape=prefill_query.shape,
                     )
                 else:
-                    assert self.o_sf_scale is None
-                    out = output[num_decode_tokens:]
+                    out = attn_output[num_decode_tokens:]
 
                 if (
                     attn_metadata.q_data_type != FP8_DTYPE
@@ -1495,7 +1529,7 @@ class FlashInferImpl(AttentionImpl):
                     cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
                     window_left=self.window_left,
                     sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
+                    o_sf_scale=trtllm_o_sf_scale,
                     out=out,
                 )
 
@@ -1542,7 +1576,7 @@ class FlashInferImpl(AttentionImpl):
                         kv_cache_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
-                        out=output[:num_decode_tokens],
+                        out=attn_output[:num_decode_tokens],
                     )
             else:
                 # decode_query may be non-contiguous or have degenerate strides
@@ -1563,19 +1597,20 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(block_tables_decode)
                 assert is_strictly_contiguous(seq_lens_decode)
 
-                if output.dtype == FP4_DTYPE:
-                    assert self.o_sf_scale is not None
+                if output.dtype == FP4_DTYPE and not use_fp4_unfused_fallback:
+                    assert trtllm_o_sf_scale is not None
                     out = FP4Tensor(
-                        data=output[:num_decode_tokens],
+                        data=attn_output[:num_decode_tokens],
                         scale=output_block_scale,
                         scale_start_index=0,
                         original_shape=decode_query.shape,
                     )
                 else:
-                    assert self.o_sf_scale is None
-                    out = output[:num_decode_tokens]
+                    out = attn_output[:num_decode_tokens]
 
-                if num_decode_tokens % attn_metadata.num_decodes != 0:
+                if attn_metadata.num_decodes <= 0:
+                    q_len_per_req = 1
+                elif num_decode_tokens % attn_metadata.num_decodes != 0:
                     # This gets triggered when the dummy_run forces
                     # attention to be initialized with q_len = 0
                     q_len_per_req = 1
@@ -1593,10 +1628,27 @@ class FlashInferImpl(AttentionImpl):
                     bmm2_scale=self.bmm2_scale,
                     window_left=self.window_left,
                     sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
+                    o_sf_scale=trtllm_o_sf_scale,
                     out=out,
                     q_len_per_req=q_len_per_req,
                 )
+
+        if use_fp4_unfused_fallback:
+            assert output_scale is not None
+            assert output_block_scale is not None
+            assert output.dtype == FP4_DTYPE
+            input_2d = attn_output.reshape(num_actual_tokens, -1)
+            output_2d = output.reshape(num_actual_tokens, -1)
+            output_block_scale_i32 = torch.ops.aten.view.dtype(
+                output_block_scale, torch.int32
+            )
+            torch.ops._C.scaled_fp4_quant(
+                output_2d,
+                input_2d,
+                output_block_scale_i32,
+                output_scale,
+                True,
+            )
         return output_padded
 
 
