@@ -69,13 +69,9 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 # Fixed fallback gating for FlashInfer FP4 attn+quant fusion.
-# If any of the following is true, run whole-call unfused fallback:
-# 1) decode per-request q_len is multi-token
-# 2) decode token load is high
-# 3) decode token load enters known CUDA graph risk zone
+# Only run whole-call unfused fallback for multi-token decode requests.
+# Keep single-token decode on fused path to preserve throughput.
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
-FP4_FUSION_DECODE_TOKENS_THRESHOLD = 192
-FP4_FUSION_CUDAGRAPH_GUARD_TOKENS = 512
 
 logger = init_logger(__name__)
 
@@ -105,11 +101,7 @@ def _should_use_fp4_unfused_fallback(
         return False, 1
 
     q_len_per_req = _get_q_len_per_req(num_decode_tokens, num_decodes)
-    is_multi_token_decode = q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD
-    is_high_decode_load = num_decode_tokens >= FP4_FUSION_DECODE_TOKENS_THRESHOLD
-    is_cudagraph_risk = num_decode_tokens > FP4_FUSION_CUDAGRAPH_GUARD_TOKENS
-
-    use_fallback = is_multi_token_decode or is_high_decode_load or is_cudagraph_risk
+    use_fallback = q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD
     return use_fallback, q_len_per_req
 
 
