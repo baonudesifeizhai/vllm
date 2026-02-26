@@ -67,12 +67,12 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
-
-# Fixed fallback gating for FlashInfer FP4 attn+quant fusion.
-# Use decode shape + decode load with hysteresis to avoid mode flapping.
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
-FP4_FUSION_DECODE_TOKENS_ENTER_THRESHOLD = 256
-FP4_FUSION_DECODE_TOKENS_EXIT_THRESHOLD = 192
+# Hysteresis for decode token-count based fallback:
+# - Enter unfused at high decode load.
+# - Exit unfused only after decode load drops below the lower threshold.
+FP4_FUSION_UNFUSED_ENTER_TOKENS = 96
+FP4_FUSION_UNFUSED_EXIT_TOKENS = 64
 
 logger = init_logger(__name__)
 
@@ -109,9 +109,9 @@ def _should_use_fp4_unfused_fallback(
         return True, q_len_per_req
 
     if fallback_active:
-        use_fallback = num_decode_tokens >= FP4_FUSION_DECODE_TOKENS_EXIT_THRESHOLD
+        use_fallback = num_decode_tokens >= FP4_FUSION_UNFUSED_EXIT_TOKENS
     else:
-        use_fallback = num_decode_tokens >= FP4_FUSION_DECODE_TOKENS_ENTER_THRESHOLD
+        use_fallback = num_decode_tokens >= FP4_FUSION_UNFUSED_ENTER_TOKENS
     return use_fallback, q_len_per_req
 
 
@@ -1422,8 +1422,8 @@ class FlashInferImpl(AttentionImpl):
 
         attn_output = output
         if use_fp4_unfused_fallback:
-            # Run prefill+decode into a temporary BF16 buffer and quantize once
-            # at the end. Avoid mixed fused/unfused writes for FP4 scales.
+            # Use BF16 temporary output for whole-call fallback and quantize once
+            # at the end. This avoids mixed writes to FP4 data/scale layout.
             attn_output = torch.empty(
                 (num_actual_tokens, self.num_heads, self.head_size),
                 dtype=torch.bfloat16,
@@ -1630,10 +1630,6 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     out = attn_output[:num_decode_tokens]
 
-                q_len_per_req = _get_q_len_per_req(
-                    num_decode_tokens, attn_metadata.num_decodes
-                )
-
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=kv_cache_permute,
@@ -1649,7 +1645,6 @@ class FlashInferImpl(AttentionImpl):
                     out=out,
                     q_len_per_req=q_len_per_req,
                 )
-
         if use_fp4_unfused_fallback:
             assert output_scale is not None
             assert output_block_scale is not None
