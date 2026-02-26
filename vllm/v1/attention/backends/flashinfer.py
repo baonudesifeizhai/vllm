@@ -68,10 +68,16 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
+# Hysteresis for decode token-count based fallback:
+# - Enter unfused at high decode load.
+# - Exit unfused only after decode load drops below the lower threshold.
 FP4_FUSION_UNFUSED_ENTER_TOKENS = 128
 FP4_FUSION_UNFUSED_EXIT_TOKENS = 96
-FP4_FUSION_UNFUSED_MAX_TOKENS = 256
+# Only apply token-threshold fallback when decode load dominates prefill load.
 FP4_FUSION_DECODE_PREFILL_RATIO = 2
+# Prefill-dominant low-latency regime:
+# For TTFT-heavy batches where decode is tiny, prefer unfused path to avoid
+# FP4 fused overhead on first-token-centric workloads.
 FP4_FUSION_PREFILL_DOM_RATIO = 4
 FP4_FUSION_PREFILL_DOM_MAX_DECODE_TOKENS = 32
 
@@ -91,7 +97,7 @@ def _get_trtllm_gen_workspace_buffer():
 
 def _get_q_len_per_req(num_decode_tokens: int, num_decodes: int) -> int:
     if num_decodes <= 0 or num_decode_tokens % num_decodes != 0:
-        # Dummy runs / non-uniform decode groups.
+        # Triggered by some dummy runs / non-uniform decode groups.
         return 1
     return num_decode_tokens // num_decodes
 
@@ -107,15 +113,11 @@ def _should_use_fp4_unfused_fallback(
         return False, 1
 
     q_len_per_req = _get_q_len_per_req(num_decode_tokens, num_decodes)
-
-    # Preserve throughput at saturated decode load.
-    if num_decode_tokens > FP4_FUSION_UNFUSED_MAX_TOKENS:
-        return False, q_len_per_req
-
     if q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD:
         return True, q_len_per_req
 
-    # Prefill-dominant, tiny-decode batches are TTFT-sensitive.
+    # TTFT-heavy / prefill-dominant batches (small decode) tend to regress with
+    # true FP4 fused attention, so route those to the unfused whole-call path.
     if (
         num_prefill_tokens > 0
         and num_decode_tokens <= FP4_FUSION_PREFILL_DOM_MAX_DECODE_TOKENS
@@ -1430,6 +1432,7 @@ class FlashInferImpl(AttentionImpl):
         # because some decode requests may have more than one query token.
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
+
         fp4_fusion_requested = output_scale is not None and output.dtype == FP4_DTYPE
         use_fp4_unfused_fallback, q_len_per_req = _should_use_fp4_unfused_fallback(
             fp4_fusion_requested=fp4_fusion_requested,
@@ -1444,12 +1447,14 @@ class FlashInferImpl(AttentionImpl):
 
         attn_output = output
         if use_fp4_unfused_fallback:
-            # Whole-call fallback: run attention in BF16 and quantize once.
+            # Use BF16 temporary output for whole-call fallback and quantize once
+            # at the end. This avoids mixed writes to FP4 data/scale layout.
             attn_output = torch.empty(
                 (num_actual_tokens, self.num_heads, self.head_size),
                 dtype=torch.bfloat16,
                 device=output.device,
             )
+
         trtllm_o_sf_scale = None if use_fp4_unfused_fallback else self.o_sf_scale
 
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
