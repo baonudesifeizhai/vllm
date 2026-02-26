@@ -1374,7 +1374,9 @@ class FlashInferImpl(AttentionImpl):
         # because some decode requests may have more than one query token.
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
-        if num_decode_tokens % attn_metadata.num_decodes != 0:
+        if attn_metadata.num_decodes <= 0:
+            q_len_per_req = 1
+        elif num_decode_tokens % attn_metadata.num_decodes != 0:
             # This gets triggered when the dummy_run forces
             # attention to be initialized with q_len = 0
             q_len_per_req = 1
