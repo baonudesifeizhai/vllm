@@ -70,6 +70,8 @@ FP4_DTYPE = torch.uint8
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
 # Prefill path has a known FP4 fused kernel cliff when q_len > 1.
 FP4_FUSION_PREFILL_Q_THRESHOLD = 1
+# Decode path can also regress under long-context even at q_len=1.
+FP4_FUSION_DECODE_MAX_SEQ_LEN_THRESHOLD = 512
 # Hysteresis for decode token-count based fallback:
 # - Enter unfused at high decode load.
 # - Exit unfused only after decode load drops below the lower threshold.
@@ -124,8 +126,9 @@ def _resolve_fp4_fallback_modes(
     num_decodes: int,
     num_prefill_tokens: int,
     max_q_len_prefill: int,
+    decode_max_seq_len: int,
 ) -> tuple[bool, bool, bool, int]:
-    decode_unfused, q_len_per_req = _should_use_fp4_decode_unfused_fallback(
+    decode_q_unfused, q_len_per_req = _should_use_fp4_decode_unfused_fallback(
         fp4_fusion_requested=fp4_fusion_requested,
         num_decode_tokens=num_decode_tokens,
         num_decodes=num_decodes,
@@ -139,11 +142,25 @@ def _resolve_fp4_fallback_modes(
     has_prefill = num_prefill_tokens > 0
     has_decode = num_decode_tokens > 0
 
-    use_whole_unfused_fallback = (decode_unfused and not has_prefill) or (
-        prefill_unfused and not has_decode
+    decode_long_context = (
+        has_decode and decode_max_seq_len >= FP4_FUSION_DECODE_MAX_SEQ_LEN_THRESHOLD
     )
-    use_prefill_only_unfused_fallback = prefill_unfused and has_prefill and has_decode
-    use_decode_only_unfused_fallback = decode_unfused and has_prefill and has_decode
+    decode_unfused = decode_q_unfused or decode_long_context
+
+    use_whole_unfused_fallback = (
+        (decode_unfused and not has_prefill)
+        or (prefill_unfused and not has_decode)
+        or (prefill_unfused and has_prefill and has_decode and decode_long_context)
+    )
+    use_prefill_only_unfused_fallback = (
+        prefill_unfused
+        and has_prefill
+        and has_decode
+        and not use_whole_unfused_fallback
+    )
+    use_decode_only_unfused_fallback = (
+        decode_unfused and has_prefill and has_decode and not use_whole_unfused_fallback
+    )
 
     return (
         use_whole_unfused_fallback,
@@ -1462,10 +1479,20 @@ class FlashInferImpl(AttentionImpl):
         # because some decode requests may have more than one query token.
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
+        trtllm_decode_metadata = (
+            attn_metadata.decode
+            if isinstance(attn_metadata.decode, TRTLLMDecode)
+            else None
+        )
         trtllm_prefill_metadata = (
             attn_metadata.prefill
             if isinstance(attn_metadata.prefill, TRTLLMPrefill)
             else None
+        )
+        decode_max_seq_len = (
+            trtllm_decode_metadata.max_seq_len
+            if num_decode_tokens > 0 and trtllm_decode_metadata is not None
+            else 0
         )
         max_q_len_prefill = (
             trtllm_prefill_metadata.max_q_len
@@ -1487,6 +1514,7 @@ class FlashInferImpl(AttentionImpl):
             num_decodes=attn_metadata.num_decodes,
             num_prefill_tokens=num_prefill_tokens,
             max_q_len_prefill=max_q_len_prefill,
+            decode_max_seq_len=decode_max_seq_len,
         )
 
         attn_output = output
