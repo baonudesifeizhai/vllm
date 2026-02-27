@@ -90,20 +90,11 @@ def _get_trtllm_gen_workspace_buffer():
     return trtllm_gen_workspace_buffer
 
 
-def _get_q_len_per_req(num_decode_tokens: int, num_decodes: int) -> int:
-    if num_decodes <= 0 or num_decode_tokens % num_decodes != 0:
-        # Triggered by some dummy runs / non-uniform decode groups.
-        return 1
-    return num_decode_tokens // num_decodes
-
-
-def _should_use_fp4_unfused_fallback(
+def _should_use_fp4_decode_unfused_fallback(
     fp4_fusion_requested: bool,
     num_decode_tokens: int,
     num_decodes: int,
-    fallback_active: bool,
 ) -> tuple[bool, int]:
-    del fallback_active
     if not fp4_fusion_requested or num_decode_tokens <= 0:
         return False, 1
 
@@ -125,6 +116,57 @@ def _should_use_fp4_prefill_unfused_fallback(
     if not fp4_fusion_requested or num_prefill_tokens <= 0:
         return False
     return max_q_len_prefill > FP4_FUSION_PREFILL_Q_THRESHOLD
+
+
+def _resolve_fp4_fallback_modes(
+    fp4_fusion_requested: bool,
+    num_decode_tokens: int,
+    num_decodes: int,
+    num_prefill_tokens: int,
+    max_q_len_prefill: int,
+) -> tuple[bool, bool, bool, int]:
+    decode_unfused, q_len_per_req = _should_use_fp4_decode_unfused_fallback(
+        fp4_fusion_requested=fp4_fusion_requested,
+        num_decode_tokens=num_decode_tokens,
+        num_decodes=num_decodes,
+    )
+    prefill_unfused = _should_use_fp4_prefill_unfused_fallback(
+        fp4_fusion_requested=fp4_fusion_requested,
+        num_prefill_tokens=num_prefill_tokens,
+        max_q_len_prefill=max_q_len_prefill,
+    )
+
+    has_prefill = num_prefill_tokens > 0
+    has_decode = num_decode_tokens > 0
+
+    use_whole_unfused_fallback = (decode_unfused and not has_prefill) or (
+        prefill_unfused and not has_decode
+    )
+    use_prefill_only_unfused_fallback = prefill_unfused and has_prefill and has_decode
+    use_decode_only_unfused_fallback = decode_unfused and has_prefill and has_decode
+
+    return (
+        use_whole_unfused_fallback,
+        use_prefill_only_unfused_fallback,
+        use_decode_only_unfused_fallback,
+        q_len_per_req,
+    )
+
+
+def _quantize_fp4_rows(
+    output: torch.Tensor,
+    input_: torch.Tensor,
+    output_block_scale_i32: torch.Tensor,
+    output_scale: torch.Tensor,
+) -> None:
+    num_tokens = input_.shape[0]
+    torch.ops._C.scaled_fp4_quant(
+        output.reshape(num_tokens, -1),
+        input_.reshape(num_tokens, -1),
+        output_block_scale_i32,
+        output_scale,
+        True,
+    )
 
 
 @triton.jit
@@ -1272,7 +1314,6 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
-        self._fp4_unfused_fallback_active = False
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
@@ -1433,34 +1474,19 @@ class FlashInferImpl(AttentionImpl):
         )
 
         fp4_fusion_requested = output_scale is not None and output.dtype == FP4_DTYPE
-        use_fp4_unfused_fallback, q_len_per_req = _should_use_fp4_unfused_fallback(
+        # Decode and prefill can each hit different FP4 kernel cliffs, so route
+        # fallback mode by batch composition.
+        (
+            use_fp4_whole_unfused_fallback,
+            use_fp4_prefill_only_unfused_fallback,
+            use_fp4_decode_only_unfused_fallback,
+            q_len_per_req,
+        ) = _resolve_fp4_fallback_modes(
             fp4_fusion_requested=fp4_fusion_requested,
             num_decode_tokens=num_decode_tokens,
             num_decodes=attn_metadata.num_decodes,
-            fallback_active=self._fp4_unfused_fallback_active,
-        )
-        use_fp4_prefill_unfused_fallback = _should_use_fp4_prefill_unfused_fallback(
-            fp4_fusion_requested=fp4_fusion_requested,
             num_prefill_tokens=num_prefill_tokens,
             max_q_len_prefill=max_q_len_prefill,
-        )
-        self._fp4_unfused_fallback_active = False
-
-        # Decode-path kernel regression is shape-driven. For mixed
-        # prefill+decode batches, keep prefill on fused path and fallback only
-        # decode to avoid whole-batch post quantization overhead.
-        use_fp4_whole_unfused_fallback = (
-            use_fp4_unfused_fallback and num_prefill_tokens == 0
-        ) or (use_fp4_prefill_unfused_fallback and num_decode_tokens == 0)
-        use_fp4_prefill_only_unfused_fallback = (
-            use_fp4_prefill_unfused_fallback
-            and num_prefill_tokens > 0
-            and num_decode_tokens > 0
-        )
-        use_fp4_decode_only_unfused_fallback = (
-            use_fp4_unfused_fallback
-            and num_prefill_tokens > 0
-            and num_decode_tokens > 0
         )
 
         attn_output = output
@@ -1615,12 +1641,11 @@ class FlashInferImpl(AttentionImpl):
                     output_block_scale_i32 = torch.ops.aten.view.dtype(
                         output_block_scale, torch.int32
                     )
-                    torch.ops._C.scaled_fp4_quant(
-                        output[num_decode_tokens:].reshape(num_prefill_tokens, -1),
-                        prefill_tmp_out.reshape(num_prefill_tokens, -1),
+                    _quantize_fp4_rows(
+                        output[num_decode_tokens:],
+                        prefill_tmp_out,
                         output_block_scale_i32[num_decode_tokens:],
                         output_scale,
-                        True,
                     )
 
         if num_decode_tokens > 0:
@@ -1733,28 +1758,24 @@ class FlashInferImpl(AttentionImpl):
                     output_block_scale_i32 = torch.ops.aten.view.dtype(
                         output_block_scale, torch.int32
                     )
-                    torch.ops._C.scaled_fp4_quant(
-                        output[:num_decode_tokens].reshape(num_decode_tokens, -1),
-                        decode_tmp_out.reshape(num_decode_tokens, -1),
+                    _quantize_fp4_rows(
+                        output[:num_decode_tokens],
+                        decode_tmp_out,
                         output_block_scale_i32,
                         output_scale,
-                        True,
                     )
         if use_fp4_whole_unfused_fallback:
             assert output_scale is not None
             assert output_block_scale is not None
             assert output.dtype == FP4_DTYPE
-            input_2d = attn_output.reshape(num_actual_tokens, -1)
-            output_2d = output.reshape(num_actual_tokens, -1)
             output_block_scale_i32 = torch.ops.aten.view.dtype(
                 output_block_scale, torch.int32
             )
-            torch.ops._C.scaled_fp4_quant(
-                output_2d,
-                input_2d,
+            _quantize_fp4_rows(
+                output,
+                attn_output,
                 output_block_scale_i32,
                 output_scale,
-                True,
             )
         return output_padded
 
