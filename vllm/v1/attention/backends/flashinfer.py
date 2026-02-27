@@ -68,6 +68,8 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT = 2048 * 1024 * 1024
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 FP4_FUSION_DECODE_Q_THRESHOLD = 1
+# Prefill path has a known FP4 fused kernel cliff when q_len > 1.
+FP4_FUSION_PREFILL_Q_THRESHOLD = 1
 # Hysteresis for decode token-count based fallback:
 # - Enter unfused at high decode load.
 # - Exit unfused only after decode load drops below the lower threshold.
@@ -113,6 +115,16 @@ def _should_use_fp4_unfused_fallback(
 
     q_len_per_req = num_decode_tokens // num_decodes
     return q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD, q_len_per_req
+
+
+def _should_use_fp4_prefill_unfused_fallback(
+    fp4_fusion_requested: bool,
+    num_prefill_tokens: int,
+    max_q_len_prefill: int,
+) -> bool:
+    if not fp4_fusion_requested or num_prefill_tokens <= 0:
+        return False
+    return max_q_len_prefill > FP4_FUSION_PREFILL_Q_THRESHOLD
 
 
 @triton.jit
@@ -1409,6 +1421,16 @@ class FlashInferImpl(AttentionImpl):
         # because some decode requests may have more than one query token.
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
+        trtllm_prefill_metadata = (
+            attn_metadata.prefill
+            if isinstance(attn_metadata.prefill, TRTLLMPrefill)
+            else None
+        )
+        max_q_len_prefill = (
+            trtllm_prefill_metadata.max_q_len
+            if num_prefill_tokens > 0 and trtllm_prefill_metadata is not None
+            else 1
+        )
 
         fp4_fusion_requested = output_scale is not None and output.dtype == FP4_DTYPE
         use_fp4_unfused_fallback, q_len_per_req = _should_use_fp4_unfused_fallback(
@@ -1417,6 +1439,11 @@ class FlashInferImpl(AttentionImpl):
             num_decodes=attn_metadata.num_decodes,
             fallback_active=self._fp4_unfused_fallback_active,
         )
+        use_fp4_prefill_unfused_fallback = _should_use_fp4_prefill_unfused_fallback(
+            fp4_fusion_requested=fp4_fusion_requested,
+            num_prefill_tokens=num_prefill_tokens,
+            max_q_len_prefill=max_q_len_prefill,
+        )
         self._fp4_unfused_fallback_active = False
 
         # Decode-path kernel regression is shape-driven. For mixed
@@ -1424,6 +1451,11 @@ class FlashInferImpl(AttentionImpl):
         # decode to avoid whole-batch post quantization overhead.
         use_fp4_whole_unfused_fallback = (
             use_fp4_unfused_fallback and num_prefill_tokens == 0
+        ) or (use_fp4_prefill_unfused_fallback and num_decode_tokens == 0)
+        use_fp4_prefill_only_unfused_fallback = (
+            use_fp4_prefill_unfused_fallback
+            and num_prefill_tokens > 0
+            and num_decode_tokens > 0
         )
         use_fp4_decode_only_unfused_fallback = (
             use_fp4_unfused_fallback
@@ -1517,14 +1549,25 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(block_tables_prefill)
                 assert is_strictly_contiguous(seq_lens_prefill)
 
+                prefill_tmp_out: torch.Tensor | None = None
+                prefill_o_sf_scale = trtllm_o_sf_scale
                 if output.dtype == FP4_DTYPE and not use_fp4_whole_unfused_fallback:
-                    assert trtllm_o_sf_scale is not None
-                    out = FP4Tensor(
-                        data=attn_output[num_decode_tokens:],
-                        scale=output_block_scale,
-                        scale_start_index=num_decode_tokens,
-                        original_shape=prefill_query.shape,
-                    )
+                    if use_fp4_prefill_only_unfused_fallback:
+                        prefill_tmp_out = torch.empty(
+                            (num_prefill_tokens, self.num_heads, self.head_size),
+                            dtype=torch.bfloat16,
+                            device=output.device,
+                        )
+                        out = prefill_tmp_out
+                        prefill_o_sf_scale = None
+                    else:
+                        assert trtllm_o_sf_scale is not None
+                        out = FP4Tensor(
+                            data=attn_output[num_decode_tokens:],
+                            scale=output_block_scale,
+                            scale_start_index=num_decode_tokens,
+                            original_shape=prefill_query.shape,
+                        )
                 else:
                     out = attn_output[num_decode_tokens:]
 
@@ -1562,9 +1605,23 @@ class FlashInferImpl(AttentionImpl):
                     cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
                     window_left=self.window_left,
                     sinks=self.sinks,
-                    o_sf_scale=trtllm_o_sf_scale,
+                    o_sf_scale=prefill_o_sf_scale,
                     out=out,
                 )
+
+                if prefill_tmp_out is not None:
+                    assert output_scale is not None
+                    assert output_block_scale is not None
+                    output_block_scale_i32 = torch.ops.aten.view.dtype(
+                        output_block_scale, torch.int32
+                    )
+                    torch.ops._C.scaled_fp4_quant(
+                        output[num_decode_tokens:].reshape(num_prefill_tokens, -1),
+                        prefill_tmp_out.reshape(num_prefill_tokens, -1),
+                        output_block_scale_i32[num_decode_tokens:],
+                        output_scale,
+                        True,
+                    )
 
         if num_decode_tokens > 0:
             decode_query = query[:num_decode_tokens]
