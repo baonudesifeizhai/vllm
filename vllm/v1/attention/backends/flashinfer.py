@@ -128,6 +128,10 @@ def _resolve_fp4_fallback_modes(
     max_q_len_prefill: int,
     decode_max_seq_len: int,
 ) -> tuple[bool, bool, bool, int]:
+    # Fallback modes in this helper are FP4-fusion specific.
+    if not fp4_fusion_requested:
+        return False, False, False, 1
+
     decode_q_unfused, q_len_per_req = _should_use_fp4_decode_unfused_fallback(
         fp4_fusion_requested=fp4_fusion_requested,
         num_decode_tokens=num_decode_tokens,
