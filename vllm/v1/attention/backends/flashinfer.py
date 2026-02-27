@@ -101,18 +101,18 @@ def _should_use_fp4_unfused_fallback(
     num_decodes: int,
     fallback_active: bool,
 ) -> tuple[bool, int]:
+    del fallback_active
     if not fp4_fusion_requested or num_decode_tokens <= 0:
         return False, 1
 
-    q_len_per_req = _get_q_len_per_req(num_decode_tokens, num_decodes)
-    if q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD:
-        return True, q_len_per_req
+    # Root-cause guard:
+    # Non-uniform decode groups can hide q_len>1 requests. Route these
+    # conservatively to unfused instead of treating them as q_len=1.
+    if num_decodes <= 0 or num_decode_tokens % num_decodes != 0:
+        return True, 1
 
-    if fallback_active:
-        use_fallback = num_decode_tokens >= FP4_FUSION_UNFUSED_EXIT_TOKENS
-    else:
-        use_fallback = num_decode_tokens >= FP4_FUSION_UNFUSED_ENTER_TOKENS
-    return use_fallback, q_len_per_req
+    q_len_per_req = num_decode_tokens // num_decodes
+    return q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD, q_len_per_req
 
 
 @triton.jit
@@ -1161,6 +1161,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # Use the persistent buffer with padding length,
                 # instead of the same address but chunked version
                 # in atten_metadata when using cudagraph.
+                assert seq_lens_cpu is not None
                 fast_plan_decode(
                     decode_wrapper,
                     self.paged_kv_indptr.cpu[: num_input_tokens + 1],
@@ -1416,9 +1417,7 @@ class FlashInferImpl(AttentionImpl):
             num_decodes=attn_metadata.num_decodes,
             fallback_active=self._fp4_unfused_fallback_active,
         )
-        self._fp4_unfused_fallback_active = (
-            fp4_fusion_requested and use_fp4_unfused_fallback
-        )
+        self._fp4_unfused_fallback_active = False
 
         attn_output = output
         if use_fp4_unfused_fallback:
