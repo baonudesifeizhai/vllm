@@ -150,7 +150,9 @@ def _resolve_fp4_fallback_modes(
     use_whole_unfused_fallback = (
         (decode_unfused and not has_prefill)
         or (prefill_unfused and not has_decode)
-        or (prefill_unfused and has_prefill and has_decode and decode_long_context)
+        # prefill-only partial quantization uses sliced output_block_scale and
+        # can be shape-sensitive; keep mixed prefill fallback on whole path.
+        or (prefill_unfused and has_prefill and has_decode)
     )
     use_prefill_only_unfused_fallback = (
         prefill_unfused
