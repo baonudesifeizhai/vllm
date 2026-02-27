@@ -1419,8 +1419,20 @@ class FlashInferImpl(AttentionImpl):
         )
         self._fp4_unfused_fallback_active = False
 
+        # Decode-path kernel regression is shape-driven. For mixed
+        # prefill+decode batches, keep prefill on fused path and fallback only
+        # decode to avoid whole-batch post quantization overhead.
+        use_fp4_whole_unfused_fallback = (
+            use_fp4_unfused_fallback and num_prefill_tokens == 0
+        )
+        use_fp4_decode_only_unfused_fallback = (
+            use_fp4_unfused_fallback
+            and num_prefill_tokens > 0
+            and num_decode_tokens > 0
+        )
+
         attn_output = output
-        if use_fp4_unfused_fallback:
+        if use_fp4_whole_unfused_fallback:
             # Use BF16 temporary output for whole-call fallback and quantize once
             # at the end. This avoids mixed writes to FP4 data/scale layout.
             attn_output = torch.empty(
@@ -1429,7 +1441,7 @@ class FlashInferImpl(AttentionImpl):
                 device=output.device,
             )
 
-        trtllm_o_sf_scale = None if use_fp4_unfused_fallback else self.o_sf_scale
+        trtllm_o_sf_scale = None if use_fp4_whole_unfused_fallback else self.o_sf_scale
 
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
         kv_cache_permute = kv_cache.permute(*stride_order)
@@ -1505,7 +1517,7 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(block_tables_prefill)
                 assert is_strictly_contiguous(seq_lens_prefill)
 
-                if output.dtype == FP4_DTYPE and not use_fp4_unfused_fallback:
+                if output.dtype == FP4_DTYPE and not use_fp4_whole_unfused_fallback:
                     assert trtllm_o_sf_scale is not None
                     out = FP4Tensor(
                         data=attn_output[num_decode_tokens:],
@@ -1618,14 +1630,27 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(block_tables_decode)
                 assert is_strictly_contiguous(seq_lens_decode)
 
-                if output.dtype == FP4_DTYPE and not use_fp4_unfused_fallback:
-                    assert trtllm_o_sf_scale is not None
-                    out = FP4Tensor(
-                        data=attn_output[:num_decode_tokens],
-                        scale=output_block_scale,
-                        scale_start_index=0,
-                        original_shape=decode_query.shape,
-                    )
+                decode_tmp_out: torch.Tensor | None = None
+                decode_o_sf_scale = trtllm_o_sf_scale
+                if output.dtype == FP4_DTYPE:
+                    if use_fp4_decode_only_unfused_fallback:
+                        decode_tmp_out = torch.empty(
+                            (num_decode_tokens, self.num_heads, self.head_size),
+                            dtype=torch.bfloat16,
+                            device=output.device,
+                        )
+                        out = decode_tmp_out
+                        decode_o_sf_scale = None
+                    elif not use_fp4_whole_unfused_fallback:
+                        assert trtllm_o_sf_scale is not None
+                        out = FP4Tensor(
+                            data=attn_output[:num_decode_tokens],
+                            scale=output_block_scale,
+                            scale_start_index=0,
+                            original_shape=decode_query.shape,
+                        )
+                    else:
+                        out = attn_output[:num_decode_tokens]
                 else:
                     out = attn_output[:num_decode_tokens]
 
@@ -1640,11 +1665,25 @@ class FlashInferImpl(AttentionImpl):
                     bmm2_scale=self.bmm2_scale,
                     window_left=self.window_left,
                     sinks=self.sinks,
-                    o_sf_scale=trtllm_o_sf_scale,
+                    o_sf_scale=decode_o_sf_scale,
                     out=out,
                     q_len_per_req=q_len_per_req,
                 )
-        if use_fp4_unfused_fallback:
+
+                if decode_tmp_out is not None:
+                    assert output_scale is not None
+                    assert output_block_scale is not None
+                    output_block_scale_i32 = torch.ops.aten.view.dtype(
+                        output_block_scale, torch.int32
+                    )
+                    torch.ops._C.scaled_fp4_quant(
+                        output[:num_decode_tokens].reshape(num_decode_tokens, -1),
+                        decode_tmp_out.reshape(num_decode_tokens, -1),
+                        output_block_scale_i32,
+                        output_scale,
+                        True,
+                    )
+        if use_fp4_whole_unfused_fallback:
             assert output_scale is not None
             assert output_block_scale is not None
             assert output.dtype == FP4_DTYPE
