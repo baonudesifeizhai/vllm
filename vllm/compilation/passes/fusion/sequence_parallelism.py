@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
 )
+from vllm.model_executor.models.utils import sequence_parallel_split_sizes
 from vllm.platforms import current_platform
 
 from ..inductor_pass import enable_fake_mode
@@ -113,12 +114,29 @@ class _SequenceParallelPatternHelper:
     def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         return tensor_model_parallel_all_reduce(x)
 
-    def _reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+    def _split_sizes_for_tokens(self, num_tokens: int) -> list[int] | None:
+        if num_tokens % self.tp_size != 0:
+            return sequence_parallel_split_sizes(num_tokens, self.tp_size)
+        return None
+
+    def _reduce_scatter(
+        self, x: torch.Tensor, sizes: list[int] | None = None
+    ) -> torch.Tensor:
+        if sizes is not None:
+            return torch.ops.vllm.reduce_scatterv.default(
+                x, dim=0, sizes=sizes, group_name=self.tp_group.unique_name
+            )
         return torch.ops.vllm.reduce_scatter.default(
             x, dim=0, world_size=self.tp_size, group_name=self.tp_group.unique_name
         )
 
-    def _all_gather(self, x: torch.Tensor) -> torch.Tensor:
+    def _all_gather(
+        self, x: torch.Tensor, sizes: list[int] | None = None
+    ) -> torch.Tensor:
+        if sizes is not None:
+            return torch.ops.vllm.all_gatherv.default(
+                x, dim=0, sizes=sizes, group_name=self.tp_group.unique_name
+            )
         return torch.ops.vllm.all_gather.default(
             x, dim=0, world_size=self.tp_size, group_name=self.tp_group.unique_name
         )
@@ -149,10 +167,11 @@ class FirstAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             input: torch.Tensor,
             arg3_1: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            reduce_scatter = self._reduce_scatter(input)
+            split_sizes = self._split_sizes_for_tokens(input.size(0))
+            reduce_scatter = self._reduce_scatter(input, split_sizes)
 
             rmsnorm = self.rmsnorm_matcher(reduce_scatter, arg3_1)
-            all_gather = self._all_gather(rmsnorm)
+            all_gather = self._all_gather(rmsnorm, split_sizes)
             return all_gather, reduce_scatter
 
         pm.register_replacement(
@@ -195,10 +214,11 @@ class MiddleAllReduceRMSNormPattern(_SequenceParallelPatternHelper):
             # pattern matcher replaces from top-to-bottom,
             # so residual is still the full size here.
             # once the seqpar pattern with the previous rmsnorm is replaced
-            reduce_scatter = self._reduce_scatter(mm_1)
+            split_sizes = self._split_sizes_for_tokens(mm_1.size(0))
+            reduce_scatter = self._reduce_scatter(mm_1, split_sizes)
             residual = residual[0 : reduce_scatter.size(0), ...]
             rmsnorm = self.rmsnorm_matcher(reduce_scatter, rms_norm_weights, residual)
-            all_gather = self._all_gather(rmsnorm[0])
+            all_gather = self._all_gather(rmsnorm[0], split_sizes)
             # shape of residual changes but that's fine,
             # next node is already slicing it, now becomes a noop
             return all_gather, rmsnorm[1]
@@ -251,10 +271,11 @@ class FirstAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             weight: torch.Tensor,
             scale: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            reduce_scatter = self._reduce_scatter(input)
+            split_sizes = self._split_sizes_for_tokens(input.size(0))
+            reduce_scatter = self._reduce_scatter(input, split_sizes)
             rms = self.rmsnorm_matcher(reduce_scatter, weight)
             quant, _ = self.quant_matcher(rms, scale)
-            all_gather = self._all_gather(quant)
+            all_gather = self._all_gather(quant, split_sizes)
 
             return all_gather, reduce_scatter
 
@@ -301,13 +322,14 @@ class MiddleAllReduceRMSNormStaticFP8Pattern(_SequenceParallelPatternHelper):
             # so residual is still the full size here.
             # add a temporary slice which will become a noop
             # once the seqpar pattern with the previous rmsnorm is replaced
-            reduce_scatter = self._reduce_scatter(mm_1)
+            split_sizes = self._split_sizes_for_tokens(mm_1.size(0))
+            reduce_scatter = self._reduce_scatter(mm_1, split_sizes)
             residual = residual[0 : reduce_scatter.size(0), ...]
             rms, residual_out = self.rmsnorm_matcher(
                 reduce_scatter, rms_norm_weights, residual
             )
             quant, _ = self.quant_matcher(rms, scale)
-            all_gather = self._all_gather(quant)
+            all_gather = self._all_gather(quant, split_sizes)
             # shape of residual changes but that's fine,
             # next node is already slicing it, now becomes a noop
             return all_gather, residual_out
@@ -431,10 +453,9 @@ class SequenceParallelismPass(VllmPatternMatcherPass):
         if (
             not self.compilation_config.use_inductor_graph_partition
             and self.compilation_config.splitting_ops
+            and not compile_range.is_single_size()
         ):
-            tp_size = get_tensor_model_parallel_world_size()
-            if not compile_range.is_single_size() or compile_range.end % tp_size != 0:
-                return False
+            return False
 
         # min_token_num is None when SP is disabled for this device/config
         # (e.g., non-CUDA platform, unsupported GPU, or small hidden_size)

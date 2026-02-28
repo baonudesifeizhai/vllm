@@ -28,7 +28,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import supports_any_eagle
 from vllm.multimodal import NestedTensors
 from vllm.sequence import IntermediateTensors
-from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import (
     is_pin_memory_available,
 )
@@ -229,15 +228,13 @@ class AutoWeightsLoader:
         """
         if isinstance(
             module,
-            (
-                nn.BatchNorm1d,
-                nn.BatchNorm2d,
-                nn.BatchNorm3d,
-                nn.LazyBatchNorm1d,
-                nn.LazyBatchNorm2d,
-                nn.LazyBatchNorm3d,
-                nn.SyncBatchNorm,
-            ),
+            nn.BatchNorm1d
+            | nn.BatchNorm2d
+            | nn.BatchNorm3d
+            | nn.LazyBatchNorm1d
+            | nn.LazyBatchNorm2d
+            | nn.LazyBatchNorm3d
+            | nn.SyncBatchNorm,
         ):
             module_state_dict = module.state_dict()
             for stat_name in ("running_mean", "running_var", "num_batches_tracked"):
@@ -249,7 +246,7 @@ class AutoWeightsLoader:
         module: nn.Module,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> Iterable[str]:
-        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
+        if isinstance(module, StageMissingLayer | PPMissingLayer):
             return
 
         # Avoid infinite recursion since this function is typically
@@ -655,7 +652,7 @@ def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
 
     missing_layer_names = []
     for name, module in model.named_modules():
-        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
+        if isinstance(module, StageMissingLayer | PPMissingLayer):
             # NOTE: the trailing dot is used to match the prefix of the layer.
             # without the dot, we could match a layer that is not missing,
             # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
@@ -667,7 +664,7 @@ def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
 
 def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
     """Check if a parameter is missing in a pipeline parallel model."""
-    if isinstance(model, (StageMissingLayer, PPMissingLayer)):
+    if isinstance(model, StageMissingLayer | PPMissingLayer):
         return True
 
     return any(
@@ -803,6 +800,12 @@ def fast_topk(
 # NOTE: This is wrapped in a torch custom op to work around the following issue:
 # The output tensor can have a sequence length 0 at small input sequence lengths
 # even though we explicitly pad to avoid this.
+def sequence_parallel_split_sizes(num_tokens: int, tp_size: int) -> list[int]:
+    base = num_tokens // tp_size
+    remainder = num_tokens % tp_size
+    return [base + (1 if rank < remainder else 0) for rank in range(tp_size)]
+
+
 def sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm.sequence_parallel_chunk_impl(x)
 
@@ -810,26 +813,17 @@ def sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
 def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
-
-    # all_gather needs the sequence length to be divisible by tp_size
-    seq_len = x.size(0)
-    remainder = seq_len % tp_size
-    if remainder != 0:
-        pad_len = tp_size - remainder
-        y = nn.functional.pad(x, (0, 0, 0, pad_len))
-    else:
-        y = x
-
-    chunk = y.shape[0] // tp_size
-    start = tp_rank * chunk
-    return torch.narrow(y, 0, start, chunk)
+    split_sizes = sequence_parallel_split_sizes(x.size(0), tp_size)
+    start = sum(split_sizes[:tp_rank])
+    return torch.narrow(x, 0, start, split_sizes[tp_rank])
 
 
 def sequence_parallel_chunk_impl_fake(x: torch.Tensor) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
-    seq_len = cdiv(x.size(0), tp_size)
+    rank = get_tensor_model_parallel_rank()
+    split_sizes = sequence_parallel_split_sizes(x.size(0), tp_size)
     shape = list(x.shape)
-    shape[0] = seq_len
+    shape[0] = split_sizes[rank]
     out = torch.empty(shape, dtype=x.dtype, device=x.device)
     return out
 

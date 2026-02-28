@@ -149,6 +149,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gelu_quick(Tensor! out, Tensor input) -> ()");
   ops.impl("gelu_quick", torch::kCUDA, &gelu_quick);
 
+  // Ragged GEMM utility kernel.
+  ops.def(
+      "ragged_mm_slice(Tensor! out, Tensor a, Tensor b, int out_row_start) "
+      "-> ()");
+  ops.impl("ragged_mm_slice", torch::kCUDA, &ragged_mm_slice);
+
   // Layernorm
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   ops.def(

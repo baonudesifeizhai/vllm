@@ -16,6 +16,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from ..fx_utils import is_func
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
@@ -405,6 +406,92 @@ class AsyncTPPass(VllmPatternMatcherPass):
 
         self.dump_patterns(config, self.patterns)
 
+    @staticmethod
+    def _get_call_arg(
+        node: fx.Node, index: int, name: str, default: object | None = None
+    ) -> object | None:
+        if len(node.args) > index:
+            return node.args[index]
+        return node.kwargs.get(name, default)
+
+    def _rewrite_ragged_all_gatherv_mm(self, graph: fx.Graph) -> int:
+        replaced = 0
+        for node in list(graph.nodes):
+            if not is_func(node, torch.ops.aten.mm.default):
+                continue
+
+            all_gatherv = self._get_call_arg(node, 0, "self")
+            weight = self._get_call_arg(node, 1, "mat2")
+            if not isinstance(all_gatherv, fx.Node):
+                continue
+            if not is_func(all_gatherv, torch.ops.vllm.all_gatherv.default):
+                continue
+            if weight is None:
+                continue
+
+            gather_dim = self._get_call_arg(all_gatherv, 1, "dim", 0)
+            if gather_dim != 0:
+                continue
+
+            ag_input = self._get_call_arg(all_gatherv, 0, "tensor")
+            sizes = self._get_call_arg(all_gatherv, 2, "sizes")
+            group_name = self._get_call_arg(all_gatherv, 3, "group_name")
+            if ag_input is None or group_name is None or sizes is None:
+                continue
+
+            with graph.inserting_before(node):
+                fused = graph.call_function(
+                    torch.ops.vllm.ragged_all_gatherv_matmul.default,
+                    args=(ag_input, weight, gather_dim, sizes, group_name),
+                )
+
+            node.replace_all_uses_with(fused)
+            graph.erase_node(node)
+            if len(all_gatherv.users) == 0:
+                graph.erase_node(all_gatherv)
+            replaced += 1
+
+        return replaced
+
+    def _rewrite_ragged_mm_reduce_scatterv(self, graph: fx.Graph) -> int:
+        replaced = 0
+        for node in list(graph.nodes):
+            if not is_func(node, torch.ops.vllm.reduce_scatterv.default):
+                continue
+
+            mm = self._get_call_arg(node, 0, "tensor")
+            if not isinstance(mm, fx.Node):
+                continue
+            if not is_func(mm, torch.ops.aten.mm.default):
+                continue
+
+            mm_input = self._get_call_arg(mm, 0, "self")
+            mm_weight = self._get_call_arg(mm, 1, "mat2")
+            if mm_input is None or mm_weight is None:
+                continue
+
+            scatter_dim = self._get_call_arg(node, 1, "dim", 0)
+            if scatter_dim != 0:
+                continue
+            sizes = self._get_call_arg(node, 2, "sizes")
+            group_name = self._get_call_arg(node, 3, "group_name")
+            if group_name is None or sizes is None:
+                continue
+
+            with graph.inserting_before(node):
+                fused = graph.call_function(
+                    torch.ops.vllm.ragged_matmul_reduce_scatterv.default,
+                    args=(mm_input, mm_weight, scatter_dim, sizes, group_name),
+                )
+
+            node.replace_all_uses_with(fused)
+            graph.erase_node(node)
+            if len(mm.users) == 0:
+                graph.erase_node(mm)
+            replaced += 1
+
+        return replaced
+
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         # This pass is applied on top of the sequence parallelism pass.
         # It inherits the same applicability condition as `SequenceParallelismPass`.
@@ -414,10 +501,11 @@ class AsyncTPPass(VllmPatternMatcherPass):
             or self.compilation_config.use_inductor_graph_partition
         ):
             return True
-        tp_size = get_tensor_model_parallel_world_size()
-        return bool(compile_range.is_single_size() and compile_range.end % tp_size == 0)
+        return bool(compile_range.is_single_size())
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self.matched_count = self.patterns.apply(graph)
+        self.matched_count += self._rewrite_ragged_all_gatherv_mm(graph)
+        self.matched_count += self._rewrite_ragged_mm_reduce_scatterv(graph)
         logger.debug("Replaced %s patterns", self.matched_count)

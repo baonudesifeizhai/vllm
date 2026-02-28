@@ -172,6 +172,321 @@ def all_gather_fake(
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
+def _normalize_dim(dim: int, ndim: int) -> int:
+    if not -ndim <= dim < ndim:
+        raise ValueError(f"Invalid dim ({dim}) for tensor dim {ndim}")
+    return dim if dim >= 0 else dim + ndim
+
+
+def _prefix_sums(sizes: list[int]) -> list[int]:
+    offsets = [0]
+    for size in sizes:
+        offsets.append(offsets[-1] + size)
+    return offsets
+
+
+def _get_pynccl_comm(group: "GroupCoordinator"):
+    comm = group.device_communicator
+    if comm is None:
+        return None
+    pynccl_comm = getattr(comm, "pynccl_comm", None)
+    if pynccl_comm is None or pynccl_comm.disabled:
+        return None
+    return pynccl_comm
+
+
+def reduce_scatterv(
+    tensor: torch.Tensor,
+    dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._reduce_scatterv_out_place(tensor, dim=dim, sizes=sizes)
+
+
+def reduce_scatterv_fake(
+    tensor: torch.Tensor,
+    dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    dim = _normalize_dim(dim, tensor.dim())
+    group = _groups.get(group_name, lambda: None)()
+    rank_in_group = 0 if group is None else group.rank_in_group
+    world_size = 1 if group is None else group.world_size
+
+    if sizes is None:
+        if tensor.shape[dim] % world_size != 0:
+            raise ValueError(
+                "reduce_scatterv fake impl requires divisible dim when sizes "
+                "is not provided."
+            )
+        out_dim = tensor.shape[dim] // world_size
+    else:
+        if rank_in_group >= len(sizes):
+            raise ValueError(
+                f"Invalid rank {rank_in_group} for sizes len {len(sizes)}."
+            )
+        out_dim = sizes[rank_in_group]
+
+    new_shape = list(tensor.shape)
+    new_shape[dim] = out_dim
+    return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
+
+
+def all_gatherv(
+    tensor: torch.Tensor,
+    dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_gatherv_out_place(tensor, dim=dim, sizes=sizes)
+
+
+def all_gatherv_fake(
+    tensor: torch.Tensor,
+    dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    dim = _normalize_dim(dim, tensor.dim())
+    group = _groups.get(group_name, lambda: None)()
+    world_size = 1 if group is None else group.world_size
+
+    out_dim = sum(sizes) if sizes is not None else tensor.shape[dim] * world_size
+    new_shape = list(tensor.shape)
+    new_shape[dim] = out_dim
+    return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
+
+
+def ragged_all_gatherv_matmul(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    gather_dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    if gather_dim != 0 or sizes is None:
+        gathered = all_gatherv(
+            input_, dim=gather_dim, sizes=sizes, group_name=group_name
+        )
+        return torch.ops.aten.mm.default(gathered, weight)
+    if input_.dim() != 2 or weight.dim() != 2:
+        gathered = all_gatherv(input_, dim=0, sizes=sizes, group_name=group_name)
+        return torch.ops.aten.mm.default(gathered, weight)
+
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if group.world_size == 1:
+        return torch.ops.aten.mm.default(input_, weight)
+
+    pynccl_comm = _get_pynccl_comm(group)
+    if pynccl_comm is None or not input_.is_cuda or not weight.is_cuda:
+        gathered = group._all_gatherv_out_place(input_, dim=0, sizes=sizes)
+        return torch.ops.aten.mm.default(gathered, weight)
+    if len(sizes) != group.world_size:
+        raise ValueError(
+            f"sizes len {len(sizes)} must match world size {group.world_size}."
+        )
+    if input_.shape[0] != sizes[group.rank_in_group]:
+        raise ValueError(
+            f"Local rows {input_.shape[0]} must match sizes[{group.rank_in_group}] "
+            f"{sizes[group.rank_in_group]}."
+        )
+
+    offsets = _prefix_sums(sizes)
+    max_rows = max(sizes)
+    out_rows = offsets[-1]
+    out_cols = weight.shape[1]
+
+    output = torch.empty((out_rows, out_cols), dtype=input_.dtype, device=input_.device)
+    staging = [
+        torch.empty(
+            (max_rows, input_.shape[1]), dtype=input_.dtype, device=input_.device
+        ),
+        torch.empty(
+            (max_rows, input_.shape[1]), dtype=input_.dtype, device=input_.device
+        ),
+    ]
+
+    comm_stream = torch.cuda.Stream(device=input_.device)
+    compute_stream = torch.cuda.Stream(device=input_.device)
+    current_stream = torch.cuda.current_stream(device=input_.device)
+    buffer_free = [torch.cuda.Event(), torch.cuda.Event()]
+    for event in buffer_free:
+        event.record(current_stream)
+
+    for root, rows in enumerate(sizes):
+        if rows == 0:
+            continue
+        buf_idx = root % 2
+        comm_done = torch.cuda.Event()
+
+        with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(buffer_free[buf_idx])
+            recv_chunk = staging[buf_idx][:rows]
+            send_chunk = input_ if group.rank_in_group == root else recv_chunk
+            pynccl_comm.broadcast_root(send_chunk, recv_chunk, root, stream=comm_stream)
+            comm_done.record(comm_stream)
+
+        with torch.cuda.stream(compute_stream):
+            compute_stream.wait_event(comm_done)
+            if hasattr(torch.ops._C, "ragged_mm_slice"):
+                torch.ops._C.ragged_mm_slice(
+                    output,
+                    staging[buf_idx][:rows],
+                    weight,
+                    offsets[root],
+                )
+            else:
+                torch.mm(
+                    staging[buf_idx][:rows],
+                    weight,
+                    out=output[offsets[root] : offsets[root + 1]],
+                )
+            buffer_free[buf_idx].record(compute_stream)
+
+    current_stream.wait_stream(compute_stream)
+    current_stream.wait_stream(comm_stream)
+    return output
+
+
+def ragged_all_gatherv_matmul_fake(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    gather_dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    gathered = all_gatherv_fake(
+        input_, dim=gather_dim, sizes=sizes, group_name=group_name
+    )
+    if gathered.dim() != 2 or weight.dim() != 2:
+        raise NotImplementedError(
+            "ragged_all_gatherv_matmul fake impl currently supports 2D mm only."
+        )
+    shape = [gathered.shape[0], weight.shape[1]]
+    return torch.empty(shape, dtype=gathered.dtype, device=gathered.device)
+
+
+def ragged_matmul_reduce_scatterv(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    scatter_dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    if scatter_dim != 0 or sizes is None:
+        mm = torch.ops.aten.mm.default(input_, weight)
+        return reduce_scatterv(mm, dim=scatter_dim, sizes=sizes, group_name=group_name)
+    if input_.dim() != 2 or weight.dim() != 2:
+        mm = torch.ops.aten.mm.default(input_, weight)
+        return reduce_scatterv(mm, dim=0, sizes=sizes, group_name=group_name)
+
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    if group.world_size == 1:
+        return torch.ops.aten.mm.default(input_, weight)
+
+    pynccl_comm = _get_pynccl_comm(group)
+    if pynccl_comm is None or not input_.is_cuda or not weight.is_cuda:
+        mm = torch.ops.aten.mm.default(input_, weight)
+        return group._reduce_scatterv_out_place(mm, dim=0, sizes=sizes)
+    if len(sizes) != group.world_size:
+        raise ValueError(
+            f"sizes len {len(sizes)} must match world size {group.world_size}."
+        )
+    if input_.shape[0] != sum(sizes):
+        raise ValueError(
+            f"Input rows {input_.shape[0]} must equal sum(sizes)={sum(sizes)}."
+        )
+
+    offsets = _prefix_sums(sizes)
+    local_rows = sizes[group.rank_in_group]
+    out_cols = weight.shape[1]
+    output = torch.empty(
+        (local_rows, out_cols), dtype=input_.dtype, device=input_.device
+    )
+
+    max_rows = max(sizes)
+    staging = [
+        torch.empty((max_rows, out_cols), dtype=input_.dtype, device=input_.device),
+        torch.empty((max_rows, out_cols), dtype=input_.dtype, device=input_.device),
+    ]
+
+    comm_stream = torch.cuda.Stream(device=input_.device)
+    compute_stream = torch.cuda.Stream(device=input_.device)
+    current_stream = torch.cuda.current_stream(device=input_.device)
+    buffer_free = [torch.cuda.Event(), torch.cuda.Event()]
+    for event in buffer_free:
+        event.record(current_stream)
+
+    for root, rows in enumerate(sizes):
+        if rows == 0:
+            continue
+        buf_idx = root % 2
+        compute_done = torch.cuda.Event()
+
+        with torch.cuda.stream(compute_stream):
+            compute_stream.wait_event(buffer_free[buf_idx])
+            if hasattr(torch.ops._C, "ragged_mm_slice"):
+                torch.ops._C.ragged_mm_slice(
+                    staging[buf_idx],
+                    input_[offsets[root] : offsets[root + 1]],
+                    weight,
+                    0,
+                )
+            else:
+                torch.mm(
+                    input_[offsets[root] : offsets[root + 1]],
+                    weight,
+                    out=staging[buf_idx][:rows],
+                )
+            compute_done.record(compute_stream)
+
+        with torch.cuda.stream(comm_stream):
+            comm_stream.wait_event(compute_done)
+            pynccl_comm.reduce_root(
+                staging[buf_idx][:rows],
+                output,
+                root,
+                stream=comm_stream,
+            )
+            buffer_free[buf_idx].record(comm_stream)
+
+    current_stream.wait_stream(comm_stream)
+    current_stream.wait_stream(compute_stream)
+    return output
+
+
+def ragged_matmul_reduce_scatterv_fake(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    scatter_dim: int,
+    sizes: list[int] | None,
+    group_name: str,
+) -> torch.Tensor:
+    if input_.dim() != 2 or weight.dim() != 2:
+        raise NotImplementedError(
+            "ragged_matmul_reduce_scatterv fake impl supports 2D mm only."
+        )
+    mm_shape = [input_.shape[0], weight.shape[1]]
+    mm = torch.empty(mm_shape, dtype=input_.dtype, device=input_.device)
+    return reduce_scatterv_fake(mm, dim=scatter_dim, sizes=sizes, group_name=group_name)
+
+
 def patched_fused_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -272,6 +587,30 @@ direct_register_custom_op(
     op_name="all_gather",
     op_func=all_gather,
     fake_impl=all_gather_fake,
+)
+
+direct_register_custom_op(
+    op_name="reduce_scatterv",
+    op_func=reduce_scatterv,
+    fake_impl=reduce_scatterv_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_gatherv",
+    op_func=all_gatherv,
+    fake_impl=all_gatherv_fake,
+)
+
+direct_register_custom_op(
+    op_name="ragged_all_gatherv_matmul",
+    op_func=ragged_all_gatherv_matmul,
+    fake_impl=ragged_all_gatherv_matmul_fake,
+)
+
+direct_register_custom_op(
+    op_name="ragged_matmul_reduce_scatterv",
+    op_func=ragged_matmul_reduce_scatterv,
+    fake_impl=ragged_matmul_reduce_scatterv_fake,
 )
 
 # TODO: Remove this once the pytorch fix
@@ -542,6 +881,20 @@ class GroupCoordinator:
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        if self.world_size == 1:
+            return input_
+        if self.use_custom_op_call and isinstance(input_, torch.Tensor):
+            return torch.ops.vllm.all_gatherv(
+                input_, dim, sizes, group_name=self.unique_name
+            )
+        return self._all_gatherv_out_place(input_, dim, sizes)
+
+    def _all_gatherv_out_place(
+        self,
+        input_: torch.Tensor | list[torch.Tensor],
+        dim: int,
+        sizes: list[int] | None,
+    ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
@@ -564,6 +917,17 @@ class GroupCoordinator:
 
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        if self.use_custom_op_call:
+            return torch.ops.vllm.reduce_scatterv(
+                input_, dim, sizes, group_name=self.unique_name
+            )
+        return self._reduce_scatterv_out_place(input_, dim, sizes)
+
+    def _reduce_scatterv_out_place(
+        self, input_: torch.Tensor, dim: int, sizes: list[int] | None
     ) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")

@@ -20,6 +20,7 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.distributed import (
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
@@ -100,6 +101,57 @@ class TestAGMMModel(torch.nn.Module):
 
     def ops_in_model_after(self):
         return [torch.ops.symm_mem.fused_all_gather_matmul.default]
+
+
+class TestRaggedAGMMModel(torch.nn.Module):
+    def __init__(self, hidden_size=16, dtype=torch.float16):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.weight = torch.nn.Parameter(
+            torch.empty((hidden_size, hidden_size)), requires_grad=False
+        )
+        self.sizes = [63, 65]
+        torch.nn.init.normal_(self.weight, std=0.02)
+
+    def forward(self, hidden_states):
+        tp_group = get_tp_group()
+        local_rows = self.sizes[tp_group.rank_in_group]
+        local = hidden_states[:local_rows].reshape(-1, self.hidden_size)
+        all_gatherv = tp_group.all_gatherv(local, dim=0, sizes=self.sizes)
+        permute = self.weight.permute(1, 0)
+        return torch.mm(all_gatherv, permute)
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.all_gatherv.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.ragged_all_gatherv_matmul.default]
+
+
+class TestRaggedMMRSModel(torch.nn.Module):
+    def __init__(self, hidden_size=16, dtype=torch.float16):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.weight = torch.nn.Parameter(
+            torch.empty((hidden_size, hidden_size)), requires_grad=False
+        )
+        self.sizes = [63, 65]
+        torch.nn.init.normal_(self.weight, std=0.02)
+
+    def forward(self, hidden_states):
+        tp_group = get_tp_group()
+        view = hidden_states[: sum(self.sizes)].reshape(-1, self.hidden_size)
+        permute = self.weight.permute(1, 0)
+        mm = torch.mm(view, permute)
+        return tp_group.reduce_scatterv(mm, dim=0, sizes=self.sizes)
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.reduce_scatterv.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.ragged_matmul_reduce_scatterv.default]
 
 
 class _BaseScaledMMModel(torch.nn.Module):
@@ -230,6 +282,8 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
     [
         TestMMRSModel,
         TestAGMMModel,
+        TestRaggedAGMMModel,
+        TestRaggedMMRSModel,
         TestScaledMMRSModel,
         TestAGScaledMMModel,
         TestCutlassScaledMMRSModel,

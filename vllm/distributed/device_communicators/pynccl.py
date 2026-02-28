@@ -238,6 +238,47 @@ class PyNcclCommunicator:
             split_offset += split_size
         self.nccl.ncclGroupEnd()
 
+    def broadcast_root(
+        self,
+        input_tensor: torch.Tensor,
+        output_tensor: torch.Tensor,
+        root: int,
+        stream=None,
+    ) -> None:
+        """Broadcast one ragged chunk from ``root`` into ``output_tensor``."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert output_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the output tensor is on {output_tensor.device}"
+        )
+        if stream is None:
+            stream = current_stream()
+
+        if self.rank == root:
+            if input_tensor.numel() != output_tensor.numel():
+                raise ValueError(
+                    "On root rank, input and output for broadcast_root "
+                    "must have equal numel."
+                )
+            sendbuff = buffer_type(input_tensor.data_ptr())
+        else:
+            sendbuff = buffer_type()
+
+        self.nccl.ncclBroadcast(
+            sendbuff,
+            buffer_type(output_tensor.data_ptr()),
+            output_tensor.numel(),
+            ncclDataTypeEnum.from_torch(output_tensor.dtype),
+            root,
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
+
     def reduce_scatter(
         self,
         output_tensor: torch.Tensor,
@@ -302,6 +343,49 @@ class PyNcclCommunicator:
             )
             split_offset += split_size
         self.nccl.ncclGroupEnd()
+
+    def reduce_root(
+        self,
+        input_tensor: torch.Tensor,
+        output_tensor: torch.Tensor,
+        root: int,
+        op: ReduceOp = ReduceOp.SUM,
+        stream=None,
+    ) -> None:
+        """Reduce one ragged chunk to ``root`` into ``output_tensor``."""
+        if self.disabled:
+            return
+        assert input_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the input tensor is on {input_tensor.device}"
+        )
+        assert output_tensor.device == self.device, (
+            f"this nccl communicator is created to work on {self.device}, "
+            f"but the output tensor is on {output_tensor.device}"
+        )
+        if stream is None:
+            stream = current_stream()
+
+        if self.rank == root:
+            if output_tensor.numel() < input_tensor.numel():
+                raise ValueError(
+                    "On root rank, output for reduce_root must be large enough "
+                    "to hold input."
+                )
+            recvbuff = buffer_type(output_tensor.data_ptr())
+        else:
+            recvbuff = buffer_type()
+
+        self.nccl.ncclReduce(
+            buffer_type(input_tensor.data_ptr()),
+            recvbuff,
+            input_tensor.numel(),
+            ncclDataTypeEnum.from_torch(input_tensor.dtype),
+            ncclRedOpTypeEnum.from_torch(op),
+            root,
+            self.comm,
+            cudaStream_t(stream.cuda_stream),
+        )
 
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:

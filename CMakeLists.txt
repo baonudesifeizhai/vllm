@@ -289,6 +289,7 @@ set(VLLM_EXT_SRC
   "csrc/attention/vertical_slash_index.cu"
   "csrc/pos_encoding_kernels.cu"
   "csrc/activation_kernels.cu"
+  "csrc/ragged_kernels.cu"
   "csrc/layernorm_kernels.cu"
   "csrc/fused_qknorm_rope_kernel.cu"
   "csrc/layernorm_quant_kernels.cu"

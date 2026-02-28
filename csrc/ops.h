@@ -182,6 +182,9 @@ void gelu_fast(torch::Tensor& out, torch::Tensor& input);
 
 void gelu_quick(torch::Tensor& out, torch::Tensor& input);
 
+void ragged_mm_slice(torch::Tensor& out, torch::Tensor const& a,
+                     torch::Tensor const& b, int64_t out_row_start);
+
 void cutlass_mla_decode(torch::Tensor const& out, torch::Tensor const& q_nope,
                         torch::Tensor const& q_pe,
                         torch::Tensor const& kv_c_and_k_pe_cache,
