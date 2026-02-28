@@ -897,27 +897,51 @@ def sequence_parallel_chunk(x: torch.Tensor) -> torch.Tensor:
     return torch.ops.vllm.sequence_parallel_chunk_impl(x)
 
 
+def sequence_parallel_split_sizes(num_tokens: int) -> list[int]:
+    tp_size = get_tensor_model_parallel_world_size()
+    if not envs.VLLM_ENABLE_SP_RAGGED:
+        # Legacy SP path pads to TP-even size.
+        return [cdiv(num_tokens, tp_size)] * tp_size
+    base, remainder = divmod(num_tokens, tp_size)
+    return [base + (1 if rank < remainder else 0) for rank in range(tp_size)]
+
+
 def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
     tp_rank = get_tensor_model_parallel_rank()
 
-    # all_gather needs the sequence length to be divisible by tp_size
     seq_len = x.size(0)
-    remainder = seq_len % tp_size
-    if remainder != 0:
-        pad_len = tp_size - remainder
-        y = nn.functional.pad(x, (0, 0, 0, pad_len))
-    else:
-        y = x
+    if not envs.VLLM_ENABLE_SP_RAGGED:
+        # Legacy SP path: pad then evenly split.
+        remainder = seq_len % tp_size
+        if remainder != 0:
+            pad_len = tp_size - remainder
+            y = nn.functional.pad(x, (0, 0, 0, pad_len))
+        else:
+            y = x
 
-    chunk = y.shape[0] // tp_size
-    start = tp_rank * chunk
-    return torch.narrow(y, 0, start, chunk)
+        chunk = y.shape[0] // tp_size
+        start = tp_rank * chunk
+        return torch.narrow(y, 0, start, chunk)
+
+    base, remainder = divmod(seq_len, tp_size)
+    chunk = base + (1 if tp_rank < remainder else 0)
+    start = tp_rank * base + min(tp_rank, remainder)
+    return torch.narrow(x, 0, start, chunk)
 
 
 def sequence_parallel_chunk_impl_fake(x: torch.Tensor) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
-    seq_len = cdiv(x.size(0), tp_size)
+    tp_rank = get_tensor_model_parallel_rank()
+    if not envs.VLLM_ENABLE_SP_RAGGED:
+        seq_len = cdiv(x.size(0), tp_size)
+    else:
+        seq_len_dim0 = x.size(0)
+        if isinstance(seq_len_dim0, int):
+            base, remainder = divmod(seq_len_dim0, tp_size)
+            seq_len = base + (1 if tp_rank < remainder else 0)
+        else:
+            seq_len = cdiv(seq_len_dim0, tp_size)
     shape = list(x.shape)
     shape[0] = seq_len
     out = torch.empty(shape, dtype=x.dtype, device=x.device)

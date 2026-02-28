@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -224,9 +225,9 @@ def is_residual_scattered_for_sp(
     if tp == 1:
         return False
 
-    # When sequence parallelism is enabled, we always pad num_input_tokens
-    # to be a multiple of tensor_parallel_size (tp) earlier.
-    assert num_input_tokens % tp == 0
+    if not envs.VLLM_ENABLE_SP_RAGGED:
+        # Legacy SP path always pads token count to TP-even.
+        assert num_input_tokens % tp == 0
 
     if (
         not vllm_config.compilation_config.splitting_ops
@@ -237,3 +238,10 @@ def is_residual_scattered_for_sp(
     if compile_sizes is None:
         return False
     return num_input_tokens in compile_sizes
+
+
+def get_local_tokens_for_sp(num_tokens: int, tp: int, tp_rank: int) -> int:
+    if not envs.VLLM_ENABLE_SP_RAGGED:
+        return num_tokens // tp
+    base, remainder = divmod(num_tokens, tp)
+    return base + (1 if tp_rank < remainder else 0)

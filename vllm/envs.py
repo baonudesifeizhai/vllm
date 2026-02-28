@@ -238,6 +238,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
+    VLLM_ENABLE_SP_RAGGED: bool = False
 
 
 def get_default_cache_root():
@@ -1585,6 +1586,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
     "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+    # Enable ragged sequence parallelism path
+    # (token dim does not require TP-even split).
+    # Default disabled to preserve legacy SP behavior.
+    "VLLM_ENABLE_SP_RAGGED": lambda: bool(int(os.getenv("VLLM_ENABLE_SP_RAGGED", "0"))),
 }
 
 

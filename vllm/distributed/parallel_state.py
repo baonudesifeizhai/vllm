@@ -133,6 +133,28 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def _normalize_dim(dim: int, ndims: int) -> int:
+    return dim + ndims if dim < 0 else dim
+
+
+def _compute_balanced_split_sizes(total_size: int, world_size: int) -> list[int]:
+    base, remainder = divmod(total_size, world_size)
+    return [base + (1 if rank < remainder else 0) for rank in range(world_size)]
+
+
+def _all_gather_local_sizes(
+    group: "GroupCoordinator", local_size: int, device: torch.device
+) -> list[int]:
+    if group.world_size == 1:
+        return [local_size]
+    if group.device_group is None:
+        return [local_size] * group.world_size
+    local = torch.tensor([local_size], dtype=torch.int64, device=device)
+    gathered = torch.empty(group.world_size, dtype=torch.int64, device=device)
+    torch.distributed.all_gather_into_tensor(gathered, local, group=group.device_group)
+    return [int(x) for x in gathered.tolist()]
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -140,14 +162,29 @@ def reduce_scatter(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    dim = _normalize_dim(dim, tensor.dim())
+    if (
+        envs.VLLM_ENABLE_SP_RAGGED
+        and dim == 0
+        and int(tensor.shape[0]) % world_size != 0
+    ):
+        sizes = _compute_balanced_split_sizes(int(tensor.shape[0]), world_size)
+        return group.reduce_scatterv(tensor, dim=0, sizes=sizes)
     return group._reduce_scatter_out_place(tensor, dim)
 
 
 def reduce_scatter_fake(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
+    dim = _normalize_dim(dim, tensor.dim())
     new_shape = list(tensor.shape)
-    new_shape[dim] = tensor.shape[dim] // world_size
+    if envs.VLLM_ENABLE_SP_RAGGED and dim == 0 and tensor.shape[dim] % world_size != 0:
+        group = _groups[group_name]() if group_name in _groups else None
+        rank = 0 if group is None else group.rank_in_group
+        sizes = _compute_balanced_split_sizes(int(tensor.shape[dim]), world_size)
+        new_shape[dim] = sizes[rank]
+    else:
+        new_shape[dim] = tensor.shape[dim] // world_size
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
@@ -158,14 +195,61 @@ def all_gather(
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
+    dim = _normalize_dim(dim, tensor.dim())
+    if envs.VLLM_ENABLE_SP_RAGGED and dim == 0:
+        local_size = int(tensor.shape[0])
+        sizes = _all_gather_local_sizes(group, local_size, tensor.device)
+        if any(size != sizes[0] for size in sizes):
+            return group.all_gatherv(tensor, dim=0, sizes=sizes)
     return group._all_gather_out_place(tensor, dim)
 
 
 def all_gather_fake(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
+    dim = _normalize_dim(dim, tensor.dim())
     new_shape = list(tensor.shape)
     new_shape[dim] = tensor.shape[dim] * world_size
+    return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
+
+
+def reduce_scatterv(
+    tensor: torch.Tensor, dim: int, sizes: list[int], group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group.reduce_scatterv(tensor, dim, sizes)
+
+
+def reduce_scatterv_fake(
+    tensor: torch.Tensor, dim: int, sizes: list[int], group_name: str
+) -> torch.Tensor:
+    dim = _normalize_dim(dim, tensor.dim())
+    group = _groups[group_name]() if group_name in _groups else None
+    rank = 0 if group is None else group.rank_in_group
+    new_shape = list(tensor.shape)
+    new_shape[dim] = sizes[rank]
+    return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
+
+
+def all_gatherv(
+    tensor: torch.Tensor, dim: int, sizes: list[int], group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group.all_gatherv(tensor, dim, sizes)
+
+
+def all_gatherv_fake(
+    tensor: torch.Tensor, dim: int, sizes: list[int], group_name: str
+) -> torch.Tensor:
+    dim = _normalize_dim(dim, tensor.dim())
+    new_shape = list(tensor.shape)
+    new_shape[dim] = sum(sizes)
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
@@ -269,6 +353,18 @@ direct_register_custom_op(
     op_name="all_gather",
     op_func=all_gather,
     fake_impl=all_gather_fake,
+)
+
+direct_register_custom_op(
+    op_name="reduce_scatterv",
+    op_func=reduce_scatterv,
+    fake_impl=reduce_scatterv_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_gatherv",
+    op_func=all_gatherv,
+    fake_impl=all_gatherv_fake,
 )
 
 # TODO: Remove this once the pytorch fix
@@ -512,7 +608,9 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def all_gather(
+        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -520,6 +618,22 @@ class GroupCoordinator:
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
+        if dim < 0:
+            dim += input_.dim()
+
+        if envs.VLLM_ENABLE_SP_RAGGED:
+            if sizes is None and dim == 0 and not self.use_custom_op_call:
+                sizes = _all_gather_local_sizes(
+                    self, int(input_.shape[0]), input_.device
+                )
+                if all(size == sizes[0] for size in sizes):
+                    sizes = None
+            if sizes is not None:
+                if self.use_custom_op_call:
+                    return torch.ops.vllm.all_gatherv(
+                        input_, dim, sizes, group_name=self.unique_name
+                    )
+                return self.all_gatherv(input_, dim, sizes)
 
         if self.use_custom_op_call:
             return torch.ops.vllm.all_gather(
@@ -543,7 +657,9 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    def reduce_scatter(
+        self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
+    ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
@@ -551,6 +667,20 @@ class GroupCoordinator:
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
+        if dim < 0:
+            dim += input_.dim()
+
+        if envs.VLLM_ENABLE_SP_RAGGED:
+            if sizes is None and dim == 0 and int(input_.shape[dim]) % world_size != 0:
+                sizes = _compute_balanced_split_sizes(
+                    int(input_.shape[dim]), world_size
+                )
+            if sizes is not None:
+                if self.use_custom_op_call:
+                    return torch.ops.vllm.reduce_scatterv(
+                        input_, dim, sizes, group_name=self.unique_name
+                    )
+                return self.reduce_scatterv(input_, dim, sizes)
 
         if self.use_custom_op_call:
             return torch.ops.vllm.reduce_scatter(
