@@ -75,8 +75,8 @@ FP4_FUSION_DECODE_MAX_SEQ_LEN_THRESHOLD = 512
 # Hysteresis for decode token-count based fallback:
 # - Enter unfused at high decode load.
 # - Exit unfused only after decode load drops below the lower threshold.
-FP4_FUSION_UNFUSED_ENTER_TOKENS = 96
-FP4_FUSION_UNFUSED_EXIT_TOKENS = 64
+FP4_FUSION_UNFUSED_ENTER_TOKENS = 128
+FP4_FUSION_UNFUSED_EXIT_TOKENS = 96
 
 logger = init_logger(__name__)
 
@@ -96,6 +96,8 @@ def _should_use_fp4_decode_unfused_fallback(
     fp4_fusion_requested: bool,
     num_decode_tokens: int,
     num_decodes: int,
+    num_prefill_tokens: int,
+    fallback_active: bool,
 ) -> tuple[bool, int]:
     if not fp4_fusion_requested or num_decode_tokens <= 0:
         return False, 1
@@ -107,7 +109,16 @@ def _should_use_fp4_decode_unfused_fallback(
         return True, 1
 
     q_len_per_req = num_decode_tokens // num_decodes
-    return q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD, q_len_per_req
+    if q_len_per_req > FP4_FUSION_DECODE_Q_THRESHOLD:
+        return True, q_len_per_req
+
+    # Hysteresis is only meaningful for pure decode load.
+    if num_prefill_tokens <= 0:
+        if fallback_active:
+            return num_decode_tokens > FP4_FUSION_UNFUSED_EXIT_TOKENS, q_len_per_req
+        return num_decode_tokens >= FP4_FUSION_UNFUSED_ENTER_TOKENS, q_len_per_req
+
+    return False, q_len_per_req
 
 
 def _should_use_fp4_prefill_unfused_fallback(
@@ -127,6 +138,7 @@ def _resolve_fp4_fallback_modes(
     num_prefill_tokens: int,
     max_q_len_prefill: int,
     decode_max_seq_len: int,
+    fallback_active: bool,
 ) -> tuple[bool, bool, bool, int]:
     # Fallback modes in this helper are FP4-fusion specific.
     if not fp4_fusion_requested:
@@ -136,6 +148,8 @@ def _resolve_fp4_fallback_modes(
         fp4_fusion_requested=fp4_fusion_requested,
         num_decode_tokens=num_decode_tokens,
         num_decodes=num_decodes,
+        num_prefill_tokens=num_prefill_tokens,
+        fallback_active=fallback_active,
     )
     prefill_unfused = _should_use_fp4_prefill_unfused_fallback(
         fp4_fusion_requested=fp4_fusion_requested,
@@ -149,11 +163,17 @@ def _resolve_fp4_fallback_modes(
     decode_long_context = (
         has_decode and decode_max_seq_len >= FP4_FUSION_DECODE_MAX_SEQ_LEN_THRESHOLD
     )
+    prefill_dominant_with_small_decode = (
+        has_prefill
+        and num_decode_tokens <= 32
+        and num_prefill_tokens >= 4 * max(num_decode_tokens, 1)
+    )
     decode_unfused = decode_q_unfused or decode_long_context
 
     use_whole_unfused_fallback = (
         (decode_unfused and not has_prefill)
         or (prefill_unfused and not has_decode)
+        or prefill_dominant_with_small_decode
         # prefill-only partial quantization uses sliced output_block_scale and
         # can be shape-sensitive; keep mixed prefill fallback on whole path.
         or (prefill_unfused and has_prefill and has_decode)
@@ -1337,6 +1357,7 @@ class FlashInferImpl(AttentionImpl):
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
         self.o_sf_scale: float | None = None
+        self._fp4_unfused_fallback_active = False
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
@@ -1521,6 +1542,12 @@ class FlashInferImpl(AttentionImpl):
             num_prefill_tokens=num_prefill_tokens,
             max_q_len_prefill=max_q_len_prefill,
             decode_max_seq_len=decode_max_seq_len,
+            fallback_active=self._fp4_unfused_fallback_active,
+        )
+        self._fp4_unfused_fallback_active = (
+            fp4_fusion_requested
+            and num_prefill_tokens == 0
+            and use_fp4_whole_unfused_fallback
         )
 
         attn_output = output
