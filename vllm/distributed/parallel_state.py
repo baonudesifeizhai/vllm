@@ -256,92 +256,6 @@ def patched_fused_scaled_matmul_reduce_scatter(
     )
 
 
-def fused_bmm_fp8_reduce_scatter_fake(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    out_dtype: torch.dtype,
-    reduce_op: str,
-    scatter_dim: int,
-    world_size: int,
-    group_name: str,
-) -> torch.Tensor:
-    out_shape = [*A.shape[:-1], B.shape[1]]
-    out_shape[scatter_dim] = out_shape[scatter_dim] // world_size
-    return torch.empty(out_shape, dtype=out_dtype, device=A.device)
-
-
-def fused_bmm_fp8_reduce_scatter(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    out_dtype: torch.dtype,
-    reduce_op: str,
-    scatter_dim: int,
-    world_size: int,
-    group_name: str,
-) -> torch.Tensor:
-    # FlashInfer bmm_fp8 takes 3D inputs, while model code works with 2D tensors.
-    bmm_out = torch.ops.vllm.bmm_fp8(
-        A.unsqueeze(0),
-        B.unsqueeze(0),
-        A_scale,
-        B_scale,
-        out_dtype,
-        "auto",
-    )
-    mm_out = bmm_out.view(*A.shape[:-1], B.shape[1])
-    # Route collective through vLLM GroupCoordinator to preserve existing
-    # communicator selection (PyNCCL/custom/symm_mem) used by AsyncTP baseline.
-    if reduce_op != "sum":
-        raise ValueError(
-            f"Only sum reduce_op is supported in fused_bmm_fp8_reduce_scatter, "
-            f"got {reduce_op}"
-        )
-    return reduce_scatter(mm_out, scatter_dim, world_size, group_name)
-
-
-def fused_all_gather_bmm_fp8_fake(
-    A_local: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    out_dtype: torch.dtype,
-    gather_dim: int,
-    world_size: int,
-    group_name: str,
-) -> torch.Tensor:
-    out_shape = [*A_local.shape[:-1], B.shape[1]]
-    out_shape[gather_dim] = out_shape[gather_dim] * world_size
-    return torch.empty(out_shape, dtype=out_dtype, device=A_local.device)
-
-
-def fused_all_gather_bmm_fp8(
-    A_local: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    out_dtype: torch.dtype,
-    gather_dim: int,
-    world_size: int,
-    group_name: str,
-) -> torch.Tensor:
-    # Route collective through vLLM GroupCoordinator to preserve existing
-    # communicator selection (PyNCCL/custom/symm_mem) used by AsyncTP baseline.
-    gathered = all_gather(A_local, gather_dim, world_size, group_name)
-    bmm_out = torch.ops.vllm.bmm_fp8(
-        gathered.unsqueeze(0),
-        B.unsqueeze(0),
-        A_scale,
-        B_scale,
-        out_dtype,
-        "auto",
-    )
-    return bmm_out.view(*gathered.shape[:-1], B.shape[1])
-
-
 direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
@@ -367,18 +281,6 @@ direct_register_custom_op(
     op_name="patched_fused_scaled_matmul_reduce_scatter",
     op_func=patched_fused_scaled_matmul_reduce_scatter,
     fake_impl=patched_fused_scaled_matmul_reduce_scatter_fake,
-)
-
-direct_register_custom_op(
-    op_name="fused_bmm_fp8_reduce_scatter",
-    op_func=fused_bmm_fp8_reduce_scatter,
-    fake_impl=fused_bmm_fp8_reduce_scatter_fake,
-)
-
-direct_register_custom_op(
-    op_name="fused_all_gather_bmm_fp8",
-    op_func=fused_all_gather_bmm_fp8,
-    fake_impl=fused_all_gather_bmm_fp8_fake,
 )
 
 
