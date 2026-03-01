@@ -224,6 +224,58 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
         return [torch.ops.symm_mem.fused_all_gather_scaled_matmul.default]
 
 
+class _BaseBMMFP8Model(torch.nn.Module):
+    def __init__(self, hidden_size=16, dtype=torch.bfloat16):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.weight = torch.empty((hidden_size, hidden_size), dtype=FP8_DTYPE)
+        self.scale_a = torch.ones(1, dtype=torch.float32)
+        self.scale_b = torch.ones(1, dtype=torch.float32)
+
+
+class TestBMMFP8RSModel(_BaseBMMFP8Model):
+    def forward(self, input: torch.Tensor):
+        fp8_input = input.to(FP8_DTYPE)
+        bmm = torch.ops.vllm.bmm_fp8.default(
+            fp8_input.unsqueeze(0),
+            self.weight.unsqueeze(0),
+            self.scale_a,
+            self.scale_b,
+            self.dtype,
+            "auto",
+        )
+        mm = bmm.view(fp8_input.shape[0], self.weight.shape[1])
+        return tensor_model_parallel_reduce_scatter(mm, dim=0)
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.reduce_scatter.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default]
+
+
+class TestAGBMMFP8Model(_BaseBMMFP8Model):
+    def forward(self, input: torch.Tensor):
+        fp8_input = input.to(FP8_DTYPE)
+        all_gather = tensor_model_parallel_all_gather(fp8_input, dim=0)
+        bmm = torch.ops.vllm.bmm_fp8.default(
+            all_gather.unsqueeze(0),
+            self.weight.unsqueeze(0),
+            self.scale_a,
+            self.scale_b,
+            self.dtype,
+            "auto",
+        )
+        return bmm.view(all_gather.shape[0], self.weight.shape[1])
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.all_gather.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.fused_all_gather_bmm_fp8.default]
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize(
     "test_model",
@@ -234,6 +286,8 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
         TestAGScaledMMModel,
         TestCutlassScaledMMRSModel,
         TestAGCutlassScaledMMModel,
+        TestBMMFP8RSModel,
+        TestAGBMMFP8Model,
     ],
 )
 @pytest.mark.parametrize("batch_size", [8])
@@ -264,6 +318,12 @@ def test_async_tp_pass_replace(
             "Only bf16 high precision output types are supported for "
             "per-token (row-wise) scaling"
         )
+
+    if test_model in (TestBMMFP8RSModel, TestAGBMMFP8Model):
+        if dtype == torch.float16:
+            pytest.skip("bmm_fp8 fusion tests only run with bfloat16 output dtype")
+        if not hasattr(torch.ops.vllm, "bmm_fp8"):
+            pytest.skip("bmm_fp8 op is unavailable (requires FlashInfer)")
 
     num_processes = 2
 
