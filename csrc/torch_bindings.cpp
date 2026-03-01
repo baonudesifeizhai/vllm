@@ -244,6 +244,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   // conditionally compiled so impl registration is in source file
 
+  // Experimental fused fp8 bmm + collective overlap entrypoints.
+  ops.def(
+      "fused_bmm_fp8_reduce_scatter_overlap("
+      "Tensor a, Tensor b, Tensor a_scale, Tensor b_scale, "
+      "ScalarType out_dtype, str reduce_op, int scatter_dim, int world_size, "
+      "str group_name) -> Tensor");
+  ops.impl("fused_bmm_fp8_reduce_scatter_overlap", torch::kCUDA,
+           &fused_bmm_fp8_reduce_scatter_overlap);
+
+  ops.def(
+      "fused_all_gather_bmm_fp8_overlap("
+      "Tensor a_local, Tensor b, Tensor a_scale, Tensor b_scale, "
+      "ScalarType out_dtype, int gather_dim, int world_size, "
+      "str group_name) -> Tensor");
+  ops.impl("fused_all_gather_bmm_fp8_overlap", torch::kCUDA,
+           &fused_all_gather_bmm_fp8_overlap);
+
   // Quantized GEMM for AWQ.
   ops.def(
       "awq_gemm(Tensor _in_feats, Tensor _kernel, Tensor _scaling_factors, "

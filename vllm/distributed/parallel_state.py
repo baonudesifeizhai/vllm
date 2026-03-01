@@ -43,6 +43,7 @@ import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -283,7 +284,31 @@ def fused_bmm_fp8_reduce_scatter(
     world_size: int,
     group_name: str,
 ) -> torch.Tensor:
-    # FlashInfer bmm_fp8 takes 3D inputs, while model code works with 2D tensors.
+    if reduce_op != "sum":
+        raise ValueError(
+            f"Only sum reduce_op is supported in fused_bmm_fp8_reduce_scatter, "
+            f"got {reduce_op}"
+        )
+
+    if ops.has_fused_bmm_fp8_collective_overlap():
+        try:
+            return ops.fused_bmm_fp8_reduce_scatter_overlap(
+                A,
+                B,
+                A_scale,
+                B_scale,
+                out_dtype,
+                reduce_op,
+                scatter_dim,
+                world_size,
+                group_name,
+            )
+        except RuntimeError:
+            # Fallback for unsupported shapes or runtime constraints
+            # (e.g., CUDA graph capture).
+            pass
+
+    # Legacy fallback path.
     bmm_out = torch.ops.vllm.bmm_fp8(
         A.unsqueeze(0),
         B.unsqueeze(0),
@@ -293,13 +318,6 @@ def fused_bmm_fp8_reduce_scatter(
         "auto",
     )
     mm_out = bmm_out.view(*A.shape[:-1], B.shape[1])
-    # Route collective through vLLM GroupCoordinator to preserve existing
-    # communicator selection (PyNCCL/custom/symm_mem) used by AsyncTP baseline.
-    if reduce_op != "sum":
-        raise ValueError(
-            f"Only sum reduce_op is supported in fused_bmm_fp8_reduce_scatter, "
-            f"got {reduce_op}"
-        )
     return reduce_scatter(mm_out, scatter_dim, world_size, group_name)
 
 
@@ -328,8 +346,24 @@ def fused_all_gather_bmm_fp8(
     world_size: int,
     group_name: str,
 ) -> torch.Tensor:
-    # Route collective through vLLM GroupCoordinator to preserve existing
-    # communicator selection (PyNCCL/custom/symm_mem) used by AsyncTP baseline.
+    if ops.has_fused_bmm_fp8_collective_overlap():
+        try:
+            return ops.fused_all_gather_bmm_fp8_overlap(
+                A_local,
+                B,
+                A_scale,
+                B_scale,
+                out_dtype,
+                gather_dim,
+                world_size,
+                group_name,
+            )
+        except RuntimeError:
+            # Fallback for unsupported shapes or runtime constraints
+            # (e.g., CUDA graph capture).
+            pass
+
+    # Legacy fallback path.
     gathered = all_gather(A_local, gather_dim, world_size, group_name)
     bmm_out = torch.ops.vllm.bmm_fp8(
         gathered.unsqueeze(0),

@@ -416,4 +416,16 @@ int64_t qr_max_size();
 #ifndef USE_ROCM
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
                        torch::Tensor const& mat_b);
+
+torch::Tensor fused_bmm_fp8_reduce_scatter_overlap(
+    torch::Tensor const& A, torch::Tensor const& B,
+    torch::Tensor const& A_scale, torch::Tensor const& B_scale,
+    c10::ScalarType out_dtype, std::string const& reduce_op,
+    int64_t scatter_dim, int64_t world_size, std::string const& group_name);
+
+torch::Tensor fused_all_gather_bmm_fp8_overlap(
+    torch::Tensor const& A_local, torch::Tensor const& B,
+    torch::Tensor const& A_scale, torch::Tensor const& B_scale,
+    c10::ScalarType out_dtype, int64_t gather_dim, int64_t world_size,
+    std::string const& group_name);
 #endif

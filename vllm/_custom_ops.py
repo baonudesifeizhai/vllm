@@ -2841,6 +2841,58 @@ def dsv3_fused_a_gemm(
     torch.ops._C.dsv3_fused_a_gemm(output, mat_a, mat_b)
 
 
+def has_fused_bmm_fp8_collective_overlap() -> bool:
+    return hasattr(torch.ops._C, "fused_bmm_fp8_reduce_scatter_overlap") and hasattr(
+        torch.ops._C, "fused_all_gather_bmm_fp8_overlap"
+    )
+
+
+def fused_bmm_fp8_reduce_scatter_overlap(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    reduce_op: str,
+    scatter_dim: int,
+    world_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    return torch.ops._C.fused_bmm_fp8_reduce_scatter_overlap(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        out_dtype,
+        reduce_op,
+        scatter_dim,
+        world_size,
+        group_name,
+    )
+
+
+def fused_all_gather_bmm_fp8_overlap(
+    A_local: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    gather_dim: int,
+    world_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    return torch.ops._C.fused_all_gather_bmm_fp8_overlap(
+        A_local,
+        B,
+        A_scale,
+        B_scale,
+        out_dtype,
+        gather_dim,
+        world_size,
+        group_name,
+    )
+
+
 if hasattr(torch.ops._C, "weight_packed_linear"):
 
     @register_fake("_C::weight_packed_linear")
