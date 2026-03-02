@@ -47,7 +47,8 @@ std::vector<int64_t> compute_balanced_split_sizes(int64_t total,
 torch::Tensor call_tensor_op(std::string const& op_name,
                              std::string const& overload,
                              std::vector<c10::IValue> stack) {
-  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(op_name, overload);
+  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(op_name.c_str(),
+                                                           overload.c_str());
   op.callBoxed(&stack);
   TORCH_CHECK(stack.size() == 1 && stack[0].isTensor(), op_name,
               " must return a Tensor");
