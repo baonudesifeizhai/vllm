@@ -84,6 +84,48 @@ torch::Tensor reinterpret_as_fp8_e4m3(torch::Tensor const& input) {
   return call_tensor_op("aten::view", "dtype", std::move(stack));
 }
 
+torch::Tensor reinterpret_as_uint8(torch::Tensor const& input) {
+  std::vector<c10::IValue> stack;
+  stack.emplace_back(input);
+  stack.emplace_back(static_cast<int64_t>(at::ScalarType::Byte));
+  return call_tensor_op("aten::view", "dtype", std::move(stack));
+}
+
+int64_t round_up(int64_t value, int64_t multiple) {
+  return ((value + multiple - 1) / multiple) * multiple;
+}
+
+torch::Tensor maybe_pad_fp4_activation(torch::Tensor const& input,
+                                       int64_t target_cols) {
+  if (input.size(1) == target_cols) {
+    return input;
+  }
+  TORCH_CHECK(input.size(1) < target_cols,
+              "Activation packed K must be <= weight packed K, got ",
+              input.size(1), " > ", target_cols);
+  auto padded = torch::zeros({input.size(0), target_cols}, input.options());
+  padded.narrow(1, 0, input.size(1)).copy_(input);
+  return padded;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> call_scaled_fp4_quant_swizzled(
+    torch::Tensor const& input, torch::Tensor const& input_global_scale) {
+  TORCH_CHECK(input.dim() == 2, "Expected 2D activation for scaled_fp4_quant");
+  TORCH_CHECK(input.size(1) % 16 == 0,
+              "Last dim must be a multiple of 16 for scaled_fp4_quant");
+
+  const int64_t m = input.size(0);
+  const int64_t n = input.size(1);
+  auto output_q =
+      torch::empty({m, n / 2}, input.options().dtype(torch::kUInt8));
+  auto output_scale_i32 =
+      torch::empty({round_up(m, 128), round_up(n / 16, 4) / 4},
+                   input.options().dtype(torch::kInt32));
+  scaled_fp4_quant(output_q, input, output_scale_i32, input_global_scale, true);
+  auto output_scale_fp8 = reinterpret_as_fp8_e4m3(output_scale_i32);
+  return {output_q, output_scale_fp8};
+}
+
 torch::Tensor to_blocked_flat(torch::Tensor const& input) {
   TORCH_CHECK(input.dim() == 2, "scale tensor must be 2D");
 
@@ -171,6 +213,32 @@ torch::Tensor call_vllm_reduce_scatterv(torch::Tensor const& tensor,
   return call_tensor_op("vllm::reduce_scatterv", "", std::move(stack));
 }
 
+torch::Tensor call_vllm_flashinfer_mm_fp4(torch::Tensor const& A_q,
+                                          torch::Tensor const& B_t,
+                                          torch::Tensor const& A_scale,
+                                          torch::Tensor const& B_scale_t,
+                                          torch::Tensor const& alpha,
+                                          std::string const& backend) {
+  auto A_scale_mm = A_scale;
+  auto B_scale_mm = B_scale_t;
+  if (backend == "cutlass" || backend == "cudnn") {
+    A_scale_mm = reinterpret_as_uint8(A_scale_mm);
+    B_scale_mm = reinterpret_as_uint8(B_scale_mm);
+  }
+  const bool use_8x4_sf_layout = backend == "trtllm" && A_q.size(0) <= 32;
+
+  std::vector<c10::IValue> stack;
+  stack.emplace_back(A_q);
+  stack.emplace_back(B_t);
+  stack.emplace_back(A_scale_mm);
+  stack.emplace_back(B_scale_mm);
+  stack.emplace_back(alpha);
+  stack.emplace_back(at::ScalarType::BFloat16);
+  stack.emplace_back(use_8x4_sf_layout);
+  stack.emplace_back(backend);
+  return call_tensor_op("vllm::flashinfer_mm_fp4", "", std::move(stack));
+}
+
 std::vector<int64_t> gather_dim0_sizes(torch::Tensor const& local_shard,
                                        int64_t world_size,
                                        std::string const& group_name) {
@@ -256,4 +324,57 @@ torch::Tensor fused_all_gather_quantize_nvf4_matmul(
   cutlass_scaled_fp4_mm(mm_out, A_q_out, B_q, A_scale_blocked, B_scale_blocked,
                         alpha);
   return mm_out;
+}
+
+torch::Tensor fused_scaled_fp4_quant_flashinfer_mm_reduce_scatter(
+    torch::Tensor const& A, torch::Tensor const& B_t,
+    torch::Tensor const& input_global_scale, torch::Tensor const& B_scale_t,
+    torch::Tensor const& alpha, const std::string& reduce_op,
+    int64_t scatter_dim, int64_t world_size, const std::string& group_name,
+    const std::string& backend) {
+  (void)reduce_op;
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(A));
+
+  auto [A_q, A_scale] = call_scaled_fp4_quant_swizzled(A, input_global_scale);
+  auto A_q_padded = maybe_pad_fp4_activation(A_q, B_t.size(0));
+  auto mm_out = call_vllm_flashinfer_mm_fp4(A_q_padded, B_t, A_scale, B_scale_t,
+                                            alpha, backend);
+
+  const int64_t dim = normalize_dim(scatter_dim, mm_out.dim());
+  if (world_size > 1 && dim == 0 && mm_out.size(0) % world_size != 0) {
+    auto sizes = compute_balanced_split_sizes(mm_out.size(0), world_size);
+    return call_vllm_reduce_scatterv(mm_out, dim, sizes, group_name);
+  }
+  return call_vllm_reduce_scatter(mm_out, dim, world_size, group_name);
+}
+
+torch::Tensor fused_all_gather_scaled_fp4_quant_flashinfer_mm(
+    torch::Tensor const& A_shard, torch::Tensor const& B_t,
+    torch::Tensor const& input_global_scale, torch::Tensor const& B_scale_t,
+    torch::Tensor const& alpha, int64_t gather_dim, int64_t world_size,
+    const std::string& group_name, const std::string& backend) {
+  const c10::cuda::OptionalCUDAGuard device_guard(device_of(A_shard));
+
+  const int64_t dim = normalize_dim(gather_dim, A_shard.dim());
+  auto gathered = A_shard;
+  if (world_size > 1) {
+    if (dim == 0) {
+      auto sizes = gather_dim0_sizes(A_shard, world_size, group_name);
+      const bool is_ragged =
+          !std::all_of(sizes.begin() + 1, sizes.end(),
+                       [&](int64_t s) { return s == sizes.front(); });
+      gathered =
+          is_ragged
+              ? call_vllm_all_gatherv(A_shard, dim, sizes, group_name)
+              : call_vllm_all_gather(A_shard, dim, world_size, group_name);
+    } else {
+      gathered = call_vllm_all_gather(A_shard, dim, world_size, group_name);
+    }
+  }
+
+  auto [A_q, A_scale] =
+      call_scaled_fp4_quant_swizzled(gathered, input_global_scale);
+  auto A_q_padded = maybe_pad_fp4_activation(A_q, B_t.size(0));
+  return call_vllm_flashinfer_mm_fp4(A_q_padded, B_t, A_scale, B_scale_t, alpha,
+                                     backend);
 }

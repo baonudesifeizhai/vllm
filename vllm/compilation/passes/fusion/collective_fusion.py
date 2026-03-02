@@ -288,6 +288,237 @@ class AllGatherNvfp4QuantizeMatmulPattern(BasePattern):
         )
 
 
+class ScaledFp4QuantFlashinferMMReduceScatterPattern(BasePattern):
+    def get_inputs(self) -> list[torch.Tensor]:
+        a = torch.empty([16, 64], device=self.device, dtype=torch.bfloat16)
+        a_q = torch.empty([16, 32], device=self.device, dtype=torch.uint8)
+        a_scale = torch.empty([128, 1], device=self.device, dtype=torch.int32)
+        input_global_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        b_t = torch.empty([32, 16], device=self.device, dtype=torch.uint8)
+        b_scale_t = torch.empty([4, 16], device=self.device, dtype=torch.float8_e4m3fn)
+        alpha = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [a, a_q, a_scale, input_global_scale, b_t, b_scale_t, alpha]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            a: torch.Tensor,
+            a_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            b_t: torch.Tensor,
+            b_scale_t: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            quant_out = torch.ops.higher_order.auto_functionalized(
+                torch.ops._C.scaled_fp4_quant.default,
+                output=a_q,
+                input=a,
+                output_scale=a_scale,
+                input_scale=input_global_scale,
+                is_sf_swizzled_layout=True,
+            )
+            mm = torch.ops.vllm.flashinfer_mm_fp4.default(
+                quant_out[1],
+                b_t,
+                quant_out[2].view(torch.float8_e4m3fn),
+                b_scale_t,
+                alpha,
+                self.dtype,
+                False,
+                "cutlass",
+            )
+            return torch.ops.vllm.reduce_scatter.default(
+                mm,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        def replacement(
+            a: torch.Tensor,
+            a_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            b_t: torch.Tensor,
+            b_scale_t: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            del a_q, a_scale
+            return torch.ops._C.fused_scaled_fp4_quant_flashinfer_mm_reduce_scatter(
+                a,
+                b_t,
+                input_global_scale,
+                b_scale_t,
+                alpha,
+                "sum",
+                scatter_dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+                backend="cutlass",
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+        split_sizes = self._compute_ragged_split_sizes()
+        if split_sizes is None:
+            return
+
+        def pattern_v(
+            a: torch.Tensor,
+            a_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            b_t: torch.Tensor,
+            b_scale_t: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            quant_out = torch.ops.higher_order.auto_functionalized(
+                torch.ops._C.scaled_fp4_quant.default,
+                output=a_q,
+                input=a,
+                output_scale=a_scale,
+                input_scale=input_global_scale,
+                is_sf_swizzled_layout=True,
+            )
+            mm = torch.ops.vllm.flashinfer_mm_fp4.default(
+                quant_out[1],
+                b_t,
+                quant_out[2].view(torch.float8_e4m3fn),
+                b_scale_t,
+                alpha,
+                self.dtype,
+                False,
+                "cutlass",
+            )
+            return torch.ops.vllm.reduce_scatterv.default(
+                mm,
+                dim=0,
+                sizes=split_sizes,
+                group_name=self.tp.unique_name,
+            )
+
+        pm.register_replacement(
+            pattern_v, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class AllGatherScaledFp4QuantFlashinferMMPattern(BasePattern):
+    def get_inputs(self) -> list[torch.Tensor]:
+        a_shard = torch.empty([8, 64], device=self.device, dtype=torch.bfloat16)
+        a_q = torch.empty([16, 32], device=self.device, dtype=torch.uint8)
+        a_scale = torch.empty([128, 1], device=self.device, dtype=torch.int32)
+        input_global_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        b_t = torch.empty([32, 16], device=self.device, dtype=torch.uint8)
+        b_scale_t = torch.empty([4, 16], device=self.device, dtype=torch.float8_e4m3fn)
+        alpha = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [a_shard, a_q, a_scale, input_global_scale, b_t, b_scale_t, alpha]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            a_shard: torch.Tensor,
+            a_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            b_t: torch.Tensor,
+            b_scale_t: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            gathered = torch.ops.vllm.all_gather.default(
+                a_shard,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+            quant_out = torch.ops.higher_order.auto_functionalized(
+                torch.ops._C.scaled_fp4_quant.default,
+                output=a_q,
+                input=gathered,
+                output_scale=a_scale,
+                input_scale=input_global_scale,
+                is_sf_swizzled_layout=True,
+            )
+            return torch.ops.vllm.flashinfer_mm_fp4.default(
+                quant_out[1],
+                b_t,
+                quant_out[2].view(torch.float8_e4m3fn),
+                b_scale_t,
+                alpha,
+                self.dtype,
+                False,
+                "cutlass",
+            )
+
+        def replacement(
+            a_shard: torch.Tensor,
+            a_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            b_t: torch.Tensor,
+            b_scale_t: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            del a_q, a_scale
+            return torch.ops._C.fused_all_gather_scaled_fp4_quant_flashinfer_mm(
+                a_shard,
+                b_t,
+                input_global_scale,
+                b_scale_t,
+                alpha,
+                gather_dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+                backend="cutlass",
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+        split_sizes = self._compute_ragged_split_sizes()
+        if split_sizes is None:
+            return
+
+        def pattern_v(
+            a_shard: torch.Tensor,
+            a_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            input_global_scale: torch.Tensor,
+            b_t: torch.Tensor,
+            b_scale_t: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            gathered = torch.ops.vllm.all_gatherv.default(
+                a_shard,
+                dim=0,
+                sizes=split_sizes,
+                group_name=self.tp.unique_name,
+            )
+            quant_out = torch.ops.higher_order.auto_functionalized(
+                torch.ops._C.scaled_fp4_quant.default,
+                output=a_q,
+                input=gathered,
+                output_scale=a_scale,
+                input_scale=input_global_scale,
+                is_sf_swizzled_layout=True,
+            )
+            return torch.ops.vllm.flashinfer_mm_fp4.default(
+                quant_out[1],
+                b_t,
+                quant_out[2].view(torch.float8_e4m3fn),
+                b_scale_t,
+                alpha,
+                self.dtype,
+                False,
+                "cutlass",
+            )
+
+        pm.register_replacement(
+            pattern_v, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
 class ScaledMMReduceScatterPattern(BasePattern):
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -579,6 +810,12 @@ class AsyncTPPass(VllmPatternMatcherPass):
             and hasattr(torch.ops.vllm, "fused_quantize_nv")
             and hasattr(torch.ops.vllm, "matmul_nvf4_bf16")
         )
+        has_flashinfer_nvf4_fused_ops = (
+            hasattr(torch.ops._C, "fused_scaled_fp4_quant_flashinfer_mm_reduce_scatter")
+            and hasattr(torch.ops._C, "fused_all_gather_scaled_fp4_quant_flashinfer_mm")
+            and hasattr(torch.ops._C, "scaled_fp4_quant")
+            and hasattr(torch.ops.vllm, "flashinfer_mm_fp4")
+        )
         if self.model_dtype == torch.bfloat16 and has_nvf4_fused_ops:
             Nvfp4MatmulReduceScatterPattern(self.model_dtype, self.device).register(
                 self.patterns
@@ -586,6 +823,13 @@ class AsyncTPPass(VllmPatternMatcherPass):
             AllGatherNvfp4QuantizeMatmulPattern(self.model_dtype, self.device).register(
                 self.patterns
             )
+        if self.model_dtype == torch.bfloat16 and has_flashinfer_nvf4_fused_ops:
+            ScaledFp4QuantFlashinferMMReduceScatterPattern(
+                self.model_dtype, self.device
+            ).register(self.patterns)
+            AllGatherScaledFp4QuantFlashinferMMPattern(
+                self.model_dtype, self.device
+            ).register(self.patterns)
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling

@@ -436,6 +436,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fused_all_gather_quantize_nvf4_matmul", torch::kCUDA,
            &fused_all_gather_quantize_nvf4_matmul);
 
+  // Fused static fp4 quant + flashinfer fp4 GEMM + reduce-scatter(+v).
+  ops.def(
+      "fused_scaled_fp4_quant_flashinfer_mm_reduce_scatter("
+      "Tensor a, Tensor b_t, Tensor input_global_scale, Tensor b_scale_t, "
+      "Tensor alpha, str reduce_op, int scatter_dim, int world_size, "
+      "str group_name, str backend) -> Tensor");
+  ops.impl("fused_scaled_fp4_quant_flashinfer_mm_reduce_scatter", torch::kCUDA,
+           &fused_scaled_fp4_quant_flashinfer_mm_reduce_scatter);
+
+  // Fused all-gather(+v) + static fp4 quant + flashinfer fp4 GEMM.
+  ops.def(
+      "fused_all_gather_scaled_fp4_quant_flashinfer_mm("
+      "Tensor a_shard, Tensor b_t, Tensor input_global_scale, Tensor "
+      "b_scale_t, "
+      "Tensor alpha, int gather_dim, int world_size, str group_name, "
+      "str backend) -> Tensor");
+  ops.impl("fused_all_gather_scaled_fp4_quant_flashinfer_mm", torch::kCUDA,
+           &fused_all_gather_scaled_fp4_quant_flashinfer_mm);
+
   // cutlass nvfp4 block scaled group GEMM
   ops.def(
       "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"
