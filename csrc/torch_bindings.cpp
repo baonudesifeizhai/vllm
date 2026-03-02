@@ -419,6 +419,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                      Tensor alpha) -> ()");
   ops.impl("cutlass_scaled_fp4_mm", torch::kCUDA, &cutlass_scaled_fp4_mm);
 
+  // Fused NVFP4 GEMM + reduce-scatter.
+  ops.def(
+      "fused_nvf4_matmul_reduce_scatter(Tensor a_q, Tensor b_q, "
+      "Tensor a_scale, Tensor b_scale, Tensor alpha, str reduce_op, "
+      "int scatter_dim, int world_size, str group_name) -> Tensor");
+  ops.impl("fused_nvf4_matmul_reduce_scatter", torch::kCUDA,
+           &fused_nvf4_matmul_reduce_scatter);
+
+  // Fused all-gather(+v) + NVFP4 quantize + GEMM.
+  ops.def(
+      "fused_all_gather_quantize_nvf4_matmul(Tensor a_shard, "
+      "Tensor hadamard_matrix, Tensor act_global_scale, Tensor b_q, "
+      "Tensor b_scale, Tensor weight_global_scale, int gather_dim, "
+      "int world_size, str group_name) -> Tensor");
+  ops.impl("fused_all_gather_quantize_nvf4_matmul", torch::kCUDA,
+           &fused_all_gather_quantize_nvf4_matmul);
+
   // cutlass nvfp4 block scaled group GEMM
   ops.def(
       "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"

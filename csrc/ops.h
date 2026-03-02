@@ -238,6 +238,18 @@ void cutlass_scaled_fp4_mm(torch::Tensor& D, torch::Tensor const& A,
                            torch::Tensor const& B_sf,
                            torch::Tensor const& alpha);
 
+torch::Tensor fused_nvf4_matmul_reduce_scatter(
+    torch::Tensor const& A_q, torch::Tensor const& B_q,
+    torch::Tensor const& A_scale, torch::Tensor const& B_scale,
+    torch::Tensor const& alpha, const std::string& reduce_op,
+    int64_t scatter_dim, int64_t world_size, const std::string& group_name);
+
+torch::Tensor fused_all_gather_quantize_nvf4_matmul(
+    torch::Tensor const& A_shard, torch::Tensor const& hadamard_matrix,
+    torch::Tensor const& act_global_scale, torch::Tensor const& B_q,
+    torch::Tensor const& B_scale, torch::Tensor const& weight_global_scale,
+    int64_t gather_dim, int64_t world_size, const std::string& group_name);
+
 void cutlass_scaled_mm(torch::Tensor& out, torch::Tensor const& a,
                        torch::Tensor const& b, torch::Tensor const& a_scales,
                        torch::Tensor const& b_scales,

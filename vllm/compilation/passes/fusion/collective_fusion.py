@@ -7,6 +7,7 @@ import torch.fx as fx
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group
@@ -16,7 +17,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from ..inductor_pass import enable_fake_mode
+from ..inductor_pass import enable_fake_mode, get_pass_context
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -30,6 +31,20 @@ class BasePattern:
         self.device = device
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
+
+    def _compute_ragged_split_sizes(self) -> list[int] | None:
+        try:
+            compile_range = get_pass_context().compile_range
+        except AssertionError:
+            return None
+        if not compile_range.is_single_size():
+            return None
+        num_tokens = compile_range.end
+        if num_tokens % self.tp_size == 0:
+            return None
+        base = num_tokens // self.tp_size
+        remainder = num_tokens % self.tp_size
+        return [base + (1 if rank < remainder else 0) for rank in range(self.tp_size)]
 
 
 class GEMMReduceScatterPattern(BasePattern):
@@ -97,6 +112,179 @@ class AllGatherGEMMPattern(BasePattern):
 
         pm.register_replacement(
             pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class Nvfp4MatmulReduceScatterPattern(BasePattern):
+    def get_inputs(self) -> list[torch.Tensor]:
+        a_q = torch.empty([16, 16], device=self.device, dtype=torch.uint8)
+        b_q = torch.empty([16, 16], device=self.device, dtype=torch.uint8)
+        a_scale = torch.empty([128, 4], device=self.device, dtype=torch.float8_e4m3fn)
+        b_scale = torch.empty([16, 4], device=self.device, dtype=torch.uint8)
+        alpha = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [a_q, b_q, a_scale, b_scale, alpha]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            a_q: torch.Tensor,
+            b_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            mm = torch.ops.vllm.matmul_nvf4_bf16.default(
+                a_q, b_q, a_scale, b_scale, alpha
+            )
+            return torch.ops.vllm.reduce_scatter.default(
+                mm,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        def replacement(
+            a_q: torch.Tensor,
+            b_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops._C.fused_nvf4_matmul_reduce_scatter(
+                a_q,
+                b_q,
+                a_scale,
+                b_scale,
+                alpha,
+                "sum",
+                scatter_dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+        split_sizes = self._compute_ragged_split_sizes()
+        if split_sizes is None:
+            return
+
+        def pattern_v(
+            a_q: torch.Tensor,
+            b_q: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+            alpha: torch.Tensor,
+        ) -> torch.Tensor:
+            mm = torch.ops.vllm.matmul_nvf4_bf16.default(
+                a_q, b_q, a_scale, b_scale, alpha
+            )
+            return torch.ops.vllm.reduce_scatterv.default(
+                mm,
+                dim=0,
+                sizes=split_sizes,
+                group_name=self.tp.unique_name,
+            )
+
+        pm.register_replacement(
+            pattern_v, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class AllGatherNvfp4QuantizeMatmulPattern(BasePattern):
+    def get_inputs(self) -> list[torch.Tensor]:
+        a_shard = torch.empty([8, 64], device=self.device, dtype=torch.bfloat16)
+        hadamard_matrix = torch.empty(
+            [64, 64], device=self.device, dtype=torch.bfloat16
+        )
+        act_global_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        b_q = torch.empty([16, 32], device=self.device, dtype=torch.uint8)
+        b_scale = torch.empty([16, 4], device=self.device, dtype=torch.uint8)
+        weight_global_scale = torch.empty([1], device=self.device, dtype=torch.float32)
+        return [
+            a_shard,
+            hadamard_matrix,
+            act_global_scale,
+            b_q,
+            b_scale,
+            weight_global_scale,
+        ]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            a_shard: torch.Tensor,
+            hadamard_matrix: torch.Tensor,
+            act_global_scale: torch.Tensor,
+            b_q: torch.Tensor,
+            b_scale: torch.Tensor,
+            weight_global_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            gathered = torch.ops.vllm.all_gather.default(
+                a_shard,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+            a_q, a_scale = torch.ops.vllm.fused_quantize_nv.default(
+                gathered, hadamard_matrix, act_global_scale
+            )
+            alpha = 1 / (weight_global_scale * act_global_scale)
+            return torch.ops.vllm.matmul_nvf4_bf16.default(
+                a_q, b_q, a_scale, b_scale, alpha
+            )
+
+        def replacement(
+            a_shard: torch.Tensor,
+            hadamard_matrix: torch.Tensor,
+            act_global_scale: torch.Tensor,
+            b_q: torch.Tensor,
+            b_scale: torch.Tensor,
+            weight_global_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops._C.fused_all_gather_quantize_nvf4_matmul(
+                a_shard,
+                hadamard_matrix,
+                act_global_scale,
+                b_q,
+                b_scale,
+                weight_global_scale,
+                gather_dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+        split_sizes = self._compute_ragged_split_sizes()
+        if split_sizes is None:
+            return
+
+        def pattern_v(
+            a_shard: torch.Tensor,
+            hadamard_matrix: torch.Tensor,
+            act_global_scale: torch.Tensor,
+            b_q: torch.Tensor,
+            b_scale: torch.Tensor,
+            weight_global_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            gathered = torch.ops.vllm.all_gatherv.default(
+                a_shard,
+                dim=0,
+                sizes=split_sizes,
+                group_name=self.tp.unique_name,
+            )
+            a_q, a_scale = torch.ops.vllm.fused_quantize_nv.default(
+                gathered, hadamard_matrix, act_global_scale
+            )
+            alpha = 1 / (weight_global_scale * act_global_scale)
+            return torch.ops.vllm.matmul_nvf4_bf16.default(
+                a_q, b_q, a_scale, b_scale, alpha
+            )
+
+        pm.register_replacement(
+            pattern_v, replacement, self.get_inputs(), pm.fwd_only, pm_pass
         )
 
 
@@ -385,6 +573,20 @@ class AsyncTPPass(VllmPatternMatcherPass):
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
 
+        has_nvf4_fused_ops = (
+            hasattr(torch.ops._C, "fused_nvf4_matmul_reduce_scatter")
+            and hasattr(torch.ops._C, "fused_all_gather_quantize_nvf4_matmul")
+            and hasattr(torch.ops.vllm, "fused_quantize_nv")
+            and hasattr(torch.ops.vllm, "matmul_nvf4_bf16")
+        )
+        if self.model_dtype == torch.bfloat16 and has_nvf4_fused_ops:
+            Nvfp4MatmulReduceScatterPattern(self.model_dtype, self.device).register(
+                self.patterns
+            )
+            AllGatherNvfp4QuantizeMatmulPattern(self.model_dtype, self.device).register(
+                self.patterns
+            )
+
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
         # only supports bfloat16 as the output dtype.
@@ -414,8 +616,12 @@ class AsyncTPPass(VllmPatternMatcherPass):
             or self.compilation_config.use_inductor_graph_partition
         ):
             return True
+        if not compile_range.is_single_size():
+            return False
+        if envs.VLLM_ENABLE_SP_RAGGED:
+            return True
         tp_size = get_tensor_model_parallel_world_size()
-        return bool(compile_range.is_single_size() and compile_range.end % tp_size == 0)
+        return bool(compile_range.end % tp_size == 0)
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:

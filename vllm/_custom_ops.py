@@ -715,6 +715,67 @@ def cutlass_scaled_fp4_mm(
     return out
 
 
+if hasattr(torch.ops._C, "fused_nvf4_matmul_reduce_scatter"):
+
+    @register_fake("_C::fused_nvf4_matmul_reduce_scatter")
+    def _fused_nvf4_matmul_reduce_scatter_fake(
+        a_q: torch.Tensor,
+        b_q: torch.Tensor,
+        a_scale: torch.Tensor,
+        b_scale: torch.Tensor,
+        alpha: torch.Tensor,
+        reduce_op: str,
+        scatter_dim: int,
+        world_size: int,
+        group_name: str,
+    ) -> torch.Tensor:
+        del a_scale, b_scale, alpha, reduce_op, group_name
+        out_shape = [a_q.size(0), b_q.size(0)]
+        dim = scatter_dim if scatter_dim >= 0 else scatter_dim + len(out_shape)
+        if dim < len(out_shape):
+            base = out_shape[dim] // world_size
+            rem = out_shape[dim] % world_size
+            rank = 0
+            try:
+                from vllm.distributed.parallel_state import get_tp_group
+
+                rank = get_tp_group().rank_in_group
+            except Exception:
+                pass
+            out_shape[dim] = base + (1 if rank < rem else 0)
+        return torch.empty(tuple(out_shape), dtype=torch.bfloat16, device=a_q.device)
+
+
+if hasattr(torch.ops._C, "fused_all_gather_quantize_nvf4_matmul"):
+
+    @register_fake("_C::fused_all_gather_quantize_nvf4_matmul")
+    def _fused_all_gather_quantize_nvf4_matmul_fake(
+        a_shard: torch.Tensor,
+        hadamard_matrix: torch.Tensor,
+        act_global_scale: torch.Tensor,
+        b_q: torch.Tensor,
+        b_scale: torch.Tensor,
+        weight_global_scale: torch.Tensor,
+        gather_dim: int,
+        world_size: int,
+        group_name: str,
+    ) -> torch.Tensor:
+        del hadamard_matrix, act_global_scale, b_scale, weight_global_scale, group_name
+        gathered_rows = a_shard.size(0) * world_size
+        if gather_dim == 0:
+            try:
+                from vllm.compilation.passes.inductor_pass import get_pass_context
+
+                compile_range = get_pass_context().compile_range
+                if compile_range.is_single_size():
+                    gathered_rows = compile_range.end
+            except Exception:
+                pass
+        return torch.empty(
+            (gathered_rows, b_q.size(0)), dtype=torch.bfloat16, device=a_shard.device
+        )
+
+
 def cutlass_scaled_mm_supports_fp8(cuda_device_capability: int) -> bool:
     return torch.ops._C.cutlass_scaled_mm_supports_fp8(cuda_device_capability)
 
