@@ -450,6 +450,39 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                  Tensor b_scales, Tensor? bias) -> ()");
   ops.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
 
+  #if defined(ENABLE_TP_FUSED_FP8_SM100) && ENABLE_TP_FUSED_FP8_SM100
+  ops.def(
+      "tp_fused_all_gather_bmm_fp8("
+      "Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, "
+      "ScalarType out_dtype, int _fa, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> Tensor");
+  ops.impl("tp_fused_all_gather_bmm_fp8", torch::kCUDA,
+           &tp_fused_all_gather_bmm_fp8);
+
+  ops.def(
+      "tp_fused_bmm_fp8_reduce_scatter("
+      "Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, "
+      "ScalarType out_dtype, int _fa, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> Tensor");
+  ops.impl("tp_fused_bmm_fp8_reduce_scatter", torch::kCUDA,
+           &tp_fused_bmm_fp8_reduce_scatter);
+
+  ops.def(
+      "fused_all_gather_bmm_fp8("
+      "Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, "
+      "ScalarType out_dtype, int _fa, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> Tensor");
+  ops.impl("fused_all_gather_bmm_fp8", torch::kCUDA, &fused_all_gather_bmm_fp8);
+
+  ops.def(
+      "fused_bmm_fp8_reduce_scatter("
+      "Tensor a, Tensor b, Tensor scale_a, Tensor scale_b, "
+      "ScalarType out_dtype, int _fa, int reg_buffer, "
+      "int reg_buffer_sz_bytes) -> Tensor");
+  ops.impl("fused_bmm_fp8_reduce_scatter", torch::kCUDA,
+           &fused_bmm_fp8_reduce_scatter);
+  #endif
+
   // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
   // quantization.
   ops.def(

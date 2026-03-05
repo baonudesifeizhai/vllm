@@ -243,6 +243,38 @@ void cutlass_scaled_mm(torch::Tensor& out, torch::Tensor const& a,
                        torch::Tensor const& b_scales,
                        std::optional<torch::Tensor> const& bias);
 
+torch::Tensor tp_fused_all_gather_bmm_fp8(torch::Tensor const& a,
+                                          torch::Tensor const& b,
+                                          torch::Tensor const& scale_a,
+                                          torch::Tensor const& scale_b,
+                                          at::ScalarType out_dtype, int64_t _fa,
+                                          int64_t reg_buffer,
+                                          int64_t reg_buffer_sz_bytes);
+
+torch::Tensor tp_fused_bmm_fp8_reduce_scatter(torch::Tensor const& a,
+                                              torch::Tensor const& b,
+                                              torch::Tensor const& scale_a,
+                                              torch::Tensor const& scale_b,
+                                              at::ScalarType out_dtype,
+                                              int64_t _fa, int64_t reg_buffer,
+                                              int64_t reg_buffer_sz_bytes);
+
+torch::Tensor fused_all_gather_bmm_fp8(torch::Tensor const& a,
+                                       torch::Tensor const& b,
+                                       torch::Tensor const& scale_a,
+                                       torch::Tensor const& scale_b,
+                                       at::ScalarType out_dtype, int64_t _fa,
+                                       int64_t reg_buffer,
+                                       int64_t reg_buffer_sz_bytes);
+
+torch::Tensor fused_bmm_fp8_reduce_scatter(torch::Tensor const& a,
+                                           torch::Tensor const& b,
+                                           torch::Tensor const& scale_a,
+                                           torch::Tensor const& scale_b,
+                                           at::ScalarType out_dtype,
+                                           int64_t _fa, int64_t reg_buffer,
+                                           int64_t reg_buffer_sz_bytes);
+
 void cutlass_moe_mm(
     torch::Tensor& out_tensors, torch::Tensor const& a_tensors,
     torch::Tensor const& b_tensors, torch::Tensor const& a_scales,

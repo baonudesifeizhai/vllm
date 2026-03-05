@@ -573,12 +573,17 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "csrc/quantization/w8a8/cutlass/scaled_mm_c3x_sm100.cu"
       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_sm100_fp8.cu"
       "csrc/quantization/w8a8/cutlass/c3x/scaled_mm_blockwise_sm100_fp8.cu"
+      "csrc/quantization/w8a8/cutlass/tp_fused_fp8_entry.cu"
+      "csrc/quantization/w8a8/cutlass/tp_fused_fp8_ag_bmm_sm100.cu"
+      "csrc/quantization/w8a8/cutlass/tp_fused_fp8_bmm_rs_sm100.cu"
     )
     set_gencode_flags_for_srcs(
       SRCS "${SRCS}"
       CUDA_ARCHS "${SCALED_MM_ARCHS}")
     list(APPEND VLLM_EXT_SRC "${SRCS}")
     list(APPEND VLLM_GPU_FLAGS "-DENABLE_SCALED_MM_SM100=1")
+    set(ENABLE_TP_FUSED_FP8_SM100 TRUE)
+    list(APPEND VLLM_GPU_FLAGS "-DENABLE_TP_FUSED_FP8_SM100=1")
     # Let scaled_mm_c2x know it doesn't need to build these arches
     list(APPEND SCALED_MM_3X_ARCHS "${SCALED_MM_ARCHS}")
     message(STATUS "Building scaled_mm_c3x_sm100 for archs: ${SCALED_MM_ARCHS}")
@@ -985,6 +990,9 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+if(ENABLE_TP_FUSED_FP8_SM100)
+  target_compile_definitions(_C PRIVATE ENABLE_TP_FUSED_FP8_SM100=1)
+endif()
 
 #
 # _moe_C extension

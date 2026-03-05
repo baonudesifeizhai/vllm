@@ -31,14 +31,16 @@ namespace vllm {
 
 // Maximal number of blocks in allreduce kernel.
 constexpr int kMaxBlocks = 36;
+constexpr int kMaxTpSlots = 2;
 
 // Default number of blocks in allreduce kernel.
 #ifndef USE_ROCM
-const int defaultBlockLimit = 36;
-CUpointer_attribute rangeStartAddrAttr = CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
+inline constexpr int defaultBlockLimit = 36;
+inline constexpr CUpointer_attribute rangeStartAddrAttr =
+    CU_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 #else
-const int defaultBlockLimit = 16;
-hipPointer_attribute rangeStartAddrAttr =
+inline constexpr int defaultBlockLimit = 16;
+inline constexpr hipPointer_attribute rangeStartAddrAttr =
     HIP_POINTER_ATTRIBUTE_RANGE_START_ADDR;
 #endif
 
@@ -56,6 +58,8 @@ struct Signal {
   alignas(128) FlagType start[kMaxBlocks][8];
   alignas(128) FlagType end[kMaxBlocks][8];
   alignas(128) FlagType _flag[kMaxBlocks];  // incremental flags for each rank
+  alignas(128) FlagType tp_ready[kMaxBlocks][kMaxTpSlots][8];
+  alignas(128) FlagType tp_consumed[kMaxBlocks][kMaxTpSlots][8];
 };
 
 struct __align__(16) RankData {
@@ -64,6 +68,14 @@ struct __align__(16) RankData {
 
 struct __align__(16) RankSignals {
   Signal* signals[8];
+};
+
+struct __align__(16) CommLaunchInfo {
+  RankData* rank_data;
+  RankSignals rank_signals;
+  Signal* self_signal;
+  int rank;
+  int world_size;
 };
 
 // like std::array, but aligned
@@ -285,6 +297,90 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 
 #endif
 
+#if !defined(USE_ROCM)
+template <int ngpus>
+DINLINE void tp_signal_ready(const RankSignals& sg, int rank, int slot,
+                             FlagType seq) {
+  if (threadIdx.x < ngpus) {
+    auto peer_counter_ptr =
+        &sg.signals[threadIdx.x]->tp_ready[blockIdx.x][slot][rank];
+    st_flag_release(peer_counter_ptr, seq);
+  }
+  __syncthreads();
+}
+
+template <int ngpus>
+DINLINE void tp_wait_ready(Signal* self_sg, int slot, FlagType seq) {
+  if (threadIdx.x < ngpus) {
+    auto self_counter_ptr = &self_sg->tp_ready[blockIdx.x][slot][threadIdx.x];
+    while (ld_flag_acquire(self_counter_ptr) != seq);
+  }
+  __syncthreads();
+}
+
+DINLINE void tp_wait_consumed(Signal* self_sg, int slot, int owner_rank,
+                              FlagType seq) {
+  if (threadIdx.x == 0) {
+    auto self_counter_ptr = &self_sg->tp_consumed[blockIdx.x][slot][owner_rank];
+    while (ld_flag_acquire(self_counter_ptr) != seq);
+  }
+  __syncthreads();
+}
+
+template <int ngpus>
+DINLINE void tp_signal_consumed(const RankSignals& sg, int owner_rank, int slot,
+                                FlagType seq) {
+  if (threadIdx.x < ngpus) {
+    auto peer_counter_ptr =
+        &sg.signals[threadIdx.x]->tp_consumed[blockIdx.x][slot][owner_rank];
+    st_flag_release(peer_counter_ptr, seq);
+  }
+  __syncthreads();
+}
+#else
+template <int ngpus>
+DINLINE void tp_signal_ready(const RankSignals& sg, int rank, int slot,
+                             FlagType seq) {
+  if (threadIdx.x < ngpus) {
+    __scoped_atomic_store_n(
+        &sg.signals[threadIdx.x]->tp_ready[blockIdx.x][slot][rank], seq,
+        __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+  }
+  __syncthreads();
+}
+
+template <int ngpus>
+DINLINE void tp_wait_ready(Signal* self_sg, int slot, FlagType seq) {
+  if (threadIdx.x < ngpus) {
+    while (__scoped_atomic_load_n(
+               &self_sg->tp_ready[blockIdx.x][slot][threadIdx.x],
+               __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) != seq);
+  }
+  __syncthreads();
+}
+
+DINLINE void tp_wait_consumed(Signal* self_sg, int slot, int owner_rank,
+                              FlagType seq) {
+  if (threadIdx.x == 0) {
+    while (__scoped_atomic_load_n(
+               &self_sg->tp_consumed[blockIdx.x][slot][owner_rank],
+               __ATOMIC_ACQUIRE, __MEMORY_SCOPE_DEVICE) != seq);
+  }
+  __syncthreads();
+}
+
+template <int ngpus>
+DINLINE void tp_signal_consumed(const RankSignals& sg, int owner_rank, int slot,
+                                FlagType seq) {
+  if (threadIdx.x < ngpus) {
+    __scoped_atomic_store_n(
+        &sg.signals[threadIdx.x]->tp_consumed[blockIdx.x][slot][owner_rank],
+        seq, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+  }
+  __syncthreads();
+}
+#endif
+
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce(const P* ptrs[], int idx) {
   A tmp = upcast(ptrs[0][idx]);
@@ -466,6 +562,35 @@ class CustomAllreduce {
           std::to_string(d_rank_data_base_ + num - d_rank_data_end_));
   }
 
+  RankData* resolve_rank_data(cudaStream_t stream, void* input) {
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " +
+            std::to_string(reinterpret_cast<uint64_t>(input)) +
+            " is not registered!");
+      ptrs = it->second;
+    }
+    return ptrs;
+  }
+
+  CommLaunchInfo resolve_comm_launch(cudaStream_t stream, void* input) {
+    CommLaunchInfo info{};
+    info.rank_data = resolve_rank_data(stream, input);
+    info.rank_signals = sg_;
+    info.self_signal = self_sg_;
+    info.rank = rank_;
+    info.world_size = world_size_;
+    return info;
+  }
+
   /**
    * Register already-shared IPC pointers.
    */
@@ -538,21 +663,7 @@ class CustomAllreduce {
                                std::to_string(kMaxBlocks) + ". Got " +
                                std::to_string(block_limit));
 
-    RankData* ptrs;
-    cudaStreamCaptureStatus status;
-    CUDACHECK(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive) {
-      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
-      graph_unreg_buffers_.push_back(input);
-    } else {
-      auto it = buffers_.find(input);
-      if (it == buffers_.end())
-        throw std::runtime_error(
-            "buffer address " +
-            std::to_string(reinterpret_cast<uint64_t>(input)) +
-            " is not registered!");
-      ptrs = it->second;
-    }
+    RankData* ptrs = resolve_rank_data(stream, input);
 
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
