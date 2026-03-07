@@ -12,8 +12,16 @@ from torch._inductor.pattern_matcher import PatternMatcherPass
 
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
-from vllm.distributed import get_tp_group, tensor_model_parallel_all_reduce
-from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
+from vllm.distributed.parallel_state import (
+    compiled_all_gather,
+    compiled_reduce_scatter,
+    get_tensor_model_parallel_world_size,
+    supports_torch_compile_collectives,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
@@ -113,11 +121,15 @@ class _SequenceParallelPatternHelper:
         return tensor_model_parallel_all_reduce(x)
 
     def _reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        if supports_torch_compile_collectives():
+            return compiled_reduce_scatter(x, 0, self.tp_group)
         return torch.ops.vllm.reduce_scatter.default(
             x, dim=0, world_size=self.tp_size, group_name=self.tp_group.unique_name
         )
 
     def _all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        if supports_torch_compile_collectives():
+            return compiled_all_gather(x, 0, self.tp_group)
         return torch.ops.vllm.all_gather.default(
             x, dim=0, world_size=self.tp_size, group_name=self.tp_group.unique_name
         )

@@ -53,6 +53,7 @@ from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
+    is_torch_equal_or_newer,
 )
 
 if TYPE_CHECKING:
@@ -254,6 +255,44 @@ def patched_fused_scaled_matmul_reduce_scatter(
         out_dtype,
         use_fast_accum,
     )
+
+
+def supports_torch_compile_collectives() -> bool:
+    """Whether compile-time graphs should prefer official functional collectives."""
+    from vllm.platforms import current_platform
+
+    return current_platform.is_cuda() and is_torch_equal_or_newer("2.10.0")
+
+
+def use_torch_compile_collectives() -> bool:
+    return supports_torch_compile_collectives() and torch.compiler.is_compiling()
+
+
+def compiled_reduce_scatter(
+    tensor: torch.Tensor,
+    dim: int,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    result = funcol.reduce_scatter_tensor(
+        tensor,
+        "sum",
+        dim,
+        group.device_group.group_name,
+    )
+    return funcol.wait_tensor(result)
+
+
+def compiled_all_gather(
+    tensor: torch.Tensor,
+    dim: int,
+    group: "GroupCoordinator",
+) -> torch.Tensor:
+    result = funcol.all_gather_tensor(
+        tensor,
+        dim,
+        group.device_group.group_name,
+    )
+    return funcol.wait_tensor(result)
 
 
 direct_register_custom_op(
@@ -524,6 +563,9 @@ class GroupCoordinator:
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
 
+        if use_torch_compile_collectives():
+            return compiled_all_gather(input_, dim, self)
+
         if self.use_custom_op_call:
             return torch.ops.vllm.all_gather(
                 input_, dim, world_size, group_name=self.unique_name
@@ -554,6 +596,9 @@ class GroupCoordinator:
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
+
+        if use_torch_compile_collectives():
+            return compiled_reduce_scatter(input_, dim, self)
 
         if self.use_custom_op_call:
             return torch.ops.vllm.reduce_scatter(

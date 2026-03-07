@@ -9,9 +9,14 @@ from torch.distributed._symmetric_memory import enable_symm_mem_for_group
 
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
-from vllm.distributed import get_tp_group
+from vllm.distributed import (
+    get_tp_group,
+)
 from vllm.distributed.parallel_state import (
+    compiled_all_gather,
+    compiled_reduce_scatter,
     get_tensor_model_parallel_world_size,
+    supports_torch_compile_collectives,
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -31,6 +36,26 @@ class BasePattern:
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
 
+    def _reduce_scatter(self, x: torch.Tensor) -> torch.Tensor:
+        if supports_torch_compile_collectives():
+            return compiled_reduce_scatter(x, 0, self.tp)
+        return torch.ops.vllm.reduce_scatter.default(
+            x,
+            dim=0,
+            world_size=self.tp_size,
+            group_name=self.tp.unique_name,
+        )
+
+    def _all_gather(self, x: torch.Tensor) -> torch.Tensor:
+        if supports_torch_compile_collectives():
+            return compiled_all_gather(x, 0, self.tp)
+        return torch.ops.vllm.all_gather.default(
+            x,
+            dim=0,
+            world_size=self.tp_size,
+            group_name=self.tp.unique_name,
+        )
+
 
 class GEMMReduceScatterPattern(BasePattern):
     def get_inputs(self) -> list[torch.Tensor]:
@@ -41,13 +66,7 @@ class GEMMReduceScatterPattern(BasePattern):
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(mul: torch.Tensor, mm_weight: torch.Tensor) -> torch.Tensor:
             mm = torch.ops.aten.mm.default(mul, mm_weight)
-            reduce_scatter = torch.ops.vllm.reduce_scatter.default(
-                mm,
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
-            return reduce_scatter
+            return self._reduce_scatter(mm)
 
         def replacement(mul: torch.Tensor, mm_weight: torch.Tensor) -> torch.Tensor:
             gemm_rs = torch.ops.symm_mem.fused_matmul_reduce_scatter(
@@ -77,12 +96,7 @@ class AllGatherGEMMPattern(BasePattern):
             x: torch.Tensor,
             weight: torch.Tensor,
         ) -> torch.Tensor:
-            all_gather = torch.ops.vllm.all_gather.default(
-                x,
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
+            all_gather = self._all_gather(x)
 
             return torch.ops.aten.mm.default(all_gather, weight)
 
@@ -128,13 +142,7 @@ class ScaledMMReduceScatterPattern(BasePattern):
                 scale_result=None,
                 out_dtype=self.dtype,
             )
-            reduce_scatter = torch.ops.vllm.reduce_scatter.default(
-                scaled_mm,
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
-            return reduce_scatter
+            return self._reduce_scatter(scaled_mm)
 
         def replacement(
             input: torch.Tensor,
@@ -191,9 +199,7 @@ class AllGatherScaledMMPattern(BasePattern):
             scale_a: torch.Tensor,
             scale_b: torch.Tensor,
         ) -> torch.Tensor:
-            all_gather = torch.ops.vllm.all_gather.default(
-                x, dim=0, world_size=self.tp_size, group_name=self.tp.unique_name
-            )
+            all_gather = self._all_gather(x)
 
             return torch.ops.aten._scaled_mm.default(
                 all_gather,
@@ -261,14 +267,7 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
                 b_scales=scale_b,
                 bias=None,
             )
-
-            reduce_scatter = torch.ops.vllm.reduce_scatter.default(
-                cutlass_scaled_mm[1],
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
-            return reduce_scatter
+            return self._reduce_scatter(cutlass_scaled_mm[1])
 
         def replacement(
             input: torch.Tensor,
@@ -330,9 +329,7 @@ class AllGatherCutlassScaledMMPattern(BasePattern):
             scale_b: torch.Tensor,
             output: torch.Tensor,
         ) -> torch.Tensor:
-            all_gather = torch.ops.vllm.all_gather.default(
-                x, dim=0, world_size=self.tp_size, group_name=self.tp.unique_name
-            )
+            all_gather = self._all_gather(x)
 
             cutlass_scaled_mm = torch.ops.higher_order.auto_functionalized(
                 torch.ops._C.cutlass_scaled_mm.default,

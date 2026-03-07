@@ -27,6 +27,7 @@ from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
+    supports_torch_compile_collectives,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -45,6 +46,18 @@ prompts = [
     "The capital of France is",
     "The future of AI is",
 ]
+
+
+def _sp_collective_ops_after() -> list[torch._ops.OpOverload]:
+    if supports_torch_compile_collectives():
+        return [
+            torch.ops._c10d_functional.all_gather_into_tensor.default,
+            torch.ops._c10d_functional.reduce_scatter_tensor.default,
+        ]
+    return [
+        torch.ops.vllm.all_gather.default,
+        torch.ops.vllm.reduce_scatter.default,
+    ]
 
 
 class TestAllReduceRMSNormModel(torch.nn.Module):
@@ -80,10 +93,7 @@ class TestAllReduceRMSNormModel(torch.nn.Module):
         return [torch.ops.vllm.all_reduce.default]
 
     def ops_in_model_after(self):
-        return [
-            torch.ops.vllm.all_gather.default,
-            torch.ops.vllm.reduce_scatter.default,
-        ]
+        return _sp_collective_ops_after()
 
     def ops_in_model(self):
         if RMSNorm.enabled():
@@ -135,10 +145,7 @@ class TestAllReduceRMSNormStaticQuantFP8Model(torch.nn.Module):
         return y4
 
     def ops_in_model_after(self):
-        return [
-            torch.ops.vllm.all_gather.default,
-            torch.ops.vllm.reduce_scatter.default,
-        ]
+        return _sp_collective_ops_after()
 
     def ops_in_model_before(self):
         return [

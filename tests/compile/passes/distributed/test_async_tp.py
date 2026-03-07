@@ -26,6 +26,7 @@ from vllm.distributed import (
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
     initialize_model_parallel,
+    supports_torch_compile_collectives,
 )
 from vllm.platforms import current_platform
 from vllm.utils.system_utils import update_environment_variables
@@ -39,6 +40,18 @@ prompts = [
     "The capital of France is",
     "The future of AI is",
 ]
+
+
+def _reduce_scatter_op_before() -> list[torch._ops.OpOverload]:
+    if supports_torch_compile_collectives():
+        return [torch.ops._c10d_functional.reduce_scatter_tensor.default]
+    return [torch.ops.vllm.reduce_scatter.default]
+
+
+def _all_gather_op_before() -> list[torch._ops.OpOverload]:
+    if supports_torch_compile_collectives():
+        return [torch.ops._c10d_functional.all_gather_into_tensor.default]
+    return [torch.ops.vllm.all_gather.default]
 
 
 class TestMMRSModel(torch.nn.Module):
@@ -67,7 +80,7 @@ class TestMMRSModel(torch.nn.Module):
         return reduce_scatter
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.reduce_scatter.default]
+        return _reduce_scatter_op_before()
 
     def ops_in_model_after(self):
         return [torch.ops.symm_mem.fused_matmul_reduce_scatter.default]
@@ -96,7 +109,7 @@ class TestAGMMModel(torch.nn.Module):
         return mm
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.all_gather.default]
+        return _all_gather_op_before()
 
     def ops_in_model_after(self):
         return [torch.ops.symm_mem.fused_all_gather_matmul.default]
@@ -136,7 +149,7 @@ class TestScaledMMRSModel(_BaseScaledMMModel):
         return reduce_scatter
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.reduce_scatter.default]
+        return _reduce_scatter_op_before()
 
     def ops_in_model_after(self):
         return [torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter.default]
@@ -162,7 +175,7 @@ class TestAGScaledMMModel(_BaseScaledMMModel):
         return scaled_mm
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.all_gather.default]
+        return _all_gather_op_before()
 
     def ops_in_model_after(self):
         return [torch.ops.symm_mem.fused_all_gather_scaled_matmul.default]
@@ -189,7 +202,7 @@ class TestCutlassScaledMMRSModel(_BaseScaledMMModel):
         return reduce_scatter
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.reduce_scatter.default]
+        return _reduce_scatter_op_before()
 
     def ops_in_model_after(self):
         return [torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter.default]
@@ -218,7 +231,7 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
         return mm_out
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.all_gather.default]
+        return _all_gather_op_before()
 
     def ops_in_model_after(self):
         return [torch.ops.symm_mem.fused_all_gather_scaled_matmul.default]
