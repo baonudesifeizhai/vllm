@@ -434,68 +434,75 @@ def test_flashinfer_rope_quant_kvcache_fusion(
         ),
     )
 
-    model = FlashInferQKRoPEQuantKVCacheTestModel(
-        vllm_config=vllm_config,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        is_neox=is_neox,
-        dtype=dtype,
-        device=torch.get_default_device(),
-    )
+    with vllm.config.set_current_vllm_config(vllm_config):
+        model = FlashInferQKRoPEQuantKVCacheTestModel(
+            vllm_config=vllm_config,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            is_neox=is_neox,
+            dtype=dtype,
+            device=torch.get_default_device(),
+        )
 
-    fusion_pass = RopeKVCacheFusionPass(vllm_config)
-    passes = [
-        NoOpEliminationPass(vllm_config),
-        SplitCoalescingPass(vllm_config),
-        ScatterSplitReplacementPass(vllm_config),
-        fusion_pass,
-        PostCleanupPass(vllm_config),
-    ]
-    backend = TestBackend(*passes)
+        fusion_pass = RopeKVCacheFusionPass(vllm_config)
+        passes = [
+            NoOpEliminationPass(vllm_config),
+            SplitCoalescingPass(vllm_config),
+            ScatterSplitReplacementPass(vllm_config),
+            fusion_pass,
+            PostCleanupPass(vllm_config),
+        ]
+        backend = TestBackend(*passes)
 
-    T = 5
-    qkv = torch.randn(
-        T, num_heads * head_size + 2 * num_kv_heads * head_size, dtype=dtype
-    )
-    pos = torch.arange(T, dtype=torch.long)
+        T = 5
+        qkv = torch.randn(
+            T, num_heads * head_size + 2 * num_kv_heads * head_size, dtype=dtype
+        )
+        pos = torch.arange(T, dtype=torch.long)
 
-    qkv_unfused = qkv.clone()
-    pos_unfused = pos.clone()
+        qkv_unfused = qkv.clone()
+        pos_unfused = pos.clone()
 
-    with set_forward_context(None, vllm_config):
-        forward_context = get_forward_context()
-        attn_metadata = model.build_attn_metadata(T)
-        forward_context.attn_metadata = attn_metadata
-        forward_context.slot_mapping = {model.layer_name: attn_metadata.slot_mapping}
-        q_unfused, k_unfused, v_unfused, dummy = model(qkv_unfused, pos_unfused)
-        attn_layer = forward_context.no_compile_layers[model.layer_name]
-        kv_cache_unfused = attn_layer.kv_cache[forward_context.virtual_engine]
-    del dummy
+        with set_forward_context(None, vllm_config):
+            forward_context = get_forward_context()
+            attn_metadata = model.build_attn_metadata(T)
+            forward_context.attn_metadata = attn_metadata
+            forward_context.slot_mapping = {
+                model.layer_name: attn_metadata.slot_mapping
+            }
+            q_unfused, k_unfused, v_unfused, dummy = model(qkv_unfused, pos_unfused)
+            attn_layer = forward_context.no_compile_layers[model.layer_name]
+            kv_cache_unfused = attn_layer.kv_cache[forward_context.virtual_engine]
+        del dummy
 
-    torch._dynamo.mark_dynamic(qkv, 0)
-    torch._dynamo.mark_dynamic(pos, 0)
-    with set_forward_context(None, vllm_config):
-        model_fused = torch.compile(model, backend=backend)
-        forward_context = get_forward_context()
-        attn_metadata = model_fused.build_attn_metadata(T)
-        forward_context.attn_metadata = attn_metadata
-        forward_context.slot_mapping = {model.layer_name: attn_metadata.slot_mapping}
-        q_fused, k_fused, v_fused, dummy = model_fused(qkv, pos)
-        attn_layer = forward_context.no_compile_layers[model.layer_name]
-        kv_cache_fused = attn_layer.kv_cache[forward_context.virtual_engine]
-    del dummy
+        torch._dynamo.mark_dynamic(qkv, 0)
+        torch._dynamo.mark_dynamic(pos, 0)
+        with set_forward_context(None, vllm_config):
+            model_fused = torch.compile(model, backend=backend)
+            forward_context = get_forward_context()
+            attn_metadata = model_fused.build_attn_metadata(T)
+            forward_context.attn_metadata = attn_metadata
+            forward_context.slot_mapping = {
+                model.layer_name: attn_metadata.slot_mapping
+            }
+            q_fused, k_fused, v_fused, dummy = model_fused(qkv, pos)
+            attn_layer = forward_context.no_compile_layers[model.layer_name]
+            kv_cache_fused = attn_layer.kv_cache[forward_context.virtual_engine]
+        del dummy
 
-    assert fusion_pass.matched_count == 1
-    backend.check_before_ops(model.ops_in_model_before())
-    backend.check_after_ops(model.ops_in_model_after())
+        assert fusion_pass.matched_count == 1
+        backend.check_before_ops(model.ops_in_model_before())
+        backend.check_after_ops(model.ops_in_model_after())
 
-    torch.testing.assert_close(q_unfused.float(), q_fused.float(), atol=0.5, rtol=0.25)
-    torch.testing.assert_close(k_unfused, k_fused, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(v_unfused, v_fused, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(
-        kv_cache_unfused.float(),
-        kv_cache_fused.float(),
-        atol=0.5,
-        rtol=0.25,
-    )
+        torch.testing.assert_close(
+            q_unfused.float(), q_fused.float(), atol=0.5, rtol=0.25
+        )
+        torch.testing.assert_close(k_unfused, k_fused, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(v_unfused, v_fused, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(
+            kv_cache_unfused.float(),
+            kv_cache_fused.float(),
+            atol=0.5,
+            rtol=0.25,
+        )
