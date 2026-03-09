@@ -222,7 +222,6 @@ class FlashInferQKRoPEQuantKVCacheTestModel(QKRoPEKVCacheTestModel):
             device=device,
             prefix=prefix,
         )
-        assert self.attn.query_quant is not None
         self.attn._q_scale = self.attn._q_scale.to(device)
 
     def forward(
@@ -394,10 +393,8 @@ def test_rope_kvcache_fusion(
 
 
 @pytest.mark.skipif(
-    not current_platform.is_cuda()
-    or not current_platform.is_device_capability_family(100)
-    or not has_flashinfer(),
-    reason="Requires CUDA Blackwell-family with FlashInfer installed",
+    not current_platform.is_cuda() or not has_flashinfer(),
+    reason="Requires CUDA with FlashInfer installed",
 )
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8])
@@ -444,6 +441,14 @@ def test_flashinfer_rope_quant_kvcache_fusion(
             dtype=dtype,
             device=torch.get_default_device(),
         )
+        if (
+            model.attn.query_quant is None
+            or not model.attn.impl.fused_rope_quant_kvcache_supported()
+        ):
+            pytest.skip(
+                "FlashInfer rope+cache+quant fusion is not supported "
+                "on this runtime/backend configuration"
+            )
 
         fusion_pass = RopeKVCacheFusionPass(vllm_config)
         passes = [
