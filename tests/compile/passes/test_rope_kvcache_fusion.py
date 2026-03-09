@@ -28,6 +28,7 @@ from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer
 from vllm.v1.attention.backend import (
     AttentionBackend,
     CommonAttentionMetadata,
@@ -38,6 +39,14 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 INDEX_SELECT_OP = torch.ops.aten.index.Tensor
 VLLM_UNIFIED_KV_CACHE_UPDATE_OP = torch.ops.vllm.unified_kv_cache_update
 FP8_DTYPE = current_platform.fp8_dtype()
+FLASHINFER_FUSED_OP = (
+    torch.ops.vllm.fused_rope_quant_and_unified_kv_cache_update.default
+)
+STATIC_FP8_QUANT_OP = (
+    torch.ops._C.static_scaled_fp8_quant.default
+    if hasattr(torch.ops._C, "static_scaled_fp8_quant")
+    else None
+)
 
 
 class QKRoPEKVCacheTestModel(torch.nn.Module):
@@ -190,6 +199,57 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
         return [torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default]
 
 
+class FlashInferQKRoPEQuantKVCacheTestModel(QKRoPEKVCacheTestModel):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        is_neox: bool,
+        dtype: torch.dtype,
+        device: torch.device,
+        prefix: str = "model.layers.0.self_attn.attn",
+    ):
+        super().__init__(
+            vllm_config=vllm_config,
+            attn_backend=AttentionBackendEnum.FLASHINFER,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            is_neox=is_neox,
+            dtype=dtype,
+            device=device,
+            prefix=prefix,
+        )
+        assert self.attn.query_quant is not None
+        self.attn._q_scale = self.attn._q_scale.to(device)
+
+    def forward(
+        self, qkv: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        qkv = qkv.clone()
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        q, _ = self.attn.query_quant(q, self.attn._q_scale)
+        q = q.view(-1, self.num_heads, self.head_size)
+        k = k.view(-1, self.num_kv_heads, self.head_size)
+        v = v.view(-1, self.num_kv_heads, self.head_size)
+        kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+            k, v, self.layer_name
+        )
+        return q, k, v, kv_cache_dummy_dep
+
+    def ops_in_model_before(self) -> list[torch._ops.OpOverload]:
+        ops = super().ops_in_model_before()
+        assert STATIC_FP8_QUANT_OP is not None
+        ops.insert(1, STATIC_FP8_QUANT_OP)
+        return ops
+
+    def ops_in_model_after(self) -> list[torch._ops.OpOverload]:
+        return [FLASHINFER_FUSED_OP]
+
+
 @pytest.mark.parametrize(
     "attn_backend",
     [
@@ -331,3 +391,111 @@ def test_rope_kvcache_fusion(
             atol=ATOL,
             rtol=RTOL,
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not current_platform.is_device_capability((10, 0))
+    or not has_flashinfer(),
+    reason="Requires CUDA Blackwell with FlashInfer installed",
+)
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("num_kv_heads", [8])
+@pytest.mark.parametrize("head_size", [64])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("is_neox", [True, False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_flashinfer_rope_quant_kvcache_fusion(
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    is_neox: bool,
+    dtype: torch.dtype,
+):
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(0)
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        cache_config=CacheConfig(
+            block_size=block_size,
+            cache_dtype="fp8",
+        ),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=["+rotary_embedding"],
+            use_inductor_graph_partition=True,
+            pass_config=PassConfig(
+                fuse_rope_kvcache=True,
+                eliminate_noops=True,
+            ),
+        ),
+    )
+
+    model = FlashInferQKRoPEQuantKVCacheTestModel(
+        vllm_config=vllm_config,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        is_neox=is_neox,
+        dtype=dtype,
+        device=torch.get_default_device(),
+    )
+
+    fusion_pass = RopeKVCacheFusionPass(vllm_config)
+    passes = [
+        NoOpEliminationPass(vllm_config),
+        SplitCoalescingPass(vllm_config),
+        ScatterSplitReplacementPass(vllm_config),
+        fusion_pass,
+        PostCleanupPass(vllm_config),
+    ]
+    backend = TestBackend(*passes)
+
+    T = 5
+    qkv = torch.randn(
+        T, num_heads * head_size + 2 * num_kv_heads * head_size, dtype=dtype
+    )
+    pos = torch.arange(T, dtype=torch.long)
+
+    qkv_unfused = qkv.clone()
+    pos_unfused = pos.clone()
+
+    with set_forward_context(None, vllm_config):
+        forward_context = get_forward_context()
+        attn_metadata = model.build_attn_metadata(T)
+        forward_context.attn_metadata = attn_metadata
+        forward_context.slot_mapping = {model.layer_name: attn_metadata.slot_mapping}
+        q_unfused, k_unfused, v_unfused, dummy = model(qkv_unfused, pos_unfused)
+        attn_layer = forward_context.no_compile_layers[model.layer_name]
+        kv_cache_unfused = attn_layer.kv_cache[forward_context.virtual_engine]
+    del dummy
+
+    torch._dynamo.mark_dynamic(qkv, 0)
+    torch._dynamo.mark_dynamic(pos, 0)
+    with set_forward_context(None, vllm_config):
+        model_fused = torch.compile(model, backend=backend)
+        forward_context = get_forward_context()
+        attn_metadata = model_fused.build_attn_metadata(T)
+        forward_context.attn_metadata = attn_metadata
+        forward_context.slot_mapping = {model.layer_name: attn_metadata.slot_mapping}
+        q_fused, k_fused, v_fused, dummy = model_fused(qkv, pos)
+        attn_layer = forward_context.no_compile_layers[model.layer_name]
+        kv_cache_fused = attn_layer.kv_cache[forward_context.virtual_engine]
+    del dummy
+
+    assert fusion_pass.matched_count == 1
+    backend.check_before_ops(model.ops_in_model_before())
+    backend.check_after_ops(model.ops_in_model_after())
+
+    torch.testing.assert_close(q_unfused.float(), q_fused.float(), atol=0.5, rtol=0.25)
+    torch.testing.assert_close(k_unfused, k_fused, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_unfused, v_fused, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        kv_cache_unfused.float(),
+        kv_cache_fused.float(),
+        atol=0.5,
+        rtol=0.25,
+    )
