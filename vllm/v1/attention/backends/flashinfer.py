@@ -13,6 +13,7 @@ from flashinfer import (
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
+    get_batch_indices_positions,
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
@@ -480,6 +481,12 @@ class FlashInferMetadata:
     paged_kv_indices: torch.Tensor | None
     """Paged-KV page indices if materialized for the current batch."""
 
+    rope_append_batch_indices: torch.Tensor | None
+    """Batch indices for rope+cache+quant cache appends."""
+
+    rope_append_positions: torch.Tensor | None
+    """Per-token cache positions for rope+cache+quant cache appends."""
+
     page_size: int
 
     prefill: FIPrefill | TRTLLMPrefill | None
@@ -546,6 +553,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             if speculative_config is not None
             else 0
         )
+        self._max_rope_append_tokens = (1 + num_spec_tokens) * max_num_reqs
         self.enable_cuda_graph = (
             self.compilation_config.cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         )
@@ -642,6 +650,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+        self.rope_append_batch_indices = self._make_buffer(self._max_rope_append_tokens)
+        self.rope_append_positions = self._make_buffer(self._max_rope_append_tokens)
 
         if self.head_dim == 256 and current_platform.is_device_capability_family(100):
             # https://github.com/flashinfer-ai/flashinfer/issues/1993 reports that
@@ -833,6 +843,30 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    def _compute_rope_append_metadata(
+        self,
+        qo_indptr: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if num_actual_tokens > self._max_rope_append_tokens:
+            raise ValueError(
+                "rope+cache+quant metadata buffer is too small for "
+                f"{num_actual_tokens} decode tokens "
+                f"(capacity={self._max_rope_append_tokens})."
+            )
+
+        batch_indices = self.rope_append_batch_indices.gpu[:num_actual_tokens]
+        positions = self.rope_append_positions.gpu[:num_actual_tokens]
+        get_batch_indices_positions(
+            qo_indptr,
+            seq_lens,
+            num_actual_tokens,
+            batch_indices=batch_indices,
+            positions=positions,
+        )
+        return batch_indices, positions
+
     def build(
         self,
         common_prefix_len: int,
@@ -926,6 +960,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_prefill_tokens=num_prefill_tokens,
             paged_kv_indptr=None,
             paged_kv_indices=None,
+            rope_append_batch_indices=None,
+            rope_append_positions=None,
             page_size=page_size,
             use_cascade=use_cascade,
             prefill=None,
@@ -1008,6 +1044,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if paged_kv_indices is not None:
             attn_metadata.paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
             attn_metadata.paged_kv_indices = paged_kv_indices
+        if needs_rope_quant_kvcache_metadata:
+            (
+                attn_metadata.rope_append_batch_indices,
+                attn_metadata.rope_append_positions,
+            ) = self._compute_rope_append_metadata(
+                qo_indptr,
+                seq_lens,
+                num_actual_tokens,
+            )
 
         # Early-out for cascade attention
         if use_cascade:

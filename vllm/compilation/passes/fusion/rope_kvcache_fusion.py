@@ -145,6 +145,19 @@ def _fallback_rope_quant_kvcache(
     return dummy, query_quant, key_roped
 
 
+def _layer_supports_graph_safe_flashinfer_rope_quant(layer: Attention) -> bool:
+    support = getattr(layer.impl, "fused_rope_quant_kvcache_supported", None)
+    return (
+        callable(support)
+        and support()
+        and layer.query_quant is not None
+        and layer._q_scale.numel() == 1
+        and layer._k_scale.numel() == 1
+        and layer._v_scale.numel() == 1
+        and layer._k_scale_float == layer._v_scale_float
+    )
+
+
 def fused_rope_quant_and_unified_kv_cache_update_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -159,8 +172,8 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
     )
 
     try:
-        from flashinfer import get_batch_indices_positions
-        from flashinfer.rope import rope_quantize_fp8_append_paged_kv_cache
+        from flashinfer.rope import _rope_quantize_fp8_append_paged_kv_cache
+        from flashinfer.utils import TensorLayout
 
         from vllm.v1.attention.backends.flashinfer import FlashInferBackend
         from vllm.v1.attention.backends.utils import get_kv_cache_layout
@@ -179,26 +192,21 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
 
     q_scale = getattr(attn_layer, "_q_scale_float", None)
     k_scale = getattr(attn_layer, "_k_scale_float", None)
-    v_scale = getattr(attn_layer, "_v_scale_float", None)
     can_use_flashinfer_kernel = (
         attn_metadata is not None
         and getattr(
             attn_layer.impl, "fused_rope_quant_kvcache_supported", lambda: False
         )()
-        and getattr(attn_metadata, "q_data_type", None) == FP8_DTYPE
-        and getattr(attn_metadata, "num_prefills", 1) == 0
-        and getattr(attn_metadata, "num_decodes", 0) > 0
-        and not getattr(attn_metadata, "use_cascade", True)
-        and getattr(attn_layer.impl, "dcp_world_size", 1) == 1
         and getattr(attn_metadata, "paged_kv_indptr", None) is not None
         and getattr(attn_metadata, "paged_kv_indices", None) is not None
+        and getattr(attn_metadata, "rope_append_batch_indices", None) is not None
+        and getattr(attn_metadata, "rope_append_positions", None) is not None
         and q_scale is not None
         and k_scale is not None
-        and v_scale is not None
         and attn_layer._q_scale.numel() == 1
         and attn_layer._k_scale.numel() == 1
         and attn_layer._v_scale.numel() == 1
-        and k_scale == v_scale
+        and attn_layer._k_scale_float == attn_layer._v_scale_float
     )
 
     if not can_use_flashinfer_kernel:
@@ -214,11 +222,15 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
             is_neox,
         )
 
-    batch_indices, cache_positions = get_batch_indices_positions(
-        attn_metadata.query_start_loc,
-        attn_metadata.seq_lens,
-        query.shape[0],
-    )
+    num_actual_tokens = attn_metadata.num_actual_tokens
+    query_actual = query[:num_actual_tokens]
+    key_actual = key[:num_actual_tokens]
+    value_actual = value[:num_actual_tokens]
+    pos_ids = positions[:num_actual_tokens]
+    batch_indices = attn_metadata.rope_append_batch_indices
+    cache_positions = attn_metadata.rope_append_positions
+    assert batch_indices is not None
+    assert cache_positions is not None
 
     if attn_layer.impl.kv_cache_dtype.startswith("fp8"):
         torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
@@ -227,34 +239,54 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
         kv_cache = kv_cache.view(torch_dtype)
     stride_order = FlashInferBackend.get_kv_cache_stride_order()
     kv_cache_view = kv_cache.permute(*stride_order)
-    query_quant, _ = rope_quantize_fp8_append_paged_kv_cache(
-        q_rope=query,
-        k_rope=key,
-        q_nope=None,
-        k_nope=None,
-        v=value,
+    query_quant = torch.empty_like(query, dtype=attn_metadata.q_data_type)
+    query_quant_actual = query_quant[:num_actual_tokens]
+    q_nope_in = query_actual[..., :0]
+    k_nope_in = key_actual[..., :0]
+    q_nope_out = query_quant_actual[..., :0]
+    empty_cache = torch.empty(0, dtype=query_quant.dtype, device=query.device)
+    _rope_quantize_fp8_append_paged_kv_cache(
+        q_rope_in=query_actual,
+        k_rope_in=key_actual,
+        q_nope_in=q_nope_in,
+        k_nope_in=k_nope_in,
+        v_in=value_actual,
+        q_rope_out=query_quant_actual,
+        q_nope_out=q_nope_out,
         cos_sin_cache=(
             cos_sin_cache
             if cos_sin_cache.dtype == torch.float32
             else cos_sin_cache.float()
         ),
-        pos_ids=positions,
-        paged_kv_cache=(kv_cache_view[:, 0], kv_cache_view[:, 1]),
+        pos_ids=pos_ids,
+        k_cache=kv_cache_view[:, 0],
+        v_cache=kv_cache_view[:, 1],
+        ckv_cache=empty_cache,
+        kpe_cache=empty_cache,
         kv_indices=attn_metadata.paged_kv_indices,
         kv_indptr=attn_metadata.paged_kv_indptr,
         batch_indices=batch_indices,
         positions=cache_positions,
-        is_neox=is_neox,
-        quantize_dtype=attn_metadata.q_data_type,
+        kv_layout_code=TensorLayout[get_kv_cache_layout()].value,
+        page_size=attn_metadata.page_size,
         quant_scale_q=q_scale,
         quant_scale_kv=k_scale,
-        page_size=attn_metadata.page_size,
-        kv_layout=get_kv_cache_layout(),
+        interleave=not is_neox,
+        enable_pdl=False,
     )
 
-    # The fused FlashInfer API writes quantized KV to cache but does not return
-    # the RoPE-transformed key tensor, so reconstruct it for graph consumers.
-    _, key_roped = _rope_qk(query, key, positions, cos_sin_cache, is_neox)
+    # The fused FlashInfer kernel writes quantized KV to cache but does not
+    # return the RoPE-transformed key tensor, so reconstruct the live prefix
+    # for downstream graph consumers and leave any padded tail untouched.
+    key_roped = key.clone()
+    _, key_roped_actual = _rope_qk(
+        query_actual,
+        key_actual,
+        pos_ids,
+        cos_sin_cache,
+        is_neox,
+    )
+    key_roped[:num_actual_tokens].copy_(key_roped_actual)
     dummy = torch.empty(0, device=query.device, dtype=query.dtype)
     return dummy, query_quant, key_roped
 
@@ -494,10 +526,7 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
 
         attn_layers = get_layers_from_vllm_config(config, Attention)
         for _, layer in attn_layers.items():
-            flashinfer_support = getattr(
-                layer.impl, "fused_rope_quant_kvcache_supported", None
-            )
-            if callable(flashinfer_support) and flashinfer_support():
+            if _layer_supports_graph_safe_flashinfer_rope_quant(layer):
                 for is_neox in [True, False]:
                     FlashInferRopeQuantKVCachePattern(
                         layer=layer,
