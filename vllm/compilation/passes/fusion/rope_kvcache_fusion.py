@@ -214,11 +214,9 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
             is_neox,
         )
 
-    query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
-    seq_lens_before_append = attn_metadata.seq_lens - query_lens
     batch_indices, cache_positions = get_batch_indices_positions(
         attn_metadata.query_start_loc,
-        seq_lens_before_append,
+        attn_metadata.seq_lens,
         query.shape[0],
     )
 
