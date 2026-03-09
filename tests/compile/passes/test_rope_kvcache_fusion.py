@@ -395,9 +395,9 @@ def test_rope_kvcache_fusion(
 
 @pytest.mark.skipif(
     not current_platform.is_cuda()
-    or not current_platform.is_device_capability((10, 0))
+    or not current_platform.is_device_capability_family(100)
     or not has_flashinfer(),
-    reason="Requires CUDA Blackwell with FlashInfer installed",
+    reason="Requires CUDA Blackwell-family with FlashInfer installed",
 )
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("num_kv_heads", [8])
