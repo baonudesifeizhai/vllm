@@ -270,7 +270,8 @@ def fused_rope_quant_and_unified_kv_cache_update_fake(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dummy = torch.empty(0, device=query.device, dtype=query.dtype)
     query_quant = torch.empty_like(query, dtype=FP8_DTYPE)
-    return dummy, query_quant, key
+    key_roped = torch.empty(key.shape, device=key.device, dtype=key.dtype)
+    return dummy, query_quant, key_roped
 
 
 direct_register_custom_op(
