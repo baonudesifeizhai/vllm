@@ -37,11 +37,6 @@ from .rms_quant_fusion import (
 
 logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
-_FALLBACK_QUERY_FP8_QUANT = QuantFP8(
-    static=True,
-    group_shape=GroupShape.PER_TENSOR,
-    compile_native=False,
-)
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -141,9 +136,11 @@ def _fallback_rope_quant_kvcache(
             layer_slot_mapping,
         )
 
-    query_quant, _ = _FALLBACK_QUERY_FP8_QUANT(
-        query_roped.reshape(query_roped.shape[0], -1), attn_layer._q_scale
-    )
+    query_quant, _ = QuantFP8(
+        static=True,
+        group_shape=GroupShape.PER_TENSOR,
+        compile_native=False,
+    )(query_roped.reshape(query_roped.shape[0], -1), attn_layer._q_scale)
     dummy = torch.empty(0, device=query.device, dtype=query.dtype)
     return dummy, query_quant.view_as(query_roped), key_roped
 
