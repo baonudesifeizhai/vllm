@@ -15,9 +15,7 @@ from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
 )
-from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    GroupShape,
     kFp8StaticTensorSym,
 )
 from vllm.platforms import current_platform
@@ -136,13 +134,15 @@ def _fallback_rope_quant_kvcache(
             layer_slot_mapping,
         )
 
-    query_quant, _ = QuantFP8(
-        static=True,
-        group_shape=GroupShape.PER_TENSOR,
-        compile_native=False,
-    )(query_roped.reshape(query_roped.shape[0], -1), attn_layer._q_scale)
+    if attn_layer.query_quant is None:
+        raise AssertionError(
+            "FlashInfer rope+cache+quant fallback requires query_quant "
+            "to be initialized on the attention layer."
+        )
+
+    query_quant, _ = attn_layer.query_quant(query_roped, attn_layer._q_scale)
     dummy = torch.empty(0, device=query.device, dtype=query.dtype)
-    return dummy, query_quant.view_as(query_roped), key_roped
+    return dummy, query_quant, key_roped
 
 
 def fused_rope_quant_and_unified_kv_cache_update_impl(
