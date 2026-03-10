@@ -212,6 +212,42 @@ def _baseline_rope_quant_attention_only(
     )
 
 
+def _rope_append_metadata_matches_slot_mapping(
+    attn_metadata: object,
+    layer_slot_mapping: torch.Tensor | None,
+    num_actual_tokens: int,
+) -> bool:
+    if layer_slot_mapping is None:
+        return True
+    batch_indices = getattr(attn_metadata, "rope_append_batch_indices", None)
+    positions = getattr(attn_metadata, "rope_append_positions", None)
+    paged_kv_indptr = getattr(attn_metadata, "paged_kv_indptr", None)
+    paged_kv_indices = getattr(attn_metadata, "paged_kv_indices", None)
+    page_size = getattr(attn_metadata, "page_size", None)
+    if (
+        batch_indices is None
+        or positions is None
+        or paged_kv_indptr is None
+        or paged_kv_indices is None
+        or page_size is None
+    ):
+        return False
+    token_count = min(num_actual_tokens, int(layer_slot_mapping.shape[0]))
+    if token_count <= 0:
+        return True
+
+    batch_indices = batch_indices[:token_count]
+    positions = positions[:token_count]
+    baseline_slots = layer_slot_mapping[:token_count].to(torch.int64)
+
+    page_offsets = torch.div(positions, page_size, rounding_mode="floor")
+    page_iters = paged_kv_indptr[batch_indices] + page_offsets
+    page_ids = paged_kv_indices[page_iters]
+    entry_idx = positions % page_size
+    append_slots = page_ids.to(torch.int64) * page_size + entry_idx.to(torch.int64)
+    return torch.equal(append_slots, baseline_slots)
+
+
 def fused_rope_quant_kvcache_attention_with_output_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -235,7 +271,9 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         )
         return
 
-    attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if attn_metadata is None:
         output.zero_()
         return
@@ -276,6 +314,23 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     from vllm.v1.attention.backends.flashinfer import FlashInferBackend
 
     num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
+    if not _rope_append_metadata_matches_slot_mapping(
+        attn_metadata,
+        layer_slot_mapping,
+        num_actual_tokens,
+    ):
+        _fallback_rope_quant_kvcache_attention_with_output(
+            query=query,
+            key=key,
+            value=value,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            output=output,
+            is_neox=is_neox,
+            layer_name=layer_name,
+        )
+        return
+
     query = query[:num_actual_tokens]
     key = key[:num_actual_tokens]
     value = value[:num_actual_tokens]
