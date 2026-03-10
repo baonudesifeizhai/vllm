@@ -42,11 +42,6 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FLASHINFER_FUSED_OP = (
     torch.ops.vllm.fused_rope_quant_and_unified_kv_cache_update.default
 )
-STATIC_FP8_QUANT_OP = (
-    torch.ops._C.static_scaled_fp8_quant.default
-    if hasattr(torch.ops._C, "static_scaled_fp8_quant")
-    else None
-)
 
 
 class QKRoPEKVCacheTestModel(torch.nn.Module):
@@ -240,10 +235,7 @@ class FlashInferQKRoPEQuantKVCacheTestModel(QKRoPEKVCacheTestModel):
         return q, k, v, kv_cache_dummy_dep
 
     def ops_in_model_before(self) -> list[torch._ops.OpOverload]:
-        ops = super().ops_in_model_before()
-        assert STATIC_FP8_QUANT_OP is not None
-        ops.insert(1, STATIC_FP8_QUANT_OP)
-        return ops
+        return super().ops_in_model_before()
 
     def ops_in_model_after(self) -> list[torch._ops.OpOverload]:
         return [FLASHINFER_FUSED_OP]
