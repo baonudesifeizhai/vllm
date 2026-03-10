@@ -518,6 +518,8 @@ class FlashInferRopeQuantKVCacheMatcher:
             or is_func(node, torch.ops.aten._unsafe_view.default)
             or is_func(node, torch.ops.aten.alias.default)
             or is_func(node, torch.ops.aten.contiguous.default)
+            or is_func(node, torch.ops.aten.clone.default)
+            or is_func(node, torch.ops.aten.detach.default)
         )
 
     def _iter_nodes(self, obj: object) -> list[fx.Node]:
