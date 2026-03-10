@@ -395,13 +395,17 @@ class RopeReshapeKVCachePattern:
 class FlashInferRopeQuantKVCachePattern:
     """
     Matches:
-      q, k = rotary_embedding(...)
-      dummy = unified_kv_cache_update(k, v, layer_name)
-      unified_attention_with_output(q_attn, k, v, ...)
+      q_rot, k_rot = rotary_embedding(positions, q, k, ...)
+      dummy = unified_kv_cache_update(k_rot.view(...), v.view(...), layer_name)
+      unified_attention_with_output(q_attn, k_rot.view(...), v.view(...), ...)
 
     and replaces the whole chain with a FlashInfer-specific fused op that
     performs rope+quant+cache-append and then runs attention, so the graph no
     longer needs an externally produced `key_roped`.
+
+    Importantly, this pattern starts from already-split Q/K/V tensors instead
+    of assuming a specific `qkv.split(...)` subgraph shape. Real service graphs
+    often rewrite the split into view/reinterpret nodes before this pass runs.
     """
 
     FUSED_OP = torch.ops.vllm.fused_rope_quant_kvcache_attention_with_output.default
@@ -436,22 +440,25 @@ class FlashInferRopeQuantKVCachePattern:
     def get_inputs(self) -> list[torch.Tensor]:
         T = 5
         L = 4096
-        qkv = empty_bf16(T, self.q_size + self.k_size + self.v_size)
+        q = empty_bf16(T, self.q_size)
+        k = empty_bf16(T, self.k_size)
+        v = empty_bf16(T, self.v_size)
         positions = empty_i64(T)
         cos_sin_cache = empty_bf16(L, self.head_size)
         q_attn = empty_fp8(T, self.num_heads, self.head_size)
         output = empty_bf16(T, self.num_heads, self.head_size_v)
-        return [qkv, positions, cos_sin_cache, q_attn, output]
+        return [q, k, v, positions, cos_sin_cache, q_attn, output]
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
-            qkv: torch.Tensor,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             q_attn: torch.Tensor,
             output: torch.Tensor,
         ) -> torch.Tensor:
-            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
             _, k = self.rope_matcher(positions, q, k, cos_sin_cache)
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
@@ -482,14 +489,15 @@ class FlashInferRopeQuantKVCachePattern:
             return RESHAPE_OP(output_attn, [-1, self.num_heads * self.head_size_v])
 
         def replacement(
-            qkv: torch.Tensor,
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             q_attn: torch.Tensor,
             output: torch.Tensor,
         ) -> torch.Tensor:
             del q_attn
-            q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
             q = q.view(-1, self.num_heads, self.head_size)
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
