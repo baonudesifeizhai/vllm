@@ -603,19 +603,68 @@ class FlashInferRopeQuantKVCacheMatcher:
                 return None
         return None
 
-    def _resolve_query_root(self, query_attn: fx.Node) -> fx.Node | None:
-        cur = self._unwrap_view_like(query_attn)
-        quant_input = self._get_quant_input(cur)
-        if quant_input is not None:
-            return self._unwrap_view_like(quant_input)
-        if is_func(cur, operator.getitem) and isinstance(cur.args[0], fx.Node):
-            quant_input = self._get_quant_input(cur.args[0])
-            if quant_input is not None:
-                return self._unwrap_view_like(quant_input)
-        return cur
-
     def _resolve_key_root(self, key_attn: fx.Node) -> fx.Node:
         return self._unwrap_view_like(key_attn)
+
+    @staticmethod
+    def _is_supported_query_transform(node: fx.Node) -> bool:
+        if node.op != "call_function":
+            return False
+        target = str(node.target)
+        return (
+            target.startswith("prims.convert_element_type.default")
+            or target.startswith("aten.mul.")
+            or target.startswith("aten.div.")
+            or target.startswith("aten.reciprocal.")
+            or target.startswith("aten.clamp.")
+            or target.startswith("aten.clamp_min.")
+            or target.startswith("aten.clamp_max.")
+            or target.startswith("aten.minimum.")
+            or target.startswith("aten.maximum.")
+            or target.startswith("aten._to_copy.")
+        )
+
+    def _has_supported_query_chain(
+        self, query_attn: fx.Node, q_rot: fx.Node, k_rot: fx.Node
+    ) -> bool:
+        # Query must come from rotary query branch, and must not consume key branch.
+        if not self._depends_on(query_attn, q_rot):
+            return False
+        if self._depends_on(query_attn, k_rot):
+            return False
+
+        stack = [query_attn]
+        seen: set[fx.Node] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+
+            if cur is q_rot:
+                continue
+            if cur is k_rot:
+                return False
+            if cur.op in ("placeholder", "get_attr"):
+                continue
+
+            quant_input = self._get_quant_input(cur)
+            if quant_input is not None:
+                stack.append(quant_input)
+                continue
+
+            if self._is_view_like(cur) or self._is_supported_query_transform(cur):
+                stack.extend(self._iter_nodes(cur.args))
+                stack.extend(self._iter_nodes(cur.kwargs))
+                continue
+
+            if is_func(cur, operator.getitem) and isinstance(cur.args[0], fx.Node):
+                stack.append(cur.args[0])
+                continue
+
+            return False
+
+        return True
 
     def _extract_attention(
         self, node: fx.Node
@@ -681,8 +730,7 @@ class FlashInferRopeQuantKVCacheMatcher:
         k_rot = find_getitem_maybe(rotary_node, 2)
         if q_rot is None or k_rot is None:
             return None
-        query_root = self._resolve_query_root(query_attn)
-        if query_root is not q_rot:
+        if not self._has_supported_query_chain(query_attn, q_rot, k_rot):
             return None
         key_root = self._resolve_key_root(key_attn)
         if key_root is not k_rot:
