@@ -248,6 +248,32 @@ def _rope_append_metadata_matches_slot_mapping(
     return torch.equal(append_slots, baseline_slots)
 
 
+def _rope_quant_runtime_debug_enabled() -> bool:
+    return os.getenv("VLLM_DEBUG_ROPE_KVCACHE_RUNTIME", "0") == "1"
+
+
+def _log_rope_quant_runtime_decision(
+    layer_name: str,
+    decision: str,
+    reason: str | None = None,
+) -> None:
+    if not _rope_quant_runtime_debug_enabled():
+        return
+    if reason is None:
+        logger.info_once(
+            "rope_quant_kvcache runtime: %s layer=%s",
+            decision,
+            layer_name,
+        )
+    else:
+        logger.info_once(
+            "rope_quant_kvcache runtime: %s layer=%s reason=%s",
+            decision,
+            layer_name,
+            reason,
+        )
+
+
 def fused_rope_quant_kvcache_attention_with_output_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -259,6 +285,11 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     layer_name: str = "",
 ) -> None:
     if os.getenv("VLLM_DEBUG_FORCE_ROPE_KVCACHE_FALLBACK", "0") == "1":
+        _log_rope_quant_runtime_decision(
+            layer_name,
+            "fallback",
+            "forced_by_env",
+        )
         _fallback_rope_quant_kvcache_attention_with_output(
             query=query,
             key=key,
@@ -278,24 +309,40 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         output.zero_()
         return
 
-    if (
-        not getattr(
-            attn_layer.impl, "fused_rope_quant_kvcache_supported", lambda: False
-        )()
-        or get_kv_cache_layout() != "HND"
-        or getattr(attn_layer.impl, "kv_sharing_target_layer_name", None) is not None
-        or attn_layer.query_quant is None
-        or attn_layer._q_scale.numel() != 1
-        or attn_layer._k_scale.numel() != 1
-        or attn_layer._v_scale.numel() != 1
-        or attn_layer._k_scale_float != attn_layer._v_scale_float
-        or getattr(attn_metadata, "num_prefills", 0) != 0
-        or getattr(attn_metadata, "num_decodes", 0) == 0
-        or getattr(attn_metadata, "paged_kv_indptr", None) is None
-        or getattr(attn_metadata, "paged_kv_indices", None) is None
-        or getattr(attn_metadata, "rope_append_batch_indices", None) is None
-        or getattr(attn_metadata, "rope_append_positions", None) is None
-    ):
+    fallback_reason = None
+    if not getattr(
+        attn_layer.impl, "fused_rope_quant_kvcache_supported", lambda: False
+    )():
+        fallback_reason = "backend_unsupported"
+    elif get_kv_cache_layout() != "HND":
+        fallback_reason = "kv_cache_layout_not_hnd"
+    elif getattr(attn_layer.impl, "kv_sharing_target_layer_name", None) is not None:
+        fallback_reason = "kv_sharing_enabled"
+    elif attn_layer.query_quant is None:
+        fallback_reason = "query_quant_missing"
+    elif attn_layer._q_scale.numel() != 1:
+        fallback_reason = "q_scale_not_per_tensor"
+    elif attn_layer._k_scale.numel() != 1:
+        fallback_reason = "k_scale_not_per_tensor"
+    elif attn_layer._v_scale.numel() != 1:
+        fallback_reason = "v_scale_not_per_tensor"
+    elif attn_layer._k_scale_float != attn_layer._v_scale_float:
+        fallback_reason = "kv_scales_mismatch"
+    elif getattr(attn_metadata, "num_prefills", 0) != 0:
+        fallback_reason = "prefill_present"
+    elif getattr(attn_metadata, "num_decodes", 0) == 0:
+        fallback_reason = "no_decode_tokens"
+    elif getattr(attn_metadata, "paged_kv_indptr", None) is None:
+        fallback_reason = "paged_kv_indptr_missing"
+    elif getattr(attn_metadata, "paged_kv_indices", None) is None:
+        fallback_reason = "paged_kv_indices_missing"
+    elif getattr(attn_metadata, "rope_append_batch_indices", None) is None:
+        fallback_reason = "rope_append_batch_indices_missing"
+    elif getattr(attn_metadata, "rope_append_positions", None) is None:
+        fallback_reason = "rope_append_positions_missing"
+
+    if fallback_reason is not None:
+        _log_rope_quant_runtime_decision(layer_name, "fallback", fallback_reason)
         _fallback_rope_quant_kvcache_attention_with_output(
             query=query,
             key=key,
@@ -319,6 +366,11 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         layer_slot_mapping,
         num_actual_tokens,
     ):
+        _log_rope_quant_runtime_decision(
+            layer_name,
+            "fallback",
+            "slot_mapping_mismatch",
+        )
         _fallback_rope_quant_kvcache_attention_with_output(
             query=query,
             key=key,
@@ -384,6 +436,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     stride_order = FlashInferBackend.get_kv_cache_stride_order()
     kv_layout = get_kv_cache_layout()
     kv_cache_flashinfer = kv_cache_flashinfer.permute(*stride_order)
+    _log_rope_quant_runtime_decision(layer_name, "fast_path")
 
     _rope_quantize_fp8_append_paged_kv_cache(
         q_rope_in=query,
