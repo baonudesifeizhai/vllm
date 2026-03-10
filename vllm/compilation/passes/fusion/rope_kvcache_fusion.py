@@ -326,6 +326,9 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
             attn_layer.impl.kv_cache_dtype
         )
         kv_cache_flashinfer = kv_cache_flashinfer.view(torch_dtype)
+    stride_order = FlashInferBackend.get_kv_cache_stride_order()
+    kv_layout = get_kv_cache_layout()
+    kv_cache_flashinfer = kv_cache_flashinfer.permute(*stride_order)
 
     _rope_quantize_fp8_append_paged_kv_cache(
         q_rope_in=query,
@@ -345,7 +348,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         kv_indptr=attn_metadata.paged_kv_indptr,
         batch_indices=attn_metadata.rope_append_batch_indices,
         positions=attn_metadata.rope_append_positions,
-        kv_layout_code=TensorLayout["NHD"].value,
+        kv_layout_code=TensorLayout[kv_layout].value,
         page_size=attn_metadata.page_size,
         quant_scale_q=quant_scale_q,
         quant_scale_kv=quant_scale_kv,
