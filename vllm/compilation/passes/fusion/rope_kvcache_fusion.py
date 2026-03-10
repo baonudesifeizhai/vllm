@@ -178,6 +178,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
             attn_layer.impl, "fused_rope_quant_kvcache_supported", lambda: False
         )()
         or get_kv_cache_layout() != "HND"
+        or getattr(attn_layer.impl, "kv_sharing_target_layer_name", None) is not None
         or attn_layer.query_quant is None
         or attn_layer._q_scale.numel() != 1
         or attn_layer._k_scale.numel() != 1
@@ -204,6 +205,8 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
 
     from flashinfer.rope import _rope_quantize_fp8_append_paged_kv_cache
     from flashinfer.utils import TensorLayout
+
+    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
 
     num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
     query = query[:num_actual_tokens]
@@ -248,6 +251,14 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     # rope+quant kernels expect the quantization multiplier applied before cast.
     quant_scale_q = 1.0 / attn_layer._q_scale_float
     quant_scale_kv = 1.0 / attn_layer._k_scale_float
+    kv_cache_flashinfer = kv_cache
+    if attn_layer.impl.kv_cache_dtype.startswith("fp8"):
+        torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+            attn_layer.impl.kv_cache_dtype
+        )
+        kv_cache_flashinfer = kv_cache_flashinfer.view(torch_dtype)
+    stride_order = FlashInferBackend.get_kv_cache_stride_order()
+    kv_cache_permute = kv_cache_flashinfer.permute(*stride_order)
 
     _rope_quantize_fp8_append_paged_kv_cache(
         q_rope_in=query,
@@ -259,8 +270,8 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         q_nope_out=q_nope_out,
         cos_sin_cache=cos_sin_cache,
         pos_ids=positions,
-        k_cache=kv_cache[:, 0],
-        v_cache=kv_cache[:, 1],
+        k_cache=kv_cache_permute[:, 0],
+        v_cache=kv_cache_permute[:, 1],
         ckv_cache=torch.empty(0, dtype=FP8_DTYPE, device=query.device),
         kpe_cache=torch.empty(0, dtype=FP8_DTYPE, device=query.device),
         kv_indices=attn_metadata.paged_kv_indices,
