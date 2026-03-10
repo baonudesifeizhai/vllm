@@ -34,6 +34,10 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.backends.utils import (
+    get_kv_cache_layout,
+    set_kv_cache_layout,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 INDEX_SELECT_OP = torch.ops.aten.index.Tensor
@@ -419,6 +423,9 @@ def test_flashinfer_rope_quant_kvcache_fusion(
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
     torch.manual_seed(0)
+    old_kv_cache_layout = get_kv_cache_layout()
+    set_kv_cache_layout("HND")
+    get_kv_cache_layout.cache_clear()
 
     vllm_config = VllmConfig(
         model_config=ModelConfig(dtype=dtype),
@@ -437,72 +444,76 @@ def test_flashinfer_rope_quant_kvcache_fusion(
         ),
     )
 
-    with vllm.config.set_current_vllm_config(vllm_config):
-        model = FlashInferRoPEQuantAttentionTestModel(
-            vllm_config=vllm_config,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_size=head_size,
-            is_neox=is_neox,
-            dtype=dtype,
-            device=torch.get_default_device(),
-        )
-        if (
-            model.attn.query_quant is None
-            or not model.attn.impl.fused_rope_quant_kvcache_supported()
-        ):
-            pytest.skip(
-                "FlashInfer rope+cache+quant fusion is not supported "
-                "on this runtime/backend configuration"
+    try:
+        with vllm.config.set_current_vllm_config(vllm_config):
+            model = FlashInferRoPEQuantAttentionTestModel(
+                vllm_config=vllm_config,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                is_neox=is_neox,
+                dtype=dtype,
+                device=torch.get_default_device(),
             )
+            if (
+                model.attn.query_quant is None
+                or not model.attn.impl.fused_rope_quant_kvcache_supported()
+            ):
+                pytest.skip(
+                    "FlashInfer rope+cache+quant fusion is not supported "
+                    "on this runtime/backend configuration"
+                )
 
-        fusion_pass = RopeKVCacheFusionPass(vllm_config)
-        passes = [
-            NoOpEliminationPass(vllm_config),
-            SplitCoalescingPass(vllm_config),
-            ScatterSplitReplacementPass(vllm_config),
-            fusion_pass,
-            PostCleanupPass(vllm_config),
-        ]
-        backend = TestBackend(*passes)
+            fusion_pass = RopeKVCacheFusionPass(vllm_config)
+            passes = [
+                NoOpEliminationPass(vllm_config),
+                SplitCoalescingPass(vllm_config),
+                ScatterSplitReplacementPass(vllm_config),
+                fusion_pass,
+                PostCleanupPass(vllm_config),
+            ]
+            backend = TestBackend(*passes)
 
-        T = 5
-        qkv = torch.randn(
-            T, num_heads * head_size + 2 * num_kv_heads * head_size, dtype=dtype
-        )
-        pos = torch.arange(T, dtype=torch.long)
+            T = 5
+            qkv = torch.randn(
+                T, num_heads * head_size + 2 * num_kv_heads * head_size, dtype=dtype
+            )
+            pos = torch.arange(T, dtype=torch.long)
 
-        qkv_unfused = qkv.clone()
-        pos_unfused = pos.clone()
+            qkv_unfused = qkv.clone()
+            pos_unfused = pos.clone()
 
-        with set_forward_context(None, vllm_config):
-            forward_context = get_forward_context()
-            attn_metadata = model.build_attn_metadata(T)
-            forward_context.attn_metadata = attn_metadata
-            forward_context.slot_mapping = {
-                model.layer_name: attn_metadata.slot_mapping
-            }
-            output_unfused = model(qkv_unfused, pos_unfused)
+            with set_forward_context(None, vllm_config):
+                forward_context = get_forward_context()
+                attn_metadata = model.build_attn_metadata(T)
+                forward_context.attn_metadata = attn_metadata
+                forward_context.slot_mapping = {
+                    model.layer_name: attn_metadata.slot_mapping
+                }
+                output_unfused = model(qkv_unfused, pos_unfused)
 
-        torch._dynamo.mark_dynamic(qkv, 0)
-        torch._dynamo.mark_dynamic(pos, 0)
-        with set_forward_context(None, vllm_config):
-            model_fused = torch.compile(model, backend=backend)
-            forward_context = get_forward_context()
-            attn_metadata = model_fused.build_attn_metadata(T)
-            forward_context.attn_metadata = attn_metadata
-            forward_context.slot_mapping = {
-                model.layer_name: attn_metadata.slot_mapping
-            }
-            output_fused = model_fused(qkv, pos)
+            torch._dynamo.mark_dynamic(qkv, 0)
+            torch._dynamo.mark_dynamic(pos, 0)
+            with set_forward_context(None, vllm_config):
+                model_fused = torch.compile(model, backend=backend)
+                forward_context = get_forward_context()
+                attn_metadata = model_fused.build_attn_metadata(T)
+                forward_context.attn_metadata = attn_metadata
+                forward_context.slot_mapping = {
+                    model.layer_name: attn_metadata.slot_mapping
+                }
+                output_fused = model_fused(qkv, pos)
 
-        assert fusion_pass.matched_count == 1
-        backend.check_before_ops(model.ops_in_model_before())
-        backend.check_after_ops(model.ops_in_model_after())
+            assert fusion_pass.matched_count == 1
+            backend.check_before_ops(model.ops_in_model_before())
+            backend.check_after_ops(model.ops_in_model_after())
 
-        torch.testing.assert_close(
-            output_unfused.float(),
-            output_fused.float(),
-            atol=0.5,
-            rtol=0.25,
-        )
+            torch.testing.assert_close(
+                output_unfused.float(),
+                output_fused.float(),
+                atol=0.5,
+                rtol=0.25,
+            )
+    finally:
+        set_kv_cache_layout(old_kv_cache_layout)
+        get_kv_cache_layout.cache_clear()
