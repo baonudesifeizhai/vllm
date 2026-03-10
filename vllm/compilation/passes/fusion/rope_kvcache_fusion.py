@@ -406,7 +406,12 @@ class FlashInferRopeQuantKVCachePattern:
 
     FUSED_OP = torch.ops.vllm.fused_rope_quant_kvcache_attention_with_output.default
 
-    def __init__(self, layer: Attention, is_neox: bool) -> None:
+    def __init__(
+        self,
+        layer: Attention,
+        is_neox: bool,
+        use_flashinfer_rotary: bool = False,
+    ) -> None:
         self.layer_name = layer.layer_name
         self.num_heads = layer.num_heads
         self.num_kv_heads = layer.num_kv_heads
@@ -423,6 +428,7 @@ class FlashInferRopeQuantKVCachePattern:
             head_size=self.head_size,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
+            use_flashinfer=use_flashinfer_rotary,
         )
         self.quant_matcher = MatcherQuantFP8(kFp8StaticTensorSym)
 
@@ -529,10 +535,12 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
         for _, layer in attn_layers.items():
             if _layer_supports_graph_safe_flashinfer_rope_quant(layer):
                 for is_neox in [True, False]:
-                    FlashInferRopeQuantKVCachePattern(
-                        layer=layer,
-                        is_neox=is_neox,
-                    ).register(self.patterns)
+                    for use_flashinfer_rotary in [False, True]:
+                        FlashInferRopeQuantKVCachePattern(
+                            layer=layer,
+                            is_neox=is_neox,
+                            use_flashinfer_rotary=use_flashinfer_rotary,
+                        ).register(self.patterns)
             elif layer.impl.fused_rope_kvcache_supported():
                 for is_neox in [True, False]:
                     RopeReshapeKVCachePattern(
