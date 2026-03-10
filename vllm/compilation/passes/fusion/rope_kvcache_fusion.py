@@ -296,8 +296,9 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         device=query.device,
     )
 
-    if cos_sin_cache.dtype != torch.float32:
-        cos_sin_cache = cos_sin_cache.float()
+    cos_sin_cache_flashinfer = (
+        cos_sin_cache.float() if cos_sin_cache.dtype != torch.float32 else cos_sin_cache
+    )
 
     # vLLM stores dequant scales (x ~= fp8 * scale), while FlashInfer's
     # rope+quant kernels expect the quantization multiplier applied before cast.
@@ -318,7 +319,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         v_in=value,
         q_rope_out=q_rope_out,
         q_nope_out=q_nope_out,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin_cache=cos_sin_cache_flashinfer,
         pos_ids=positions,
         k_cache=kv_cache_flashinfer[:, 0],
         v_cache=kv_cache_flashinfer[:, 1],
