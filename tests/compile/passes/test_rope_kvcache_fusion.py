@@ -423,7 +423,6 @@ def test_flashinfer_rope_quant_kvcache_fusion(
     torch.set_default_device("cuda")
     torch.set_default_dtype(dtype)
     torch.manual_seed(0)
-    old_kv_cache_layout = get_kv_cache_layout()
     set_kv_cache_layout("HND")
     get_kv_cache_layout.cache_clear()
 
@@ -515,5 +514,5 @@ def test_flashinfer_rope_quant_kvcache_fusion(
                 rtol=0.25,
             )
     finally:
-        set_kv_cache_layout(old_kv_cache_layout)
+        set_kv_cache_layout(None)
         get_kv_cache_layout.cache_clear()
