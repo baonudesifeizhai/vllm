@@ -137,11 +137,16 @@ def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
     use_inductor_graph_partition is enabled.
     """
     from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.platforms import current_platform
+    from vllm.utils.flashinfer import has_flashinfer
 
     return (
-        rocm_aiter_ops.is_enabled()
-        and cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
+        cfg.compilation_config.is_custom_op_enabled("rotary_embedding")
         and cfg.compilation_config.use_inductor_graph_partition
+        and (
+            rocm_aiter_ops.is_enabled()
+            or (current_platform.is_cuda() and has_flashinfer())
+        )
     )
 
 
@@ -1206,23 +1211,6 @@ class VllmConfig:
                     env_path,
                 )
             self.compilation_config.debug_dump_path = env_path
-
-        def has_blocked_weights():
-            if self.quant_config is not None:
-                if hasattr(self.quant_config, "weight_block_size"):
-                    return self.quant_config.weight_block_size is not None
-                elif hasattr(self.quant_config, "has_blocked_weights"):
-                    return self.quant_config.has_blocked_weights()
-            return False
-
-        # Enable quant_fp8 CUDA ops (TODO disable in follow up)
-        # On H100 the CUDA kernel is faster than
-        # native implementation
-        # https://github.com/vllm-project/vllm/issues/25094
-        if has_blocked_weights():
-            custom_ops = self.compilation_config.custom_ops
-            if "-quant_fp8" not in custom_ops:
-                custom_ops.append("+quant_fp8")
 
         # Handle the KV connector configs
         self._post_init_kv_transfer_config()

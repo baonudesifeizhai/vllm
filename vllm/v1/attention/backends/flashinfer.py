@@ -462,12 +462,24 @@ class FlashInferMetadata:
     slot_mapping: torch.Tensor
     """Tensor for writing K/V to the cache. Shape: [num_actual_tokens]"""
 
+    query_start_loc: torch.Tensor
+    """Ragged query indptr used by decode-only append metadata."""
+
+    seq_lens: torch.Tensor
+    """Per-request sequence lengths for the current batch."""
+
     q_data_type: torch.dtype
 
     num_decodes: int
     num_decode_tokens: int
     num_prefills: int
     num_prefill_tokens: int
+
+    paged_kv_indptr: torch.Tensor | None
+    paged_kv_indices: torch.Tensor | None
+    rope_append_batch_indices: torch.Tensor | None
+    rope_append_positions: torch.Tensor | None
+    page_size: int
 
     prefill: FIPrefill | TRTLLMPrefill | None
     """
@@ -629,6 +641,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )  # Extra buffer for mutable paged_kv_indptr.cpu in cuda graph mode
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
+        max_num_append_tokens = (1 + num_spec_tokens) * max_num_reqs
+        self.rope_append_batch_indices = self._make_buffer(max_num_append_tokens)
+        self.rope_append_positions = self._make_buffer(max_num_append_tokens)
 
         if self.head_dim == 256 and current_platform.is_device_capability_family(100):
             # https://github.com/flashinfer-ai/flashinfer/issues/1993 reports that
@@ -821,6 +836,24 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    def _compute_rope_append_metadata(
+        self,
+        qo_indptr: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from flashinfer import get_batch_indices_positions
+
+        batch_indices = self.rope_append_batch_indices.gpu[:num_actual_tokens]
+        positions = self.rope_append_positions.gpu[:num_actual_tokens]
+        return get_batch_indices_positions(
+            qo_indptr,
+            seq_lens,
+            num_actual_tokens,
+            batch_indices=batch_indices,
+            positions=positions,
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -905,20 +938,41 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         attn_metadata = FlashInferMetadata(
             num_actual_tokens=num_actual_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
+            query_start_loc=qo_indptr,
+            seq_lens=seq_lens,
             q_data_type=self.q_data_type,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
+            paged_kv_indptr=None,
+            paged_kv_indices=None,
+            rope_append_batch_indices=None,
+            rope_append_positions=None,
+            page_size=page_size,
             use_cascade=use_cascade,
             prefill=None,
             decode=None,
             cascade_wrapper=None,
         )
 
+        needs_rope_quant_kvcache_metadata = (
+            not use_cascade
+            and not self.use_dcp
+            and num_prefills == 0
+            and num_decodes > 0
+            and self.q_data_type == FP8_DTYPE
+            and self.cache_dtype.startswith("fp8")
+        )
+
         # Guard access to seq_lens_cpu, which may not always be needed
         # and can be expensive to retrieve in async mode.
-        needs_seq_lens_cpu = self.use_dcp or use_cascade or not is_only_trtllm_decode
+        needs_seq_lens_cpu = (
+            self.use_dcp
+            or use_cascade
+            or not is_only_trtllm_decode
+            or needs_rope_quant_kvcache_metadata
+        )
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu if needs_seq_lens_cpu else None
         seq_lens_np = seq_lens_cpu.numpy() if seq_lens_cpu is not None else None
         num_blocks_np = (
@@ -956,7 +1010,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             num_blocks_np -= num_common_kv_blocks
 
         # Compute paged_kv_indices if necessary
-        needs_paged_kv_indices = use_cascade or not is_only_trtllm_decode
+        needs_paged_kv_indices = (
+            use_cascade
+            or not is_only_trtllm_decode
+            or needs_rope_quant_kvcache_metadata
+        )
         if needs_paged_kv_indices:
             assert num_blocks_np is not None
             assert seq_lens_np is not None
@@ -969,6 +1027,19 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         else:
             paged_kv_indices = None
+
+        if paged_kv_indices is not None:
+            attn_metadata.paged_kv_indptr = self.paged_kv_indptr.gpu[: num_reqs + 1]
+            attn_metadata.paged_kv_indices = paged_kv_indices
+        if needs_rope_quant_kvcache_metadata:
+            (
+                attn_metadata.rope_append_batch_indices,
+                attn_metadata.rope_append_positions,
+            ) = self._compute_rope_append_metadata(
+                qo_indptr,
+                seq_lens,
+                num_actual_tokens,
+            )
 
         # Early-out for cascade attention
         if use_cascade:
@@ -1250,6 +1321,9 @@ class FlashInferImpl(AttentionImpl):
             and self.kv_cache_dtype.startswith("fp8")
             and quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
         )
+
+    def fused_rope_quant_kvcache_supported(self):
+        return self.kv_cache_dtype.startswith("fp8") and self.supports_quant_query_input
 
     # FlashInfer requires attention sinks to be float32
     def process_weights_after_loading(self, act_dtype: torch.dtype):

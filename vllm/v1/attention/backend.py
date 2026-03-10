@@ -742,6 +742,13 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         """
         return False
 
+    def fused_rope_quant_kvcache_supported(self):
+        """
+        Does this attention implementation support the FlashInfer-specific
+        RoPE+query-quant+KVCache+attention fusion path.
+        """
+        return False
+
     def do_rope_and_kv_cache_update(
         self,
         layer: AttentionLayer,
