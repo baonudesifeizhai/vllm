@@ -28,6 +28,7 @@ from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .matcher_utils import (
     FLASHINFER_ROTARY_OP,
+    QUANT_OPS,
     ROTARY_OP,
     MatcherRotaryEmbedding,
 )
@@ -507,6 +508,17 @@ class FlashInferRopeQuantKVCacheMatcher:
 
     def __init__(self, layers: dict[str, Attention]):
         self.layers = layers
+        self.quant_ops = tuple(QUANT_OPS.values())
+
+    @staticmethod
+    def _is_view_like(node: fx.Node) -> bool:
+        return (
+            is_func(node, torch.ops.aten.view.default)
+            or is_func(node, torch.ops.aten.reshape.default)
+            or is_func(node, torch.ops.aten._unsafe_view.default)
+            or is_func(node, torch.ops.aten.alias.default)
+            or is_func(node, torch.ops.aten.contiguous.default)
+        )
 
     def _iter_nodes(self, obj: object) -> list[fx.Node]:
         result: list[fx.Node] = []
@@ -565,6 +577,43 @@ class FlashInferRopeQuantKVCacheMatcher:
             if found is not None:
                 return found
         return None
+
+    def _unwrap_view_like(self, node: fx.Node) -> fx.Node:
+        cur = node
+        seen: set[fx.Node] = set()
+        while cur not in seen:
+            seen.add(cur)
+            if not self._is_view_like(cur):
+                break
+            if len(cur.args) == 0 or not isinstance(cur.args[0], fx.Node):
+                break
+            cur = cur.args[0]
+        return cur
+
+    def _get_quant_input(self, node: fx.Node) -> fx.Node | None:
+        for quant_op in self.quant_ops:
+            if is_auto_func(node, quant_op) or is_func(node, quant_op):
+                quant_input = node.kwargs.get("input")
+                if isinstance(quant_input, fx.Node):
+                    return quant_input
+                if len(node.args) >= 2 and isinstance(node.args[1], fx.Node):
+                    return node.args[1]
+                return None
+        return None
+
+    def _resolve_query_root(self, query_attn: fx.Node) -> fx.Node | None:
+        cur = self._unwrap_view_like(query_attn)
+        quant_input = self._get_quant_input(cur)
+        if quant_input is not None:
+            return self._unwrap_view_like(quant_input)
+        if is_func(cur, operator.getitem) and isinstance(cur.args[0], fx.Node):
+            quant_input = self._get_quant_input(cur.args[0])
+            if quant_input is not None:
+                return self._unwrap_view_like(quant_input)
+        return cur
+
+    def _resolve_key_root(self, key_attn: fx.Node) -> fx.Node:
+        return self._unwrap_view_like(key_attn)
 
     def _extract_attention(
         self, node: fx.Node
@@ -630,9 +679,11 @@ class FlashInferRopeQuantKVCacheMatcher:
         k_rot = find_getitem_maybe(rotary_node, 2)
         if q_rot is None or k_rot is None:
             return None
-        if not self._depends_on(query_attn, q_rot):
+        query_root = self._resolve_query_root(query_attn)
+        if query_root is not q_rot:
             return None
-        if not self._depends_on(key_attn, k_rot):
+        key_root = self._resolve_key_root(key_attn)
+        if key_root is not k_rot:
             return None
 
         output_getitem = None

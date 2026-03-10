@@ -859,7 +859,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         slot_mapping: torch.Tensor,
         num_actual_tokens: int,
     ) -> None:
-        if os.getenv("VLLM_DEBUG_ROPE_APPEND_SLOT_CHECK", "0") != "1":
+        debug_mode = os.getenv("VLLM_DEBUG_ROPE_APPEND_SLOT_CHECK", "0").lower()
+        if debug_mode in ("0", "false", ""):
             return
 
         batch_indices = attn_metadata.rope_append_batch_indices
@@ -895,12 +896,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         mismatch = torch.nonzero(append_slots != baseline_slots, as_tuple=False)
         first = int(mismatch[0].item()) if mismatch.numel() > 0 else -1
-        raise AssertionError(
-            "FlashInfer rope append metadata mismatch with baseline slot_mapping: "
-            f"first_mismatch_token={first}, "
+        message = (
+            "FlashInfer rope append metadata mismatch with baseline "
+            f"slot_mapping: first_mismatch_token={first}, "
             f"append_slot={int(append_slots[first].item()) if first >= 0 else -1}, "
             f"baseline_slot={int(baseline_slots[first].item()) if first >= 0 else -1}"
         )
+        if debug_mode in ("2", "strict", "error"):
+            raise AssertionError(message)
+        logger.warning("%s", message)
 
     def build(
         self,
