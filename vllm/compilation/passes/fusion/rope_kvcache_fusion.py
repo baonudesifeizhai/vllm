@@ -411,6 +411,7 @@ class FlashInferRopeQuantKVCachePattern:
         layer: Attention,
         is_neox: bool,
         use_flashinfer_rotary: bool = False,
+        use_direct_attention_op: bool = False,
     ) -> None:
         self.layer_name = layer.layer_name
         self.num_heads = layer.num_heads
@@ -422,6 +423,7 @@ class FlashInferRopeQuantKVCachePattern:
         self.q_size = self.num_heads * self.head_size
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
+        self.use_direct_attention_op = use_direct_attention_op
 
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=self.is_neox,
@@ -454,18 +456,30 @@ class FlashInferRopeQuantKVCachePattern:
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
             dummy = torch.ops.vllm.unified_kv_cache_update(k, v, self.layer_name)
-            at1 = auto_functionalized(
-                ATTN_OP,
-                query=q_attn,
-                key=k,
-                value=v,
-                output=output,
-                layer_name=self.layer_name,
-                output_scale=None,
-                output_block_scale=None,
-                kv_cache_dummy_dep=dummy,
-            )
-            return RESHAPE_OP(at1[1], [-1, self.num_heads * self.head_size_v])
+            if self.use_direct_attention_op:
+                torch.ops.vllm.unified_attention_with_output(
+                    q_attn,
+                    k,
+                    v,
+                    output,
+                    self.layer_name,
+                    kv_cache_dummy_dep=dummy,
+                )
+                output_attn = output
+            else:
+                at1 = auto_functionalized(
+                    ATTN_OP,
+                    query=q_attn,
+                    key=k,
+                    value=v,
+                    output=output,
+                    layer_name=self.layer_name,
+                    output_scale=None,
+                    output_block_scale=None,
+                    kv_cache_dummy_dep=dummy,
+                )
+                output_attn = at1[1]
+            return RESHAPE_OP(output_attn, [-1, self.num_heads * self.head_size_v])
 
         def replacement(
             qkv: torch.Tensor,
@@ -479,20 +493,34 @@ class FlashInferRopeQuantKVCachePattern:
             q = q.view(-1, self.num_heads, self.head_size)
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
-            at1 = auto_functionalized(
-                self.FUSED_OP,
-                query=q,
-                key=k,
-                value=v,
-                positions=positions,
-                cos_sin_cache=cos_sin_cache,
-                output=output,
-                is_neox=self.is_neox,
-                layer_name=self.layer_name,
-                output_scale=None,
-                output_block_scale=None,
-            )
-            return RESHAPE_OP(at1[1], [-1, self.num_heads * self.head_size_v])
+            if self.use_direct_attention_op:
+                torch.ops.vllm.fused_rope_quant_kvcache_attention_with_output(
+                    q,
+                    k,
+                    v,
+                    positions,
+                    cos_sin_cache,
+                    output,
+                    self.is_neox,
+                    self.layer_name,
+                )
+                output_attn = output
+            else:
+                at1 = auto_functionalized(
+                    self.FUSED_OP,
+                    query=q,
+                    key=k,
+                    value=v,
+                    positions=positions,
+                    cos_sin_cache=cos_sin_cache,
+                    output=output,
+                    is_neox=self.is_neox,
+                    layer_name=self.layer_name,
+                    output_scale=None,
+                    output_block_scale=None,
+                )
+                output_attn = at1[1]
+            return RESHAPE_OP(output_attn, [-1, self.num_heads * self.head_size_v])
 
         def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
             gm = pm.fwd_only(*args, **kwargs)
@@ -533,11 +561,13 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
             if _layer_supports_graph_safe_flashinfer_rope_quant(layer):
                 for is_neox in [True, False]:
                     for use_flashinfer_rotary in [False, True]:
-                        FlashInferRopeQuantKVCachePattern(
-                            layer=layer,
-                            is_neox=is_neox,
-                            use_flashinfer_rotary=use_flashinfer_rotary,
-                        ).register(self.patterns)
+                        for use_direct_attention_op in [False, True]:
+                            FlashInferRopeQuantKVCachePattern(
+                                layer=layer,
+                                is_neox=is_neox,
+                                use_flashinfer_rotary=use_flashinfer_rotary,
+                                use_direct_attention_op=use_direct_attention_op,
+                            ).register(self.patterns)
             elif layer.impl.fused_rope_kvcache_supported():
                 for is_neox in [True, False]:
                     RopeReshapeKVCachePattern(
