@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import ClassVar
@@ -17,7 +18,6 @@ from flashinfer import (
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
-from typing_extensions import override
 
 from vllm import envs
 from vllm.config import (
@@ -665,7 +665,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             with_numpy=True,
         )
 
-    @override  # type: ignore[misc]
     @classmethod
     def get_cudagraph_support(
         cls: type["FlashInferMetadataBuilder"],
@@ -854,6 +853,55 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             positions=positions,
         )
 
+    def _debug_validate_rope_append_slot_mapping(
+        self,
+        attn_metadata: "FlashInferMetadata",
+        slot_mapping: torch.Tensor,
+        num_actual_tokens: int,
+    ) -> None:
+        if os.getenv("VLLM_DEBUG_ROPE_APPEND_SLOT_CHECK", "0") != "1":
+            return
+
+        batch_indices = attn_metadata.rope_append_batch_indices
+        positions = attn_metadata.rope_append_positions
+        paged_kv_indptr = attn_metadata.paged_kv_indptr
+        paged_kv_indices = attn_metadata.paged_kv_indices
+        if (
+            batch_indices is None
+            or positions is None
+            or paged_kv_indptr is None
+            or paged_kv_indices is None
+        ):
+            return
+
+        token_count = min(num_actual_tokens, slot_mapping.shape[0])
+        if token_count == 0:
+            return
+
+        batch_indices = batch_indices[:token_count]
+        positions = positions[:token_count]
+        slot_mapping = slot_mapping[:token_count]
+
+        page_size = attn_metadata.page_size
+        page_offsets = torch.div(positions, page_size, rounding_mode="floor")
+        page_iters = paged_kv_indptr[batch_indices] + page_offsets
+        page_ids = paged_kv_indices[page_iters]
+        entry_idx = positions % page_size
+        append_slots = page_ids.to(torch.int64) * page_size + entry_idx.to(torch.int64)
+        baseline_slots = slot_mapping.to(torch.int64)
+
+        if torch.equal(append_slots, baseline_slots):
+            return
+
+        mismatch = torch.nonzero(append_slots != baseline_slots, as_tuple=False)
+        first = int(mismatch[0].item()) if mismatch.numel() > 0 else -1
+        raise AssertionError(
+            "FlashInfer rope append metadata mismatch with baseline slot_mapping: "
+            f"first_mismatch_token={first}, "
+            f"append_slot={int(append_slots[first].item()) if first >= 0 else -1}, "
+            f"baseline_slot={int(baseline_slots[first].item()) if first >= 0 else -1}"
+        )
+
     def build(
         self,
         common_prefix_len: int,
@@ -1038,6 +1086,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             ) = self._compute_rope_append_metadata(
                 qo_indptr,
                 seq_lens,
+                num_actual_tokens,
+            )
+            self._debug_validate_rope_append_slot_mapping(
+                attn_metadata,
+                common_attn_metadata.slot_mapping,
                 num_actual_tokens,
             )
 

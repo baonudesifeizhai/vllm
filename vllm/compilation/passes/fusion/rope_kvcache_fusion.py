@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import operator
+import os
 from dataclasses import dataclass
 
 import torch
@@ -220,6 +221,19 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     is_neox: bool,
     layer_name: str = "",
 ) -> None:
+    if os.getenv("VLLM_DEBUG_FORCE_ROPE_KVCACHE_FALLBACK", "0") == "1":
+        _fallback_rope_quant_kvcache_attention_with_output(
+            query=query,
+            key=key,
+            value=value,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            output=output,
+            is_neox=is_neox,
+            layer_name=layer_name,
+        )
+        return
+
     attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
     if attn_metadata is None:
         output.zero_()
