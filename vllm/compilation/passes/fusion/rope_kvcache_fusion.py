@@ -205,21 +205,11 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     from flashinfer.rope import _rope_quantize_fp8_append_paged_kv_cache
     from flashinfer.utils import TensorLayout
 
-    from vllm.v1.attention.backends.flashinfer import FlashInferBackend
-
     num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
     query = query[:num_actual_tokens]
     key = key[:num_actual_tokens]
     value = value[:num_actual_tokens]
     positions = positions[:num_actual_tokens]
-
-    kv_cache_for_rope = kv_cache
-    torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
-        attn_layer.impl.kv_cache_dtype
-    )
-    kv_cache_for_rope = kv_cache_for_rope.view(torch_dtype)
-    stride_order = FlashInferBackend.get_kv_cache_stride_order()
-    kv_cache_permute = kv_cache_for_rope.permute(*stride_order)
 
     if query.ndim == 2:
         query = query.view(-1, attn_layer.num_heads, attn_layer.head_size)
@@ -254,6 +244,11 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     if cos_sin_cache.dtype != torch.float32:
         cos_sin_cache = cos_sin_cache.float()
 
+    # vLLM stores dequant scales (x ~= fp8 * scale), while FlashInfer's
+    # rope+quant kernels expect the quantization multiplier applied before cast.
+    quant_scale_q = 1.0 / attn_layer._q_scale_float
+    quant_scale_kv = 1.0 / attn_layer._k_scale_float
+
     _rope_quantize_fp8_append_paged_kv_cache(
         q_rope_in=query,
         k_rope_in=key,
@@ -264,8 +259,8 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         q_nope_out=q_nope_out,
         cos_sin_cache=cos_sin_cache,
         pos_ids=positions,
-        k_cache=kv_cache_permute[:, 0],
-        v_cache=kv_cache_permute[:, 1],
+        k_cache=kv_cache[:, 0],
+        v_cache=kv_cache[:, 1],
         ckv_cache=torch.empty(0, dtype=FP8_DTYPE, device=query.device),
         kpe_cache=torch.empty(0, dtype=FP8_DTYPE, device=query.device),
         kv_indices=attn_metadata.paged_kv_indices,
@@ -274,8 +269,8 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         positions=attn_metadata.rope_append_positions,
         kv_layout_code=TensorLayout["HND"].value,
         page_size=attn_metadata.page_size,
-        quant_scale_q=attn_layer._q_scale_float,
-        quant_scale_kv=attn_layer._k_scale_float,
+        quant_scale_q=quant_scale_q,
+        quant_scale_kv=quant_scale_kv,
         interleave=(not is_neox),
         enable_pdl=False,
     )
