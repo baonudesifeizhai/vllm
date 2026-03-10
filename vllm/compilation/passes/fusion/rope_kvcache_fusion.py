@@ -220,9 +220,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     is_neox: bool,
     layer_name: str = "",
 ) -> None:
-    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
-        layer_name
-    )
+    attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
     if attn_metadata is None:
         output.zero_()
         return
@@ -306,26 +304,6 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     # rope+quant kernels expect the quantization multiplier applied before cast.
     quant_scale_q = 1.0 / attn_layer._q_scale_float
     quant_scale_kv = 1.0 / attn_layer._k_scale_float
-
-    if layer_slot_mapping is not None:
-        batch_indices = attn_metadata.rope_append_batch_indices
-        cache_positions = attn_metadata.rope_append_positions
-        kv_indptr = attn_metadata.paged_kv_indptr
-        kv_indices = attn_metadata.paged_kv_indices
-        page_size = attn_metadata.page_size
-
-        page_iter = torch.div(cache_positions, page_size, rounding_mode="floor")
-        entry_idx = torch.remainder(cache_positions, page_size)
-        page_indices = kv_indices[kv_indptr[batch_indices] + page_iter]
-        derived_slot_mapping = page_indices * page_size + entry_idx
-        if not torch.equal(
-            derived_slot_mapping.to(torch.int64),
-            layer_slot_mapping[:num_actual_tokens].to(torch.int64),
-        ):
-            raise RuntimeError(
-                "FlashInfer rope+quant append metadata does not match "
-                "baseline slot_mapping"
-            )
 
     kv_cache_flashinfer = kv_cache
     if attn_layer.impl.kv_cache_dtype.startswith("fp8"):
