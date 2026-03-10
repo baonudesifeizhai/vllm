@@ -158,6 +158,58 @@ def _fallback_rope_quant_kvcache_attention_with_output(
     )
 
 
+def _baseline_rope_quant_attention_only(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    output: torch.Tensor,
+    is_neox: bool,
+    attn_layer: Attention,
+    kv_cache: torch.Tensor,
+    attn_metadata: object,
+) -> None:
+    query = query.clone()
+    key = key.clone()
+    rotary_op = torch.ops._C.rotary_embedding.default
+    rotary_op(
+        positions=positions,
+        query=query,
+        key=key,
+        head_size=attn_layer.head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+    )
+
+    if (
+        attn_layer.query_quant is not None
+        and attn_layer.impl.supports_quant_query_input
+    ):
+        query, _ = attn_layer.query_quant(query, attn_layer._q_scale)
+
+    num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
+    query = query[:num_actual_tokens].view(
+        -1, attn_layer.num_heads, attn_layer.head_size
+    )
+    key = key[:num_actual_tokens].view(
+        -1, attn_layer.num_kv_heads, attn_layer.head_size
+    )
+    value = value[:num_actual_tokens]
+    if value.ndim == 2:
+        value = value.view(-1, attn_layer.num_kv_heads, attn_layer.head_size_v)
+
+    attn_layer.impl.forward(
+        attn_layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+    )
+
+
 def fused_rope_quant_kvcache_attention_with_output_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -257,8 +309,6 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
             attn_layer.impl.kv_cache_dtype
         )
         kv_cache_flashinfer = kv_cache_flashinfer.view(torch_dtype)
-    stride_order = FlashInferBackend.get_kv_cache_stride_order()
-    kv_cache_permute = kv_cache_flashinfer.permute(*stride_order)
 
     _rope_quantize_fp8_append_paged_kv_cache(
         q_rope_in=query,
@@ -270,15 +320,15 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         q_nope_out=q_nope_out,
         cos_sin_cache=cos_sin_cache,
         pos_ids=positions,
-        k_cache=kv_cache_permute[:, 0],
-        v_cache=kv_cache_permute[:, 1],
+        k_cache=kv_cache_flashinfer[:, 0],
+        v_cache=kv_cache_flashinfer[:, 1],
         ckv_cache=torch.empty(0, dtype=FP8_DTYPE, device=query.device),
         kpe_cache=torch.empty(0, dtype=FP8_DTYPE, device=query.device),
         kv_indices=attn_metadata.paged_kv_indices,
         kv_indptr=attn_metadata.paged_kv_indptr,
         batch_indices=attn_metadata.rope_append_batch_indices,
         positions=attn_metadata.rope_append_positions,
-        kv_layout_code=TensorLayout["HND"].value,
+        kv_layout_code=TensorLayout["NHD"].value,
         page_size=attn_metadata.page_size,
         quant_scale_q=quant_scale_q,
         quant_scale_kv=quant_scale_kv,
@@ -286,14 +336,17 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         enable_pdl=False,
     )
 
-    attn_layer.impl.forward(
-        attn_layer,
-        q_rope_out,
-        key,
-        value,
-        kv_cache,
-        attn_metadata,
+    _baseline_rope_quant_attention_only(
+        query=query,
+        key=key,
+        value=value,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
         output=output,
+        is_neox=is_neox,
+        attn_layer=attn_layer,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
     )
 
 
