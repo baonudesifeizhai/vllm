@@ -223,6 +223,62 @@ class FlashInferRoPEQuantAttentionTestModel(QKRoPEKVCacheTestModel):
         )
         self.attn._q_scale = self.attn._q_scale.to(device)
 
+    def build_attn_metadata(self, batch_size: int) -> CommonAttentionMetadata:
+        batch_spec = BatchSpec(seq_lens=[1] * batch_size, query_lens=[1] * batch_size)
+        common_attn_metadata = create_common_attn_metadata(
+            batch_spec, self.block_size, self.device, arange_block_indices=True
+        )
+
+        slot_mapping = torch.empty(
+            common_attn_metadata.num_actual_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        token_idx = 0
+        for req_idx, seq_len in enumerate(batch_spec.seq_lens):
+            query_len = batch_spec.query_lens[req_idx]
+            start_pos = seq_len - query_len
+            for pos in range(start_pos, seq_len):
+                block_idx = common_attn_metadata.block_table_tensor[
+                    req_idx, pos // self.block_size
+                ]
+                slot_mapping[token_idx] = block_idx.to(
+                    torch.int64
+                ) * self.block_size + (pos % self.block_size)
+                token_idx += 1
+
+        common_attn_metadata.slot_mapping = slot_mapping
+
+        max_blocks = (max(batch_spec.seq_lens) + self.block_size - 1) // self.block_size
+        num_blocks = batch_size * max_blocks
+        attn_backend = self.attn.attn_backend
+        kv_cache_shape = attn_backend.get_kv_cache_shape(
+            num_blocks, self.block_size, self.num_kv_heads, self.head_size
+        )
+        try:
+            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+        except (AttributeError, NotImplementedError):
+            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+
+        kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
+        inv_order = [
+            kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
+        ]
+
+        raw_tensor = torch.zeros(
+            2 * num_blocks * self.block_size * self.num_kv_heads * self.head_size,
+            dtype=self.kv_cache_dtype,
+            device=self.device,
+        )
+        raw_tensor = raw_tensor.view(kv_cache_shape)
+        kv_cache = raw_tensor.permute(*inv_order)
+        self.attn.kv_cache = [kv_cache]
+
+        return self.builder.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        )
+
     def forward(self, qkv: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         qkv = qkv.clone()
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
