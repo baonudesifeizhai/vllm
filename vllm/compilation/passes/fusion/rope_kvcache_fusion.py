@@ -15,26 +15,27 @@ from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
 )
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    kFp8StaticTensorSym,
-)
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .matcher_utils import (
-    MatcherQuantFP8,
     MatcherRotaryEmbedding,
 )
 from .rms_quant_fusion import (
     empty_bf16,
-    empty_fp32,
     empty_i64,
 )
 
 logger = init_logger(__name__)
 ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
 RESHAPE_OP = torch.ops.aten.reshape.default
+FP8_DTYPE = current_platform.fp8_dtype()
+
+
+def empty_fp8(*args, **kwargs) -> torch.Tensor:
+    return torch.empty(*args, **kwargs, dtype=FP8_DTYPE, device="cuda")
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -395,9 +396,8 @@ class FlashInferRopeQuantKVCachePattern:
     """
     Matches:
       q, k = rotary_embedding(...)
-      q_quant = static_fp8_quant(q, scale)
       dummy = unified_kv_cache_update(k, v, layer_name)
-      unified_attention_with_output(q_quant, k, v, ...)
+      unified_attention_with_output(q_attn, k, v, ...)
 
     and replaces the whole chain with a FlashInfer-specific fused op that
     performs rope+quant+cache-append and then runs attention, so the graph no
@@ -430,7 +430,6 @@ class FlashInferRopeQuantKVCachePattern:
             num_kv_heads=self.num_kv_heads,
             use_flashinfer=use_flashinfer_rotary,
         )
-        self.quant_matcher = MatcherQuantFP8(kFp8StaticTensorSym)
 
     def get_inputs(self) -> list[torch.Tensor]:
         T = 5
@@ -438,28 +437,26 @@ class FlashInferRopeQuantKVCachePattern:
         qkv = empty_bf16(T, self.q_size + self.k_size + self.v_size)
         positions = empty_i64(T)
         cos_sin_cache = empty_bf16(L, self.head_size)
-        scale = empty_fp32(1, 1)
+        q_attn = empty_fp8(T, self.num_heads, self.head_size)
         output = empty_bf16(T, self.num_heads, self.head_size_v)
-        return [qkv, positions, cos_sin_cache, scale, output]
+        return [qkv, positions, cos_sin_cache, q_attn, output]
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
             qkv: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
-            scale: torch.Tensor,
+            q_attn: torch.Tensor,
             output: torch.Tensor,
         ) -> torch.Tensor:
             q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
-            q, k = self.rope_matcher(positions, q, k, cos_sin_cache)
-            q = self.quant_matcher(q, scale)[0]
-            q = q.view(-1, self.num_heads, self.head_size)
+            _, k = self.rope_matcher(positions, q, k, cos_sin_cache)
             k = k.view(-1, self.num_kv_heads, self.head_size)
             v = v.view(-1, self.num_kv_heads, self.head_size_v)
             dummy = torch.ops.vllm.unified_kv_cache_update(k, v, self.layer_name)
             at1 = auto_functionalized(
                 ATTN_OP,
-                query=q,
+                query=q_attn,
                 key=k,
                 value=v,
                 output=output,
@@ -474,10 +471,10 @@ class FlashInferRopeQuantKVCachePattern:
             qkv: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
-            scale: torch.Tensor,
+            q_attn: torch.Tensor,
             output: torch.Tensor,
         ) -> torch.Tensor:
-            del scale
+            del q_attn
             q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
             q = q.view(-1, self.num_heads, self.head_size)
             k = k.view(-1, self.num_kv_heads, self.head_size)
