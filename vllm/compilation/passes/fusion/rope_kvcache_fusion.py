@@ -298,9 +298,8 @@ class FlashInferRopeQuantKVCachePattern:
         qkv = empty_bf16(t, self.q_size + self.k_size + self.v_size)
         positions = empty_i64(t)
         cos_sin_cache = empty_bf16(4096, self.head_size)
-        output = empty_bf16(t, self.num_heads, self.head_size_v)
         q_scale = torch.empty((), dtype=torch.float32, device=qkv.device)
-        return [qkv, positions, cos_sin_cache, output, q_scale]
+        return [qkv, positions, cos_sin_cache, q_scale]
 
     def _quantize_query(
         self, query: torch.Tensor, q_scale: torch.Tensor
@@ -317,7 +316,6 @@ class FlashInferRopeQuantKVCachePattern:
             qkv: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
-            output: torch.Tensor,
             q_scale: torch.Tensor,
         ) -> torch.Tensor:
             query, key, value = qkv.split(
@@ -329,6 +327,12 @@ class FlashInferRopeQuantKVCachePattern:
             query = query.view(-1, self.num_heads, self.head_size)
             key = key.view(-1, self.num_kv_heads, self.head_size)
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
+            output = torch.empty(
+                [qkv.shape[0], self.hidden_size],
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            output = output.view(-1, self.num_heads, self.head_size_v)
             kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                 key, value, self.layer_name
             )
@@ -349,10 +353,15 @@ class FlashInferRopeQuantKVCachePattern:
             qkv: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
-            output: torch.Tensor,
             q_scale: torch.Tensor,
         ) -> torch.Tensor:
             del q_scale
+            output = torch.empty(
+                [qkv.shape[0], self.hidden_size],
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            output = output.view(-1, self.num_heads, self.head_size_v)
             result = auto_functionalized(
                 self.FUSED_OP,
                 qkv=qkv,
