@@ -284,7 +284,7 @@ class FlashInferRopeQuantKVCachePattern:
         self.q_size = self.num_heads * self.head_size
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
-        self.q_scale = layer._q_scale
+        self.q_scale = float(layer._q_scale_float)
         self.fp8_dtype = current_platform.fp8_dtype()
         self.fp8_min, self.fp8_max = get_fp8_min_max()
         self.rope_matcher = MatcherRotaryEmbedding(
@@ -304,7 +304,7 @@ class FlashInferRopeQuantKVCachePattern:
 
     def _quantize_query(self, query: torch.Tensor) -> torch.Tensor:
         query = query.to(torch.float32)
-        query = query * self.q_scale.to(torch.float32).reciprocal()
+        query = query * (1.0 / self.q_scale)
         query = query.clamp(min=self.fp8_min)
         query = query.clamp(max=self.fp8_max)
         return query.to(self.fp8_dtype)
