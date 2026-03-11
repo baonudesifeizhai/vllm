@@ -91,6 +91,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    q_scale: torch.Tensor,
     output: torch.Tensor,
     is_neox: bool,
     layer_name: str = "",
@@ -120,7 +121,7 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         attn_layer.query_quant is not None
         and attn_layer.impl.supports_quant_query_input
     ):
-        query, _ = attn_layer.query_quant(query, attn_layer._q_scale)
+        query, _ = attn_layer.query_quant(query, q_scale)
 
     query = query.view(-1, attn_layer.num_heads, attn_layer.head_size)
     key = key.view(-1, attn_layer.num_kv_heads, attn_layer.head_size)
@@ -146,6 +147,7 @@ def fused_rope_quant_kvcache_attention_with_output_fake(
     qkv: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
+    q_scale: torch.Tensor,
     output: torch.Tensor,
     is_neox: bool,
     layer_name: str = "",
@@ -354,7 +356,6 @@ class FlashInferRopeQuantKVCachePattern:
             cos_sin_cache: torch.Tensor,
             q_scale: torch.Tensor,
         ) -> torch.Tensor:
-            del q_scale
             output = torch.empty(
                 [qkv.shape[0], self.hidden_size],
                 dtype=qkv.dtype,
@@ -366,6 +367,7 @@ class FlashInferRopeQuantKVCachePattern:
                 qkv=qkv,
                 positions=positions,
                 cos_sin_cache=cos_sin_cache,
+                q_scale=q_scale,
                 output=output,
                 is_neox=self.is_neox,
                 layer_name=self.layer_name,
