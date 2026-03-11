@@ -8,6 +8,7 @@ from torch._higher_order_ops import auto_functionalized
 from torch._inductor.fx_passes.post_grad import view_to_reshape
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
+from vllm import envs
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.utils import Range
 from vllm.logger import init_logger
@@ -206,7 +207,7 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
 
         attn_layers = get_layers_from_vllm_config(config, Attention)
         for _, layer in attn_layers.items():
-            if layer.impl.fused_rope_kvcache_supported():
+            if getattr(layer.impl, "fused_rope_kvcache_supported", lambda: False)():
                 for is_neox in [True, False]:
                     RopeReshapeKVCachePattern(
                         layer=layer,
@@ -217,6 +218,13 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        if envs.VLLM_DUMP_ONLY_ROPE_KVCACHE_PASS:
+            self.matched_count = 0
+            logger.debug(
+                "Dump-only mode enabled for RopeKVCacheFusionPass; "
+                "skipping replacements."
+            )
+            return
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
 
