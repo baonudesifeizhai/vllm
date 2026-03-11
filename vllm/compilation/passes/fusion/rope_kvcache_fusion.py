@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention.attention import (
     get_attention_context,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
@@ -284,7 +285,7 @@ class FlashInferRopeQuantKVCachePattern:
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
         self.q_scale = layer._q_scale
-        self.fp8_dtype = layer.query_quant.quant_dtype
+        self.fp8_dtype = current_platform.fp8_dtype()
         self.fp8_min, self.fp8_max = get_fp8_min_max()
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=self.is_neox,
