@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     VLLM_DP_MASTER_IP: str = ""
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_DUMP_ONLY_ROPE_KVCACHE_PASS: bool = False
+    VLLM_DEBUG_FORCE_ROPE_KVCACHE_DECODE_FALLBACK: bool = False
     VLLM_MOE_DP_CHUNK_SIZE: int = 256
     VLLM_ENABLE_MOE_DP_CHUNK: bool = True
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -600,6 +601,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run RopeKVCacheFusionPass only for graph dumps and skip replacements.
     "VLLM_DUMP_ONLY_ROPE_KVCACHE_PASS": lambda: bool(
         int(os.environ.get("VLLM_DUMP_ONLY_ROPE_KVCACHE_PASS", "0"))
+    ),
+    "VLLM_DEBUG_FORCE_ROPE_KVCACHE_DECODE_FALLBACK": lambda: bool(
+        int(
+            os.environ.get(
+                "VLLM_DEBUG_FORCE_ROPE_KVCACHE_DECODE_FALLBACK",
+                "0",
+            )
+        )
     ),
     # Dump fx graphs to the given directory.
     # It will override CompilationConfig.debug_dump_path if set.

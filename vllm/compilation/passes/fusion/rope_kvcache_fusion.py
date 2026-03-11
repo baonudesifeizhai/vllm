@@ -189,7 +189,8 @@ def fused_decode_attention_from_kvcache_with_output_impl(
         attn_layer.impl, "forward_decode_from_kvcache_with_output", None
     )
     if (
-        decode_only_forward is not None
+        not envs.VLLM_DEBUG_FORCE_ROPE_KVCACHE_DECODE_FALLBACK
+        and decode_only_forward is not None
         and attn_metadata is not None
         and attn_metadata.num_prefill_tokens == 0
         and output_scale is None
