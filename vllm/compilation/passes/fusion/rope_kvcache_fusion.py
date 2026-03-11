@@ -102,6 +102,7 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
 
     query = query.clone()
     key = key.clone()
+    value = value.clone()
     torch.ops._C.rotary_embedding.default(
         positions=positions,
         query=query,
