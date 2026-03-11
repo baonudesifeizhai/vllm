@@ -31,7 +31,6 @@ from .rms_quant_fusion import (
 )
 
 logger = init_logger(__name__)
-ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -87,52 +86,88 @@ direct_register_custom_op(
 )
 
 
-def fused_rope_quant_kvcache_attention_with_output_impl(
-    qkv: torch.Tensor,
+def fused_rope_quant_and_unified_kv_cache_update_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     q_scale: torch.Tensor,
-    output: torch.Tensor,
+    head_size: int,
+    head_size_v: int,
     is_neox: bool,
     layer_name: str = "",
-) -> None:
-    del q_scale
-    _, attn_layer, _, _ = get_attention_context(layer_name)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
 
-    qkv = qkv.clone()
-    q_size = attn_layer.num_heads * attn_layer.head_size
-    k_size = attn_layer.num_kv_heads * attn_layer.head_size
-    v_size = attn_layer.num_kv_heads * attn_layer.head_size_v
-    query, key, value = qkv.split([q_size, k_size, v_size], dim=-1)
+    query = query.clone()
+    key = key.clone()
     torch.ops._C.rotary_embedding.default(
         positions=positions,
         query=query,
         key=key,
-        head_size=attn_layer.head_size,
+        head_size=head_size,
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
     )
-    result = attn_layer(query, key, value)
-    output.copy_(result.view_as(output))
+    assert attn_layer.query_quant is not None
+    query, _ = attn_layer.query_quant(query, q_scale)
+
+    num_heads = query.shape[-1] // head_size
+    num_kv_heads = key.shape[-1] // head_size
+    query = query.view(-1, num_heads, head_size)
+    key = key.view(-1, num_kv_heads, head_size)
+    value = value.view(-1, value.shape[-1] // head_size_v, head_size_v)
+
+    if layer_slot_mapping is not None:
+        attn_layer.impl.do_kv_cache_update(
+            attn_layer,
+            key,
+            value,
+            kv_cache,
+            layer_slot_mapping,
+        )
+
+    dummy = torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
+    return dummy, query, key, value
 
 
-def fused_rope_quant_kvcache_attention_with_output_fake(
-    qkv: torch.Tensor,
+def fused_rope_quant_and_unified_kv_cache_update_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     q_scale: torch.Tensor,
-    output: torch.Tensor,
+    head_size: int,
+    head_size_v: int,
     is_neox: bool,
     layer_name: str = "",
-) -> None:
-    return
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    fp8_dtype = current_platform.fp8_dtype()
+    query = torch.empty(
+        (query.shape[0], query.shape[-1] // head_size, head_size),
+        dtype=fp8_dtype,
+        device=query.device,
+    )
+    key = torch.empty(
+        (key.shape[0], key.shape[-1] // head_size, head_size),
+        dtype=key.dtype,
+        device=key.device,
+    )
+    value = torch.empty(
+        (value.shape[0], value.shape[-1] // head_size_v, head_size_v),
+        dtype=value.dtype,
+        device=value.device,
+    )
+    dummy = torch.empty(0, device=key.device, dtype=key.dtype)
+    return dummy, query, key, value
 
 
 direct_register_custom_op(
-    op_name="fused_rope_quant_kvcache_attention_with_output",
-    op_func=fused_rope_quant_kvcache_attention_with_output_impl,
-    mutates_args=["output"],
-    fake_impl=fused_rope_quant_kvcache_attention_with_output_fake,
+    op_name="fused_rope_quant_and_unified_kv_cache_update",
+    op_func=fused_rope_quant_and_unified_kv_cache_update_impl,
+    fake_impl=fused_rope_quant_and_unified_kv_cache_update_fake,
 )
 
 
@@ -239,20 +274,17 @@ class FlashInferRopeQuantKVCachePattern:
       split_with_sizes(qkv) -> auto_functionalized(rotary_embedding)
       -> inline fp8 query quant -> reshape(q, k, v)
       -> unified_kv_cache_update(k, v)
-      -> auto_functionalized(unified_attention_with_output)
-    and replace it with a single fused op that replays the baseline semantics.
+    and replace it with a smaller fused op, leaving attention in the graph.
     """
 
-    FUSED_OP = torch.ops.vllm.fused_rope_quant_kvcache_attention_with_output.default
+    FUSED_OP = torch.ops.vllm.fused_rope_quant_and_unified_kv_cache_update.default
 
     def __init__(self, layer: Attention, is_neox: bool) -> None:
-        self.layer = layer
         self.layer_name = layer.layer_name
         self.num_heads = layer.num_heads
         self.num_kv_heads = layer.num_kv_heads
         self.head_size = layer.head_size
         self.head_size_v = layer.head_size_v
-        self.hidden_size = self.num_heads * self.head_size_v
         self.is_neox = is_neox
 
         self.q_size = self.num_heads * self.head_size
@@ -291,7 +323,7 @@ class FlashInferRopeQuantKVCachePattern:
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             q_scale: torch.Tensor,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             query, key, value = qkv.split(
                 [self.q_size, self.k_size, self.v_size], dim=-1
             )
@@ -301,51 +333,32 @@ class FlashInferRopeQuantKVCachePattern:
             query = query.view(-1, self.num_heads, self.head_size)
             key = key.view(-1, self.num_kv_heads, self.head_size)
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
-            output = torch.empty(
-                [qkv.shape[0], self.hidden_size],
-                dtype=qkv.dtype,
-                device=qkv.device,
-            )
-            output = output.view(-1, self.num_heads, self.head_size_v)
             kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                 key, value, self.layer_name
             )
-            result = auto_functionalized(
-                ATTN_OP,
-                query=query,
-                key=key,
-                value=value,
-                output=output,
-                layer_name=self.layer_name,
-                output_scale=None,
-                output_block_scale=None,
-                kv_cache_dummy_dep=kv_cache_dummy_dep,
-            )
-            return result[1]
+            return kv_cache_dummy_dep, query, key, value
 
         def replacement(
             qkv: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             q_scale: torch.Tensor,
-        ) -> torch.Tensor:
-            output = torch.empty(
-                [qkv.shape[0], self.hidden_size],
-                dtype=qkv.dtype,
-                device=qkv.device,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            query, key, value = qkv.split(
+                [self.q_size, self.k_size, self.v_size], dim=-1
             )
-            output = output.view(-1, self.num_heads, self.head_size_v)
-            result = auto_functionalized(
-                self.FUSED_OP,
-                qkv=qkv,
+            return self.FUSED_OP(
+                query=query,
+                key=key,
+                value=value,
                 positions=positions,
                 cos_sin_cache=cos_sin_cache,
                 q_scale=q_scale,
-                output=output,
+                head_size=self.head_size,
+                head_size_v=self.head_size_v,
                 is_neox=self.is_neox,
                 layer_name=self.layer_name,
             )
-            return result[1]
 
         def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
             gm = pm.fwd_only(*args, **kwargs)
@@ -428,5 +441,5 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
             self,
             RopeReshapeKVCachePattern,
             FlashInferRopeQuantKVCachePattern,
-            fused_rope_quant_kvcache_attention_with_output_impl,
+            fused_rope_quant_and_unified_kv_cache_update_impl,
         )

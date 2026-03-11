@@ -236,7 +236,10 @@ class FlashInferRoPEQuantAttentionTestModel(QKRoPEKVCacheTestModel):
         return ops
 
     def ops_in_model_after(self) -> list[torch._ops.OpOverload]:
-        return [torch.ops.vllm.fused_rope_quant_kvcache_attention_with_output.default]
+        return [
+            torch.ops.vllm.fused_rope_quant_and_unified_kv_cache_update.default,
+            UNIFIED_ATTN_WITH_OUTPUT_OP,
+        ]
 
 
 @pytest.mark.parametrize(
