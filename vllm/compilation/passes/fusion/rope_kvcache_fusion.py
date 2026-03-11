@@ -96,12 +96,8 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
     is_neox: bool,
     layer_name: str = "",
 ) -> None:
-    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
-        layer_name
-    )
-    if attn_metadata is None:
-        output.zero_()
-        return
+    del q_scale
+    _, attn_layer, _, _ = get_attention_context(layer_name)
 
     qkv = qkv.clone()
     q_size = attn_layer.num_heads * attn_layer.head_size
@@ -116,31 +112,8 @@ def fused_rope_quant_kvcache_attention_with_output_impl(
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
     )
-
-    if (
-        attn_layer.query_quant is not None
-        and attn_layer.impl.supports_quant_query_input
-    ):
-        query, _ = attn_layer.query_quant(query, q_scale)
-
-    query = query.view(-1, attn_layer.num_heads, attn_layer.head_size)
-    key = key.view(-1, attn_layer.num_kv_heads, attn_layer.head_size)
-    value = value.view(-1, attn_layer.num_kv_heads, attn_layer.head_size_v)
-
-    if layer_slot_mapping is not None:
-        attn_layer.impl.do_kv_cache_update(
-            attn_layer, key, value, kv_cache, layer_slot_mapping
-        )
-
-    attn_layer.impl.forward(
-        attn_layer,
-        query,
-        key,
-        value,
-        kv_cache,
-        attn_metadata,
-        output=output,
-    )
+    result = attn_layer(query, key, value)
+    output.copy_(result.view_as(output))
 
 
 def fused_rope_quant_kvcache_attention_with_output_fake(
