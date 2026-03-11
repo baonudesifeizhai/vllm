@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     VLLM_DP_MASTER_PORT: int = 0
     VLLM_DUMP_ONLY_ROPE_KVCACHE_PASS: bool = False
     VLLM_DEBUG_FORCE_ROPE_KVCACHE_DECODE_FALLBACK: bool = False
+    VLLM_DEBUG_SHADOW_COMPARE_ROPE_KVCACHE_ONCE: bool = False
     VLLM_MOE_DP_CHUNK_SIZE: int = 256
     VLLM_ENABLE_MOE_DP_CHUNK: bool = True
     VLLM_RANDOMIZE_DP_DUMMY_INPUTS: bool = False
@@ -606,6 +607,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(
             os.environ.get(
                 "VLLM_DEBUG_FORCE_ROPE_KVCACHE_DECODE_FALLBACK",
+                "0",
+            )
+        )
+    ),
+    "VLLM_DEBUG_SHADOW_COMPARE_ROPE_KVCACHE_ONCE": lambda: bool(
+        int(
+            os.environ.get(
+                "VLLM_DEBUG_SHADOW_COMPARE_ROPE_KVCACHE_ONCE",
                 "0",
             )
         )

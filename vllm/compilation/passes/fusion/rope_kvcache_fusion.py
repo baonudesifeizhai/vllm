@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
 FP8_DTYPE = current_platform.fp8_dtype()
 FP8_MIN, FP8_MAX = get_fp8_min_max()
+_SHADOW_COMPARE_DONE = False
 
 
 def _inline_quantize_query_to_fp8(
@@ -45,6 +46,114 @@ def _inline_quantize_query_to_fp8(
     query = query.clamp(min=FP8_MIN)
     query = query.clamp(max=FP8_MAX)
     return torch.ops.prims.convert_element_type.default(query, FP8_DTYPE)
+
+
+def _should_run_shadow_compare_once(query: torch.Tensor) -> bool:
+    global _SHADOW_COMPARE_DONE
+    if _SHADOW_COMPARE_DONE or not envs.VLLM_DEBUG_SHADOW_COMPARE_ROPE_KVCACHE_ONCE:
+        return False
+    if query.is_cuda and torch.cuda.is_current_stream_capturing():
+        return False
+    _SHADOW_COMPARE_DONE = True
+    return True
+
+
+def _tensor_mismatch_message(
+    name: str,
+    expected: torch.Tensor,
+    actual: torch.Tensor,
+) -> str:
+    if expected.shape != actual.shape:
+        return (
+            f"{name} shape mismatch: expected {tuple(expected.shape)}, "
+            f"got {tuple(actual.shape)}"
+        )
+    if expected.dtype != actual.dtype:
+        return f"{name} dtype mismatch: expected {expected.dtype}, got {actual.dtype}"
+
+    expected_f = expected.float()
+    actual_f = actual.float()
+    diff = (expected_f - actual_f).abs()
+    max_diff = diff.max().item()
+    if max_diff == 0:
+        return ""
+    flat_idx = diff.reshape(-1).argmax().item()
+    unraveled = list(reversed(expected.shape))
+    coords: list[int] = []
+    rem = flat_idx
+    for size in unraveled:
+        coords.append(rem % size)
+        rem //= size
+    coords = list(reversed(coords))
+    return (
+        f"{name} mismatch: max_abs_diff={max_diff} at index {tuple(coords)}; "
+        f"expected={expected_f[tuple(coords)].item()}, "
+        f"got={actual_f[tuple(coords)].item()}"
+    )
+
+
+def _compare_first_stage_against_baseline_once(
+    *,
+    query_in: torch.Tensor,
+    key_in: torch.Tensor,
+    value_in: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    q_scale: torch.Tensor,
+    head_size: int,
+    head_size_v: int,
+    is_neox: bool,
+    layer_name: str,
+    attn_layer: Attention,
+    kv_cache: torch.Tensor,
+    layer_slot_mapping: torch.Tensor | None,
+    query_out: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+) -> None:
+    shadow_query = query_in.clone()
+    shadow_key = key_in.clone()
+    shadow_value = value_in.clone()
+
+    torch.ops._C.rotary_embedding.default(
+        positions=positions,
+        query=shadow_query,
+        key=shadow_key,
+        head_size=head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+    )
+    shadow_query = _inline_quantize_query_to_fp8(shadow_query, q_scale)
+
+    num_heads = shadow_query.shape[-1] // head_size
+    num_kv_heads = shadow_key.shape[-1] // head_size
+    shadow_query = shadow_query.view(-1, num_heads, head_size)
+    shadow_key = shadow_key.view(-1, num_kv_heads, head_size)
+    shadow_value = shadow_value.view(
+        -1, shadow_value.shape[-1] // head_size_v, head_size_v
+    )
+
+    shadow_kv_cache = kv_cache.clone()
+    if layer_slot_mapping is not None:
+        attn_layer.impl.do_kv_cache_update(
+            attn_layer,
+            shadow_key,
+            shadow_value,
+            shadow_kv_cache,
+            layer_slot_mapping,
+        )
+
+    for name, expected, actual in (
+        ("query", shadow_query, query_out),
+        ("key", shadow_key, key_out),
+        ("value", shadow_value, value_out),
+        ("kv_cache", shadow_kv_cache, kv_cache),
+    ):
+        mismatch = _tensor_mismatch_message(name, expected, actual)
+        if mismatch:
+            raise RuntimeError(
+                f"RopeKVCache shadow compare failed for {layer_name}: {mismatch}"
+            )
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -113,6 +222,9 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
     layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    query_in = query
+    key_in = key
+    value_in = value
 
     query = query.clone()
     key = key.clone()
@@ -140,6 +252,26 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
             value,
             kv_cache,
             layer_slot_mapping,
+        )
+
+    if _should_run_shadow_compare_once(query):
+        _compare_first_stage_against_baseline_once(
+            query_in=query_in,
+            key_in=key_in,
+            value_in=value_in,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            q_scale=q_scale,
+            head_size=head_size,
+            head_size_v=head_size_v,
+            is_neox=is_neox,
+            layer_name=layer_name,
+            attn_layer=attn_layer,
+            kv_cache=kv_cache,
+            layer_slot_mapping=layer_slot_mapping,
+            query_out=query,
+            key_out=key,
+            value_out=value,
         )
 
     dummy = torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
