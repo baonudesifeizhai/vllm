@@ -32,6 +32,19 @@ from .rms_quant_fusion import (
 
 logger = init_logger(__name__)
 ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
+FP8_DTYPE = current_platform.fp8_dtype()
+FP8_MIN, FP8_MAX = get_fp8_min_max()
+
+
+def _inline_quantize_query_to_fp8(
+    query: torch.Tensor, q_scale: torch.Tensor
+) -> torch.Tensor:
+    query = torch.ops.prims.convert_element_type.default(query, torch.float32)
+    reciprocal = torch.ops.aten.reciprocal.default(q_scale)
+    query = torch.ops.aten.mul.Tensor(query, reciprocal)
+    query = query.clamp(min=FP8_MIN)
+    query = query.clamp(max=FP8_MAX)
+    return torch.ops.prims.convert_element_type.default(query, FP8_DTYPE)
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -112,8 +125,7 @@ def fused_rope_quant_and_unified_kv_cache_update_impl(
         cos_sin_cache=cos_sin_cache,
         is_neox=is_neox,
     )
-    assert attn_layer.query_quant is not None
-    query, _ = attn_layer.query_quant(query, q_scale)
+    query = _inline_quantize_query_to_fp8(query, q_scale)
 
     num_heads = query.shape[-1] // head_size
     num_kv_heads = key.shape[-1] // head_size
@@ -146,10 +158,9 @@ def fused_rope_quant_and_unified_kv_cache_update_fake(
     is_neox: bool,
     layer_name: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    fp8_dtype = current_platform.fp8_dtype()
     query = torch.empty(
         (query.shape[0], query.shape[-1] // head_size, head_size),
-        dtype=fp8_dtype,
+        dtype=FP8_DTYPE,
         device=query.device,
     )
     key = torch.empty(
