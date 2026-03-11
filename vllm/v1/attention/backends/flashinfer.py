@@ -1252,6 +1252,9 @@ class FlashInferImpl(AttentionImpl):
             and quant_key in (kFp8StaticTensorSym, kNvfp4Dynamic)
         )
 
+    def fused_rope_quant_kvcache_supported(self) -> bool:
+        return self.kv_cache_dtype.startswith("fp8") and self.supports_quant_query_input
+
     # FlashInfer requires attention sinks to be float32
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if self.sinks is not None and self.sinks.dtype != torch.float32:

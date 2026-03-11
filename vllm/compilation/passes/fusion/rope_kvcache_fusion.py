@@ -29,6 +29,8 @@ from .rms_quant_fusion import (
 )
 
 logger = init_logger(__name__)
+ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
+RESHAPE_OP = torch.ops.aten.reshape.default
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -81,6 +83,80 @@ direct_register_custom_op(
     op_func=fused_rope_and_unified_kv_cache_update_impl,
     mutates_args=["query", "key"],
     fake_impl=fused_rope_and_unified_kv_cache_update_fake,
+)
+
+
+def fused_rope_quant_kvcache_attention_with_output_impl(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    output: torch.Tensor,
+    is_neox: bool,
+    layer_name: str = "",
+) -> None:
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
+    if attn_metadata is None:
+        output.zero_()
+        return
+
+    qkv = qkv.clone()
+    q_size = attn_layer.num_heads * attn_layer.head_size
+    k_size = attn_layer.num_kv_heads * attn_layer.head_size
+    v_size = attn_layer.num_kv_heads * attn_layer.head_size_v
+    query, key, value = qkv.split([q_size, k_size, v_size], dim=-1)
+    torch.ops._C.rotary_embedding.default(
+        positions=positions,
+        query=query,
+        key=key,
+        head_size=attn_layer.head_size,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+    )
+
+    if (
+        attn_layer.query_quant is not None
+        and attn_layer.impl.supports_quant_query_input
+    ):
+        query, _ = attn_layer.query_quant(query, attn_layer._q_scale)
+
+    query = query.view(-1, attn_layer.num_heads, attn_layer.head_size)
+    key = key.view(-1, attn_layer.num_kv_heads, attn_layer.head_size)
+    value = value.view(-1, attn_layer.num_kv_heads, attn_layer.head_size_v)
+
+    if layer_slot_mapping is not None:
+        attn_layer.impl.do_kv_cache_update(
+            attn_layer, key, value, kv_cache, layer_slot_mapping
+        )
+
+    attn_layer.impl.forward(
+        attn_layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+    )
+
+
+def fused_rope_quant_kvcache_attention_with_output_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    output: torch.Tensor,
+    is_neox: bool,
+    layer_name: str = "",
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="fused_rope_quant_kvcache_attention_with_output",
+    op_func=fused_rope_quant_kvcache_attention_with_output_impl,
+    mutates_args=["output"],
+    fake_impl=fused_rope_quant_kvcache_attention_with_output_fake,
 )
 
 
@@ -181,6 +257,107 @@ class RopeReshapeKVCachePattern:
         )
 
 
+class FlashInferRopeQuantKVCachePattern:
+    """
+    Match the real CUDA decode graph shape:
+      split_with_sizes(qkv) -> auto_functionalized(rotary_embedding)
+      -> inline fp8 query quant -> reshape(q, k, v)
+      -> unified_kv_cache_update(k, v)
+      -> auto_functionalized(unified_attention_with_output)
+    and replace it with a single fused op that replays the baseline semantics.
+    """
+
+    FUSED_OP = torch.ops.vllm.fused_rope_quant_kvcache_attention_with_output.default
+
+    def __init__(self, layer: Attention, is_neox: bool) -> None:
+        self.layer = layer
+        self.layer_name = layer.layer_name
+        self.num_heads = layer.num_heads
+        self.num_kv_heads = layer.num_kv_heads
+        self.head_size = layer.head_size
+        self.head_size_v = layer.head_size_v
+        self.hidden_size = self.num_heads * self.head_size_v
+        self.is_neox = is_neox
+
+        self.q_size = self.num_heads * self.head_size
+        self.k_size = self.num_kv_heads * self.head_size
+        self.v_size = self.num_kv_heads * self.head_size_v
+        self.rope_matcher = MatcherRotaryEmbedding(
+            is_neox=self.is_neox,
+            head_size=self.head_size,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+        )
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        t = 5
+        qkv = empty_bf16(t, self.q_size + self.k_size + self.v_size)
+        positions = empty_i64(t)
+        cos_sin_cache = empty_bf16(4096, self.head_size)
+        output = torch.empty(
+            t, self.num_heads, self.head_size_v, dtype=self.layer.dtype, device="cuda"
+        )
+        return [qkv, positions, cos_sin_cache, output]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            qkv: torch.Tensor,
+            positions: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            output: torch.Tensor,
+        ) -> torch.Tensor:
+            query, key, value = qkv.split(
+                [self.q_size, self.k_size, self.v_size], dim=-1
+            )
+            query, key = self.rope_matcher(positions, query, key, cos_sin_cache)
+            assert key is not None
+            query, _ = self.layer.query_quant(query, self.layer._q_scale)
+            query = query.view(-1, self.num_heads, self.head_size)
+            key = key.view(-1, self.num_kv_heads, self.head_size)
+            value = value.view(-1, self.num_kv_heads, self.head_size_v)
+            kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
+                key, value, self.layer_name
+            )
+            result = auto_functionalized(
+                ATTN_OP,
+                query=query,
+                key=key,
+                value=value,
+                output=output,
+                layer_name=self.layer_name,
+                output_scale=None,
+                output_block_scale=None,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+            return RESHAPE_OP(result[1], [-1, self.hidden_size])
+
+        def replacement(
+            qkv: torch.Tensor,
+            positions: torch.Tensor,
+            cos_sin_cache: torch.Tensor,
+            output: torch.Tensor,
+        ) -> torch.Tensor:
+            result = auto_functionalized(
+                self.FUSED_OP,
+                qkv=qkv,
+                positions=positions,
+                cos_sin_cache=cos_sin_cache,
+                output=output,
+                is_neox=self.is_neox,
+                layer_name=self.layer_name,
+            )
+            return RESHAPE_OP(result[1], [-1, self.hidden_size])
+
+        def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
+            gm = pm.fwd_only(*args, **kwargs)
+            view_to_reshape(gm)
+            return gm
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), fwd_and_view_to_reshape, pm_pass
+        )
+
+
 class RopeKVCacheFusionPass(VllmPatternMatcherPass):
     """
     This pass fuses the rotary embedding and KV cache update operations
@@ -213,6 +390,19 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
                         layer=layer,
                         is_neox=is_neox,
                     ).register(self.patterns)
+            if (
+                layer.query_quant is not None
+                and getattr(
+                    layer.impl,
+                    "fused_rope_quant_kvcache_supported",
+                    lambda: False,
+                )()
+            ):
+                for is_neox in [True, False]:
+                    FlashInferRopeQuantKVCachePattern(
+                        layer=layer,
+                        is_neox=is_neox,
+                    ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
@@ -235,4 +425,9 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
         return compile_range.end <= self.max_token_num
 
     def uuid(self) -> str:
-        return VllmInductorPass.hash_source(self, RopeReshapeKVCachePattern)
+        return VllmInductorPass.hash_source(
+            self,
+            RopeReshapeKVCachePattern,
+            FlashInferRopeQuantKVCachePattern,
+            fused_rope_quant_kvcache_attention_with_output_impl,
+        )
