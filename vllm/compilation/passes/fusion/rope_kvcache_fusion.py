@@ -599,8 +599,13 @@ class FlashInferRopeQuantKVCachePattern:
                 device=qkv.device,
             )
             output = output.view(-1, self.num_heads, self.head_size_v)
+            attn_op = (
+                ATTN_OP
+                if envs.VLLM_DEBUG_BYPASS_ROPE_KVCACHE_SECOND_STAGE_OP
+                else self.FUSED_ATTN_OP
+            )
             result = auto_functionalized(
-                self.FUSED_ATTN_OP,
+                attn_op,
                 query=query,
                 key=key,
                 value=value,
