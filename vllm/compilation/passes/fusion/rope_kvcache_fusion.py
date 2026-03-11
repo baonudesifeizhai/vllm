@@ -16,6 +16,7 @@ from vllm.model_executor.layers.attention.attention import (
     Attention,
     get_attention_context,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
@@ -282,6 +283,9 @@ class FlashInferRopeQuantKVCachePattern:
         self.q_size = self.num_heads * self.head_size
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
+        self.q_scale = layer._q_scale
+        self.fp8_dtype = layer.query_quant.quant_dtype
+        self.fp8_min, self.fp8_max = get_fp8_min_max()
         self.rope_matcher = MatcherRotaryEmbedding(
             is_neox=self.is_neox,
             head_size=self.head_size,
@@ -294,10 +298,15 @@ class FlashInferRopeQuantKVCachePattern:
         qkv = empty_bf16(t, self.q_size + self.k_size + self.v_size)
         positions = empty_i64(t)
         cos_sin_cache = empty_bf16(4096, self.head_size)
-        output = torch.empty(
-            t, self.num_heads, self.head_size_v, dtype=self.layer.dtype, device="cuda"
-        )
+        output = empty_bf16(t, self.num_heads, self.head_size_v)
         return [qkv, positions, cos_sin_cache, output]
+
+    def _quantize_query(self, query: torch.Tensor) -> torch.Tensor:
+        query = query.to(torch.float32)
+        query = query * self.q_scale.to(torch.float32).reciprocal()
+        query = query.clamp(min=self.fp8_min)
+        query = query.clamp(max=self.fp8_max)
+        return query.to(self.fp8_dtype)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -311,7 +320,7 @@ class FlashInferRopeQuantKVCachePattern:
             )
             query, key = self.rope_matcher(positions, query, key, cos_sin_cache)
             assert key is not None
-            query, _ = self.layer.query_quant(query, self.layer._q_scale)
+            query = self._quantize_query(query)
             query = query.view(-1, self.num_heads, self.head_size)
             key = key.view(-1, self.num_kv_heads, self.head_size)
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
