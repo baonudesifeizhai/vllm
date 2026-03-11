@@ -32,7 +32,6 @@ from .rms_quant_fusion import (
 
 logger = init_logger(__name__)
 ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
-RESHAPE_OP = torch.ops.aten.reshape.default
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -347,7 +346,7 @@ class FlashInferRopeQuantKVCachePattern:
                 output_block_scale=None,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
-            return RESHAPE_OP(result[1], [-1, self.hidden_size])
+            return result[1]
 
         def replacement(
             qkv: torch.Tensor,
@@ -371,7 +370,7 @@ class FlashInferRopeQuantKVCachePattern:
                 is_neox=self.is_neox,
                 layer_name=self.layer_name,
             )
-            return RESHAPE_OP(result[1], [-1, self.hidden_size])
+            return result[1]
 
         def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
             gm = pm.fwd_only(*args, **kwargs)
