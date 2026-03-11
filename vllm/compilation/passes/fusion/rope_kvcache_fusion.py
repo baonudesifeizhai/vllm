@@ -31,6 +31,7 @@ from .rms_quant_fusion import (
 )
 
 logger = init_logger(__name__)
+ATTN_OP = torch.ops.vllm.unified_attention_with_output.default
 
 
 def fused_rope_and_unified_kv_cache_update_impl(
@@ -172,6 +173,71 @@ direct_register_custom_op(
 )
 
 
+def fused_decode_attention_from_kvcache_with_output_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    del kv_cache_dummy_dep
+    attn_metadata, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    decode_only_forward = getattr(
+        attn_layer.impl, "forward_decode_from_kvcache_with_output", None
+    )
+    if (
+        decode_only_forward is not None
+        and attn_metadata is not None
+        and attn_metadata.num_prefill_tokens == 0
+        and output_scale is None
+        and output_block_scale is None
+    ):
+        decode_only_forward(
+            attn_layer,
+            query,
+            kv_cache,
+            attn_metadata,
+            output=output,
+        )
+        return
+
+    attn_layer.impl.forward(
+        attn_layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        output_scale=output_scale,
+        output_block_scale=output_block_scale,
+    )
+
+
+def fused_decode_attention_from_kvcache_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="fused_decode_attention_from_kvcache_with_output",
+    op_func=fused_decode_attention_from_kvcache_with_output_impl,
+    mutates_args=["output", "output_block_scale"],
+    fake_impl=fused_decode_attention_from_kvcache_with_output_fake,
+)
+
+
 class RopeReshapeKVCachePattern:
     """
     This pattern matches the following unfused inplace ops:
@@ -275,10 +341,16 @@ class FlashInferRopeQuantKVCachePattern:
       split_with_sizes(qkv) -> auto_functionalized(rotary_embedding)
       -> inline fp8 query quant -> reshape(q, k, v)
       -> unified_kv_cache_update(k, v)
-    and replace it with a smaller fused op, leaving attention in the graph.
+      -> auto_functionalized(unified_attention_with_output)
+    and replace it with two smaller ops:
+      1. rope + query quant + kv cache update
+      2. decode-only attention from cache
     """
 
     FUSED_OP = torch.ops.vllm.fused_rope_quant_and_unified_kv_cache_update.default
+    FUSED_ATTN_OP = (
+        torch.ops.vllm.fused_decode_attention_from_kvcache_with_output.default
+    )
 
     def __init__(self, layer: Attention, is_neox: bool) -> None:
         self.layer_name = layer.layer_name
@@ -324,7 +396,7 @@ class FlashInferRopeQuantKVCachePattern:
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             q_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             query, key, value = qkv.split(
                 [self.q_size, self.k_size, self.v_size], dim=-1
             )
@@ -337,18 +409,35 @@ class FlashInferRopeQuantKVCachePattern:
             kv_cache_dummy_dep = torch.ops.vllm.unified_kv_cache_update(
                 key, value, self.layer_name
             )
-            return kv_cache_dummy_dep, query, key, value
+            output = torch.empty(
+                [qkv.shape[0], self.num_heads * self.head_size_v],
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            output = output.view(-1, self.num_heads, self.head_size_v)
+            result = auto_functionalized(
+                ATTN_OP,
+                query=query,
+                key=key,
+                value=value,
+                output=output,
+                layer_name=self.layer_name,
+                output_scale=None,
+                output_block_scale=None,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+            return result[1]
 
         def replacement(
             qkv: torch.Tensor,
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             q_scale: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> torch.Tensor:
             query, key, value = qkv.split(
                 [self.q_size, self.k_size, self.v_size], dim=-1
             )
-            return self.FUSED_OP(
+            kv_cache_dummy_dep, query, key, value = self.FUSED_OP(
                 query=query,
                 key=key,
                 value=value,
@@ -360,6 +449,24 @@ class FlashInferRopeQuantKVCachePattern:
                 is_neox=self.is_neox,
                 layer_name=self.layer_name,
             )
+            output = torch.empty(
+                [qkv.shape[0], self.num_heads * self.head_size_v],
+                dtype=qkv.dtype,
+                device=qkv.device,
+            )
+            output = output.view(-1, self.num_heads, self.head_size_v)
+            result = auto_functionalized(
+                self.FUSED_ATTN_OP,
+                query=query,
+                key=key,
+                value=value,
+                output=output,
+                layer_name=self.layer_name,
+                output_scale=None,
+                output_block_scale=None,
+                kv_cache_dummy_dep=kv_cache_dummy_dep,
+            )
+            return result[1]
 
         def fwd_and_view_to_reshape(*args, **kwargs) -> fx.GraphModule:
             gm = pm.fwd_only(*args, **kwargs)
@@ -443,4 +550,5 @@ class RopeKVCacheFusionPass(VllmPatternMatcherPass):
             RopeReshapeKVCachePattern,
             FlashInferRopeQuantKVCachePattern,
             fused_rope_quant_and_unified_kv_cache_update_impl,
+            fused_decode_attention_from_kvcache_with_output_impl,
         )

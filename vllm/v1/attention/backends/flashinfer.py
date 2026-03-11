@@ -1629,6 +1629,139 @@ class FlashInferImpl(AttentionImpl):
                 layer._v_scale,
             )
 
+    def forward_decode_from_kvcache_with_output(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashInferMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        assert output is not None, "Output tensor must be provided."
+
+        if attn_metadata is None:
+            return output.fill_(0)
+
+        assert attn_metadata.num_prefill_tokens == 0, (
+            "forward_decode_from_kvcache_with_output only supports pure decode."
+        )
+        assert attn_metadata.q_data_type == query.dtype, (
+            f"Query dtype mismatch: expected {attn_metadata.q_data_type}, "
+            f"got {query.dtype}"
+        )
+
+        if self.bmm1_scale is None:
+            self.bmm1_scale = layer._q_scale_float * layer._k_scale_float * self.scale
+
+        if self.bmm2_scale is None:
+            self.bmm2_scale = layer._v_scale_float
+
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if self.kv_sharing_target_layer_name is None and self.kv_cache_dtype.startswith(
+            "fp8"
+        ):
+            torch_dtype = FlashInferBackend.get_fp8_dtype_for_flashinfer(
+                self.kv_cache_dtype
+            )
+            kv_cache = kv_cache.view(torch_dtype)
+
+        query = query[:num_actual_tokens]
+        output_padded = output
+        output = output[:num_actual_tokens]
+
+        if attn_metadata.use_cascade:
+            assert attn_metadata.cascade_wrapper is not None
+            output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache))
+            return output_padded
+
+        num_decode_tokens = attn_metadata.num_decode_tokens
+        assert num_decode_tokens > 0
+
+        stride_order = FlashInferBackend.get_kv_cache_stride_order()
+        kv_cache_permute = kv_cache.permute(*stride_order)
+        use_dcp = self.dcp_world_size > 1
+        decode_query = query[:num_decode_tokens]
+        assert decode_query.shape[0] == num_decode_tokens
+        decode_use_trtllm = isinstance(attn_metadata.decode, TRTLLMDecode)
+
+        if not decode_use_trtllm:
+            assert isinstance(attn_metadata.decode, FIDecode)
+            decode_wrapper = attn_metadata.decode.wrapper
+            assert decode_wrapper is not None
+            assert decode_wrapper._window_left == self.window_left
+            assert decode_wrapper._logits_soft_cap == (self.logits_soft_cap or 0.0)
+            assert decode_wrapper._sm_scale == self.scale
+
+            if use_dcp:
+                decode_query = get_dcp_group().all_gather(
+                    decode_query.contiguous(), dim=-2
+                )
+                output_tmp = torch.empty_like(decode_query)
+                lse = torch.empty(
+                    (decode_query.size(0), decode_query.size(1)),
+                    dtype=torch.float32,
+                    device=decode_query.device,
+                )
+                decode_wrapper.run(
+                    decode_query,
+                    kv_cache_permute,
+                    k_scale=layer._k_scale_float,
+                    v_scale=layer._v_scale_float,
+                    out=output_tmp,
+                    lse=lse,
+                    return_lse=True,
+                )
+                output[:num_decode_tokens] = self.dcp_combine(
+                    output_tmp,
+                    lse,
+                    get_dcp_group(),
+                )
+            else:
+                decode_wrapper.run(
+                    decode_query,
+                    kv_cache_permute,
+                    k_scale=layer._k_scale_float,
+                    v_scale=layer._v_scale_float,
+                    out=output[:num_decode_tokens],
+                )
+        else:
+            assert isinstance(attn_metadata.decode, TRTLLMDecode)
+            decode_query = decode_query.contiguous().reshape(decode_query.shape)
+            workspace_buffer = _get_trtllm_gen_workspace_buffer()
+            block_tables_decode = attn_metadata.decode.block_tables
+            seq_lens_decode = attn_metadata.decode.seq_lens
+
+            assert get_kv_cache_layout() == "HND"
+            assert is_strictly_contiguous(decode_query)
+            assert is_strictly_contiguous(kv_cache_permute)
+            assert is_strictly_contiguous(workspace_buffer)
+            assert is_strictly_contiguous(block_tables_decode)
+            assert is_strictly_contiguous(seq_lens_decode)
+
+            out = output[:num_decode_tokens]
+            if num_decode_tokens % attn_metadata.num_decodes != 0:
+                q_len_per_req = 1
+            else:
+                q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
+
+            trtllm_batch_decode_with_kv_cache(
+                query=decode_query,
+                kv_cache=kv_cache_permute,
+                workspace_buffer=workspace_buffer,
+                block_tables=block_tables_decode,
+                seq_lens=seq_lens_decode,
+                max_seq_len=attn_metadata.decode.max_seq_len,
+                bmm1_scale=self.bmm1_scale,
+                bmm2_scale=self.bmm2_scale,
+                window_left=self.window_left,
+                sinks=self.sinks,
+                o_sf_scale=self.o_sf_scale,
+                out=out,
+                q_len_per_req=q_len_per_req,
+            )
+
+        return output_padded
+
 
 def fast_plan_decode(
     self,  # decode wrapper
