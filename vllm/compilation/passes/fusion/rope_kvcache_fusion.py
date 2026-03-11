@@ -284,7 +284,6 @@ class FlashInferRopeQuantKVCachePattern:
         self.q_size = self.num_heads * self.head_size
         self.k_size = self.num_kv_heads * self.head_size
         self.v_size = self.num_kv_heads * self.head_size_v
-        self.q_scale = float(layer._q_scale_float)
         self.fp8_dtype = current_platform.fp8_dtype()
         self.fp8_min, self.fp8_max = get_fp8_min_max()
         self.rope_matcher = MatcherRotaryEmbedding(
@@ -300,14 +299,18 @@ class FlashInferRopeQuantKVCachePattern:
         positions = empty_i64(t)
         cos_sin_cache = empty_bf16(4096, self.head_size)
         output = empty_bf16(t, self.num_heads, self.head_size_v)
-        return [qkv, positions, cos_sin_cache, output]
+        q_scale = torch.empty((), dtype=torch.float32, device=qkv.device)
+        return [qkv, positions, cos_sin_cache, output, q_scale]
 
-    def _quantize_query(self, query: torch.Tensor) -> torch.Tensor:
-        query = query.to(torch.float32)
-        query = query * (1.0 / self.q_scale)
+    def _quantize_query(
+        self, query: torch.Tensor, q_scale: torch.Tensor
+    ) -> torch.Tensor:
+        query = torch.ops.prims.convert_element_type.default(query, torch.float32)
+        reciprocal = torch.ops.aten.reciprocal.default(q_scale)
+        query = torch.ops.aten.mul.Tensor(query, reciprocal)
         query = query.clamp(min=self.fp8_min)
         query = query.clamp(max=self.fp8_max)
-        return query.to(self.fp8_dtype)
+        return torch.ops.prims.convert_element_type.default(query, self.fp8_dtype)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
         def pattern(
@@ -315,13 +318,14 @@ class FlashInferRopeQuantKVCachePattern:
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             output: torch.Tensor,
+            q_scale: torch.Tensor,
         ) -> torch.Tensor:
             query, key, value = qkv.split(
                 [self.q_size, self.k_size, self.v_size], dim=-1
             )
             query, key = self.rope_matcher(positions, query, key, cos_sin_cache)
             assert key is not None
-            query = self._quantize_query(query)
+            query = self._quantize_query(query, q_scale)
             query = query.view(-1, self.num_heads, self.head_size)
             key = key.view(-1, self.num_kv_heads, self.head_size)
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
@@ -346,7 +350,9 @@ class FlashInferRopeQuantKVCachePattern:
             positions: torch.Tensor,
             cos_sin_cache: torch.Tensor,
             output: torch.Tensor,
+            q_scale: torch.Tensor,
         ) -> torch.Tensor:
+            del q_scale
             result = auto_functionalized(
                 self.FUSED_OP,
                 qkv=qkv,
