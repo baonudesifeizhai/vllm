@@ -31,6 +31,17 @@ class BasePattern:
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
 
+    @staticmethod
+    def wrap_trace_fn(trace_fn):
+        def wrapped(*args, **kwargs):
+            gm = trace_fn(*args, **kwargs)
+            from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+            view_to_reshape(gm)
+            return gm
+
+        return wrapped
+
 
 class GEMMReduceScatterPattern(BasePattern):
     def get_inputs(self) -> list[torch.Tensor]:
@@ -403,7 +414,7 @@ class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
                 self.dtype,
             )
 
-        def pattern_view(
+        def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
             scale_a: torch.Tensor,
@@ -423,33 +434,12 @@ class FlashInferBMMFP8ReduceScatterPattern(BasePattern):
             )
             return reduce_scatter
 
-        def pattern_reshape(
-            input: torch.Tensor,
-            weight: torch.Tensor,
-            scale_a: torch.Tensor,
-            scale_b: torch.Tensor,
-        ) -> torch.Tensor:
-            input_3d = input.unsqueeze(0)
-            weight_3d = weight.unsqueeze(0)
-            bmm_result = torch.ops.vllm.bmm_fp8.default(
-                input_3d, weight_3d, scale_a, scale_b, self.dtype, "auto"
-            )
-            mm_result = torch.ops.aten.reshape.default(
-                bmm_result, [input.shape[0], weight.shape[1]]
-            )
-            reduce_scatter = torch.ops.vllm.reduce_scatter.default(
-                mm_result,
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
-            return reduce_scatter
-
         pm.register_replacement(
-            pattern_view, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
-        pm.register_replacement(
-            pattern_reshape, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+            pattern,
+            replacement,
+            self.get_inputs(),
+            BasePattern.wrap_trace_fn(pm.fwd_only),
+            pm_pass,
         )
 
 
@@ -483,7 +473,7 @@ class AllGatherFlashInferBMMFP8Pattern(BasePattern):
             )
             return mm_output
 
-        def pattern_view(
+        def pattern(
             x: torch.Tensor,
             weight: torch.Tensor,
             scale_a: torch.Tensor,
@@ -502,32 +492,12 @@ class AllGatherFlashInferBMMFP8Pattern(BasePattern):
             )
             return bmm_result.view(all_gather.shape[0], weight.shape[1])
 
-        def pattern_reshape(
-            x: torch.Tensor,
-            weight: torch.Tensor,
-            scale_a: torch.Tensor,
-            scale_b: torch.Tensor,
-        ) -> torch.Tensor:
-            all_gather = torch.ops.vllm.all_gather.default(
-                x,
-                dim=0,
-                world_size=self.tp_size,
-                group_name=self.tp.unique_name,
-            )
-            ag_3d = all_gather.unsqueeze(0)
-            weight_3d = weight.unsqueeze(0)
-            bmm_result = torch.ops.vllm.bmm_fp8.default(
-                ag_3d, weight_3d, scale_a, scale_b, self.dtype, "auto"
-            )
-            return torch.ops.aten.reshape.default(
-                bmm_result, [all_gather.shape[0], weight.shape[1]]
-            )
-
         pm.register_replacement(
-            pattern_view, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
-        pm.register_replacement(
-            pattern_reshape, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+            pattern,
+            replacement,
+            self.get_inputs(),
+            BasePattern.wrap_trace_fn(pm.fwd_only),
+            pm_pass,
         )
 
 
