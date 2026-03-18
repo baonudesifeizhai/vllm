@@ -254,6 +254,29 @@ class TestFlashInferBMMFP8RSModel(_BaseFlashInferBMMFP8Model):
         return [torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default]
 
 
+class TestFlashInferBMMFP8RSReshapeModel(_BaseFlashInferBMMFP8Model):
+    def forward(self, input: torch.Tensor):
+        fp8_input = input.to(FP8_DTYPE)
+        output = torch.ops.aten.reshape.default(
+            torch.ops.vllm.bmm_fp8(
+                fp8_input.unsqueeze(0),
+                self.weight.unsqueeze(0),
+                self.scale_a,
+                self.scale_b,
+                self.dtype,
+                "auto",
+            ),
+            [fp8_input.shape[0], self.weight.shape[1]],
+        )
+        return tensor_model_parallel_reduce_scatter(output, dim=0)
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.reduce_scatter.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default]
+
+
 class TestAGFlashInferBMMFP8Model(_BaseFlashInferBMMFP8Model):
     def forward(self, input: torch.Tensor):
         fp8_input = input.to(FP8_DTYPE)
@@ -275,6 +298,30 @@ class TestAGFlashInferBMMFP8Model(_BaseFlashInferBMMFP8Model):
         return [torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default]
 
 
+class TestAGFlashInferBMMFP8ReshapeModel(_BaseFlashInferBMMFP8Model):
+    def forward(self, input: torch.Tensor):
+        fp8_input = input.to(FP8_DTYPE)
+        all_gather = tensor_model_parallel_all_gather(fp8_input, dim=0)
+        output = torch.ops.aten.reshape.default(
+            torch.ops.vllm.bmm_fp8(
+                all_gather.unsqueeze(0),
+                self.weight.unsqueeze(0),
+                self.scale_a,
+                self.scale_b,
+                self.dtype,
+                "auto",
+            ),
+            [all_gather.shape[0], self.weight.shape[1]],
+        )
+        return output
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.all_gather.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default]
+
+
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize(
     "test_model",
@@ -286,7 +333,9 @@ class TestAGFlashInferBMMFP8Model(_BaseFlashInferBMMFP8Model):
         TestCutlassScaledMMRSModel,
         TestAGCutlassScaledMMModel,
         TestFlashInferBMMFP8RSModel,
+        TestFlashInferBMMFP8RSReshapeModel,
         TestAGFlashInferBMMFP8Model,
+        TestAGFlashInferBMMFP8ReshapeModel,
     ],
 )
 @pytest.mark.parametrize("batch_size", [8])
