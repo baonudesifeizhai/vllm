@@ -302,16 +302,17 @@ class TestAGFlashInferBMMFP8ReshapeModel(_BaseFlashInferBMMFP8Model):
     def forward(self, input: torch.Tensor):
         fp8_input = input.to(FP8_DTYPE)
         all_gather = tensor_model_parallel_all_gather(fp8_input, dim=0)
+        bmm_result = torch.ops.vllm.bmm_fp8(
+            all_gather.unsqueeze(0),
+            self.weight.unsqueeze(0),
+            self.scale_a,
+            self.scale_b,
+            self.dtype,
+            "auto",
+        )
         output = torch.ops.aten.reshape.default(
-            torch.ops.vllm.bmm_fp8(
-                all_gather.unsqueeze(0),
-                self.weight.unsqueeze(0),
-                self.scale_a,
-                self.scale_b,
-                self.dtype,
-                "auto",
-            ),
-            [all_gather.shape[0], self.weight.shape[1]],
+            bmm_result,
+            [bmm_result.shape[1], bmm_result.shape[2]],
         )
         return output
 

@@ -490,7 +490,11 @@ class AllGatherFlashInferBMMFP8Pattern(BasePattern):
             bmm_result = torch.ops.vllm.bmm_fp8.default(
                 ag_3d, weight_3d, scale_a, scale_b, self.dtype, "auto"
             )
-            return bmm_result.view(all_gather.shape[0], weight.shape[1])
+            # Match the real graph shape expression directly. Using
+            # all_gather.shape[0] traces as a composed symbolic expression,
+            # while the compiled graph keeps the gathered token count as the
+            # bmm_result second dimension symbol.
+            return bmm_result.view(bmm_result.shape[1], bmm_result.shape[2])
 
         pm.register_replacement(
             pattern,
