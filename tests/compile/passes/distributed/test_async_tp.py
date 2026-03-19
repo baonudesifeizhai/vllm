@@ -10,7 +10,10 @@ from tests.compile.backend import TestBackend
 from tests.utils import (
     multi_gpu_test,
 )
-from vllm.compilation.passes.fusion.collective_fusion import AsyncTPPass
+from vllm.compilation.passes.fusion.collective_fusion import (
+    AsyncTPPass,
+    LateAsyncTPAllGatherPass,
+)
 from vllm.config import (
     CompilationConfig,
     DeviceConfig,
@@ -368,13 +371,26 @@ def test_async_tp_pass_replace(
             "per-token (row-wise) scaling"
         )
 
-    if test_model in (TestFlashInferBMMFP8RSModel, TestAGFlashInferBMMFP8Model):
+    if test_model in (
+        TestFlashInferBMMFP8RSModel,
+        TestFlashInferBMMFP8RSReshapeModel,
+        TestAGFlashInferBMMFP8Model,
+        TestAGFlashInferBMMFP8ReshapeModel,
+    ):
         if not hasattr(torch.ops.vllm, "bmm_fp8"):
             pytest.skip("FlashInfer bmm_fp8 not available")
         if dtype == torch.float16:
             pytest.skip("FlashInfer FP8 async TP fusion requires bf16 output")
 
     num_processes = 2
+
+    if test_model in (
+        TestAGFlashInferBMMFP8Model,
+        TestAGFlashInferBMMFP8ReshapeModel,
+    ):
+        pass_cls = LateAsyncTPAllGatherPass
+    else:
+        pass_cls = AsyncTPPass
 
     def run_torch_spawn(fn, nprocs):
         # need to use torch.mp.spawn otherwise will have problems with
@@ -383,6 +399,7 @@ def test_async_tp_pass_replace(
             fn,
             args=(
                 num_processes,
+                pass_cls,
                 test_model,
                 batch_size,
                 seq_len,
@@ -399,6 +416,7 @@ def test_async_tp_pass_replace(
 def async_tp_pass_on_test_model(
     local_rank: int,
     world_size: int,
+    pass_cls,
     test_model_cls: torch.nn.Module,
     batch_size: int,
     seq_len: int,
@@ -445,7 +463,7 @@ def async_tp_pass_on_test_model(
     with set_current_vllm_config(vllm_config):
         initialize_model_parallel(tensor_model_parallel_size=world_size)
 
-        async_tp_pass = AsyncTPPass(vllm_config)
+        async_tp_pass = pass_cls(vllm_config)
         backend = TestBackend(async_tp_pass)
 
         assert (

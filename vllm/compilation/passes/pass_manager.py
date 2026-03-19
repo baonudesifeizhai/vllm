@@ -35,7 +35,7 @@ if current_platform.is_cuda_alike():
 
 if current_platform.is_cuda():
     from .fusion.allreduce_rms_fusion import AllReduceFusionPass
-    from .fusion.collective_fusion import AsyncTPPass
+    from .fusion.collective_fusion import AsyncTPPass, LateAsyncTPAllGatherPass
 
 from .inductor_pass import (
     CustomGraphPass,
@@ -149,6 +149,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.enable_qk_norm_rope_fusion:
                 self.passes += [SplitCoalescingPass(config)]
                 self.passes += [QKNormRoPEFusionPass(config)]
+
+            if self.pass_config.enable_sp and self.pass_config.fuse_gemm_comms:
+                self.passes += [LateAsyncTPAllGatherPass(config)]
 
             # needs a functional graph
             self.post_cleanup = PostCleanupPass(config)

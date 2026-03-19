@@ -23,6 +23,16 @@ FP8_DTYPE = current_platform.fp8_dtype()
 
 logger = init_logger(__name__)
 
+_ASYNC_TP_MATCH_COUNT_ATTR = "_vllm_async_tp_match_count"
+
+
+def _get_async_tp_match_count(graph: fx.Graph) -> int:
+    return int(getattr(graph, _ASYNC_TP_MATCH_COUNT_ATTR, 0))
+
+
+def _set_async_tp_match_count(graph: fx.Graph, count: int) -> None:
+    setattr(graph, _ASYNC_TP_MATCH_COUNT_ATTR, count)
+
 
 class BasePattern:
     def __init__(self, dtype: torch.dtype, device: str | None) -> None:
@@ -541,9 +551,6 @@ class AsyncTPPass(VllmPatternMatcherPass):
                 FlashInferBMMFP8ReduceScatterPattern(
                     self.model_dtype, self.device
                 ).register(self.patterns)
-                AllGatherFlashInferBMMFP8Pattern(
-                    self.model_dtype, self.device
-                ).register(self.patterns)
 
         self.dump_patterns(config, self.patterns)
 
@@ -562,4 +569,47 @@ class AsyncTPPass(VllmPatternMatcherPass):
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self.matched_count = self.patterns.apply(graph)
-        logger.debug("Replaced %s patterns", self.matched_count)
+        _set_async_tp_match_count(graph, self.matched_count)
+        logger.debug("Early async_tp matched %s patterns", self.matched_count)
+
+
+class LateAsyncTPAllGatherPass(VllmPatternMatcherPass):
+    """
+    Run late all-gather fusion after other graph-normalizing passes.
+
+    The early AsyncTP pass already handles working reduce-scatter patterns.
+    This late pass is intentionally limited to all-gather FlashInfer patterns
+    that are more likely to match after downstream graph rewrites.
+    """
+
+    @enable_fake_mode
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__(config)
+
+        enable_symm_mem_for_group(get_tp_group().device_group.group_name)
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="late_async_tp_all_gather_pass"
+        )
+
+        if self.model_dtype == torch.bfloat16 and hasattr(torch.ops.vllm, "bmm_fp8"):
+            AllGatherFlashInferBMMFP8Pattern(self.model_dtype, self.device).register(
+                self.patterns
+            )
+
+        self.dump_patterns(config, self.patterns)
+
+    def is_applicable_for_range(self, compile_range: Range) -> bool:
+        if (
+            not self.compilation_config.splitting_ops
+            or self.compilation_config.use_inductor_graph_partition
+        ):
+            return True
+        tp_size = get_tensor_model_parallel_world_size()
+        return bool(compile_range.is_single_size() and compile_range.end % tp_size == 0)
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        self.matched_count = self.patterns.apply(graph)
+        total_matches = _get_async_tp_match_count(graph) + self.matched_count
+        _set_async_tp_match_count(graph, total_matches)
+        logger.debug("Replaced %s patterns", total_matches)
