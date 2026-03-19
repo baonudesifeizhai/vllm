@@ -589,7 +589,7 @@ class LateAsyncTPAllGatherPass(VllmPatternMatcherPass):
         super().__init__(config)
 
         enable_symm_mem_for_group(get_tp_group().device_group.group_name)
-        self.group_name = self.tp.device_group.group_name
+        self.group_name = get_tp_group().device_group.group_name
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         if (
