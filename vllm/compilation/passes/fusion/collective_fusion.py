@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import operator
+
 import torch
 import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
@@ -16,6 +18,7 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+from ..fx_utils import is_func
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
@@ -582,21 +585,11 @@ class LateAsyncTPAllGatherPass(VllmPatternMatcherPass):
     that are more likely to match after downstream graph rewrites.
     """
 
-    @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
 
         enable_symm_mem_for_group(get_tp_group().device_group.group_name)
-        self.patterns: PatternMatcherPass = PatternMatcherPass(
-            pass_name="late_async_tp_all_gather_pass"
-        )
-
-        if self.model_dtype == torch.bfloat16 and hasattr(torch.ops.vllm, "bmm_fp8"):
-            AllGatherFlashInferBMMFP8Pattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
-
-        self.dump_patterns(config, self.patterns)
+        self.group_name = self.tp.device_group.group_name
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         if (
@@ -607,9 +600,98 @@ class LateAsyncTPAllGatherPass(VllmPatternMatcherPass):
         tp_size = get_tensor_model_parallel_world_size()
         return bool(compile_range.is_single_size() and compile_range.end % tp_size == 0)
 
+    @staticmethod
+    def _is_view_or_reshape(node: fx.Node) -> bool:
+        return is_func(node, torch.ops.aten.reshape.default) or is_func(
+            node, torch.ops.aten.view.default
+        )
+
+    @staticmethod
+    def _erase_if_unused(graph: fx.Graph, node: fx.Node | None) -> None:
+        if node is not None and len(node.users) == 0:
+            graph.erase_node(node)
+
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
-        self.matched_count = self.patterns.apply(graph)
+        self.matched_count = 0
+        if self.model_dtype != torch.bfloat16 or not hasattr(torch.ops.vllm, "bmm_fp8"):
+            total_matches = _get_async_tp_match_count(graph)
+            logger.debug("Replaced %s patterns", total_matches)
+            return
+
+        for node in list(graph.nodes):
+            if not is_func(node, torch.ops.vllm.bmm_fp8.default):
+                continue
+
+            if len(node.args) < 4:
+                continue
+
+            ag_3d = node.args[0]
+            weight_3d = node.args[1]
+            scale_a = node.args[2]
+            scale_b = node.args[3]
+
+            if not (
+                isinstance(ag_3d, fx.Node)
+                and isinstance(weight_3d, fx.Node)
+                and is_func(ag_3d, torch.ops.aten.unsqueeze.default)
+                and is_func(weight_3d, torch.ops.aten.unsqueeze.default)
+                and ag_3d.args[1] == 0
+                and weight_3d.args[1] == 0
+            ):
+                continue
+
+            all_gather = ag_3d.args[0]
+            weight = weight_3d.args[0]
+            if not (
+                isinstance(all_gather, fx.Node)
+                and isinstance(weight, fx.Node)
+                and is_func(all_gather, torch.ops.vllm.all_gather.default)
+            ):
+                continue
+
+            reshape_users = [
+                user for user in list(node.users) if self._is_view_or_reshape(user)
+            ]
+            if not reshape_users:
+                continue
+
+            if any(user.args[0] is not node for user in reshape_users):
+                continue
+
+            with graph.inserting_before(reshape_users[0]):
+                fused_ag = graph.call_function(
+                    torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default,
+                    args=(
+                        all_gather.args[0],
+                        weight,
+                        scale_a,
+                        scale_b,
+                        0,
+                        self.group_name,
+                        self.dtype,
+                    ),
+                )
+                fused_mm_output = graph.call_function(
+                    operator.getitem,
+                    args=(fused_ag, 1),
+                )
+
+            fused_ag.meta = dict(node.meta)
+            fused_mm_output.meta = dict(reshape_users[0].meta)
+
+            for reshape_node in reshape_users:
+                reshape_node.replace_all_uses_with(fused_mm_output)
+                graph.erase_node(reshape_node)
+
+            self._erase_if_unused(graph, node)
+            self._erase_if_unused(graph, ag_3d)
+            self._erase_if_unused(graph, weight_3d)
+            self._erase_if_unused(graph, all_gather)
+
+            self.matched_count += 1
+
+        graph.lint()
         total_matches = _get_async_tp_match_count(graph) + self.matched_count
         _set_async_tp_match_count(graph, total_matches)
         logger.debug("Replaced %s patterns", total_matches)
