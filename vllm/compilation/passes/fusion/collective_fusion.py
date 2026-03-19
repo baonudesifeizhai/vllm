@@ -669,7 +669,7 @@ class LateAsyncTPAllGatherPass(VllmPatternMatcherPass):
                         scale_b,
                         0,
                         self.group_name,
-                        self.dtype,
+                        self.model_dtype,
                     ),
                 )
                 fused_mm_output = graph.call_function(
