@@ -51,6 +51,10 @@ from vllm.distributed.utils import (
     get_cached_tcp_store_client,
 )
 from vllm.logger import init_logger
+from vllm.utils.flashinfer import (
+    flashinfer_fused_all_gather_bmm_fp8,
+    has_flashinfer_fused_all_gather_bmm_fp8,
+)
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
@@ -175,6 +179,89 @@ def all_gather_fake(
     return torch.empty(new_shape, dtype=tensor.dtype, device=tensor.device)
 
 
+def fused_all_gather_bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    if group.world_size == 1:
+        return torch.ops.vllm.bmm_fp8.default(
+            A.unsqueeze(0),
+            B.unsqueeze(0),
+            A_scale,
+            B_scale,
+            out_dtype,
+            backend,
+        ).squeeze(0)
+
+    device_communicator = group.device_communicator
+    ca_comm = (
+        getattr(device_communicator, "ca_comm", None)
+        if device_communicator is not None
+        else None
+    )
+    if (
+        has_flashinfer_fused_all_gather_bmm_fp8()
+        and ca_comm is not None
+        and not ca_comm.disabled
+        and ca_comm.should_custom_ar(A)
+    ):
+        return flashinfer_fused_all_gather_bmm_fp8(
+            A,
+            B,
+            A_scale,
+            B_scale,
+            ca_comm._ptr,
+            ca_comm.buffer_ptrs[group.rank_in_group],
+            ca_comm.max_size,
+            group.world_size,
+            out_dtype=out_dtype,
+            backend=backend,
+        )
+
+    gathered = group._all_gather_out_place(A, 0)
+    return torch.ops.vllm.bmm_fp8.default(
+        gathered.unsqueeze(0),
+        B.unsqueeze(0),
+        A_scale,
+        B_scale,
+        out_dtype,
+        backend,
+    ).squeeze(0)
+
+
+def fused_all_gather_bmm_fp8_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    world_size = 1
+    group_ref = _groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            world_size = group.world_size
+    return torch.empty(
+        A.shape[0] * world_size,
+        B.shape[1],
+        dtype=out_dtype,
+        device=A.device,
+    )
+
+
 def patched_fused_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -275,6 +362,12 @@ direct_register_custom_op(
     op_name="all_gather",
     op_func=all_gather,
     fake_impl=all_gather_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_all_gather_bmm_fp8",
+    op_func=fused_all_gather_bmm_fp8,
+    fake_impl=fused_all_gather_bmm_fp8_fake,
 )
 
 # TODO: Remove this once the pytorch fix

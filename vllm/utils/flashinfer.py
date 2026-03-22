@@ -120,6 +120,9 @@ flashinfer_cutlass_fused_moe = _lazy_import_wrapper(
 flashinfer_cutedsl_grouped_gemm_nt_masked = _lazy_import_wrapper(
     "flashinfer.cute_dsl.blockscaled_gemm", "grouped_gemm_nt_masked"
 )
+flashinfer_fused_all_gather_bmm_fp8 = _lazy_import_wrapper(
+    "flashinfer", "fused_all_gather_bmm_fp8"
+)
 flashinfer_fp4_quantize = _lazy_import_wrapper("flashinfer", "fp4_quantize")
 nvfp4_batched_quantize = _lazy_import_wrapper("flashinfer", "nvfp4_batched_quantize")
 silu_and_mul_scaled_nvfp4_experts_quantize = _lazy_import_wrapper(
@@ -147,6 +150,15 @@ _is_fi_autotuning: bool = False
 def has_flashinfer_comm() -> bool:
     """Return `True` if FlashInfer comm module is available."""
     return has_flashinfer() and importlib.util.find_spec("flashinfer.comm") is not None
+
+
+@functools.cache
+def has_flashinfer_fused_all_gather_bmm_fp8() -> bool:
+    """Return `True` if FlashInfer's AG+FP8 GEMM primitive is available."""
+    if not has_flashinfer():
+        return False
+    mod = _get_submodule("flashinfer")
+    return mod is not None and hasattr(mod, "fused_all_gather_bmm_fp8")
 
 
 @functools.cache
@@ -766,6 +778,7 @@ __all__ = [
     "flashinfer_trtllm_fp8_block_scale_moe",
     "flashinfer_cutlass_fused_moe",
     "flashinfer_cutedsl_grouped_gemm_nt_masked",
+    "flashinfer_fused_all_gather_bmm_fp8",
     "flashinfer_fp4_quantize",
     "silu_and_mul_scaled_nvfp4_experts_quantize",
     "scaled_fp4_grouped_quantize",
@@ -774,6 +787,7 @@ __all__ = [
     "autotune",
     "has_flashinfer_moe",
     "has_flashinfer_comm",
+    "has_flashinfer_fused_all_gather_bmm_fp8",
     "has_flashinfer_nvlink_two_sided",
     "has_flashinfer_nvlink_one_sided",
     "has_flashinfer_cutlass_fused_moe",

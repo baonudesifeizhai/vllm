@@ -28,6 +28,7 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm, has_flashinfer
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
@@ -168,6 +169,37 @@ class TestAGScaledMMModel(_BaseScaledMMModel):
         return [torch.ops.symm_mem.fused_all_gather_scaled_matmul.default]
 
 
+class TestAGBmmFP8Model(torch.nn.Module):
+    def __init__(self, hidden_size=16, dtype=torch.float16):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.weight = (
+            torch.empty([hidden_size, hidden_size], dtype=FP8_DTYPE)
+            .contiguous()
+            .transpose(0, 1)
+        )
+        self.scale_b = torch.ones(1, dtype=torch.float32)
+
+    def forward(self, input: torch.Tensor):
+        fp8_input = input.to(FP8_DTYPE)
+        all_gather = tensor_model_parallel_all_gather(fp8_input, dim=0)
+        scale_a = torch.ones(1, dtype=torch.float32, device=input.device)
+        return flashinfer_scaled_fp8_mm(
+            all_gather,
+            self.weight,
+            scale_a,
+            self.scale_b,
+            self.dtype,
+        )
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.all_gather.default, torch.ops.vllm.bmm_fp8.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.fused_all_gather_bmm_fp8.default]
+
+
 class TestCutlassScaledMMRSModel(_BaseScaledMMModel):
     def forward(self, input: torch.Tensor):
         """
@@ -230,6 +262,7 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
     [
         TestMMRSModel,
         TestAGMMModel,
+        TestAGBmmFP8Model,
         TestScaledMMRSModel,
         TestAGScaledMMModel,
         TestCutlassScaledMMRSModel,
@@ -250,6 +283,12 @@ def test_async_tp_pass_replace(
     dtype: torch.dtype,
     dynamic: bool,
 ):
+    if test_model is TestAGBmmFP8Model:
+        if not has_flashinfer():
+            pytest.skip("FlashInfer is required for AG + bmm_fp8 fusion")
+        if not current_platform.has_device_capability(100):
+            pytest.skip("AG + bmm_fp8 fusion requires compute capability 100+")
+
     if (
         test_model
         in (

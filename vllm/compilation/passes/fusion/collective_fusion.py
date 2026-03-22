@@ -15,6 +15,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.flashinfer import has_flashinfer
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
@@ -230,6 +231,59 @@ class AllGatherScaledMMPattern(BasePattern):
         )
 
 
+class AllGatherBMMFP8Pattern(BasePattern):
+    def get_inputs(self) -> list[torch.Tensor]:
+        x = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
+        weight = (
+            torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
+            .contiguous()
+            .transpose(0, 1)
+        )
+        scale_a = torch.ones(1, device=self.device, dtype=torch.float32)
+        scale_b = torch.ones(1, device=self.device, dtype=torch.float32)
+        return [x, weight, scale_a, scale_b]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            all_gather = torch.ops.vllm.all_gather.default(
+                x, dim=0, world_size=self.tp_size, group_name=self.tp.unique_name
+            )
+            bmm_fp8 = torch.ops.vllm.bmm_fp8.default(
+                all_gather.unsqueeze(0),
+                weight.unsqueeze(0),
+                scale_a,
+                scale_b,
+                self.dtype,
+                "auto",
+            )
+            return bmm_fp8.view(all_gather.shape[0], weight.shape[1])
+
+        def replacement(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            scale_a: torch.Tensor,
+            scale_b: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops.vllm.fused_all_gather_bmm_fp8.default(
+                x,
+                weight,
+                scale_a,
+                scale_b,
+                self.dtype,
+                self.tp.unique_name,
+                "auto",
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
 class CutlassScaledMMReduceScatterPattern(BasePattern):
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -384,6 +438,10 @@ class AsyncTPPass(VllmPatternMatcherPass):
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
+        if has_flashinfer():
+            AllGatherBMMFP8Pattern(self.model_dtype, self.device).register(
+                self.patterns
+            )
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
