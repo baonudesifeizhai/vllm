@@ -51,10 +51,6 @@ from vllm.distributed.utils import (
     get_cached_tcp_store_client,
 )
 from vllm.logger import init_logger
-from vllm.utils.flashinfer import (
-    flashinfer_fused_all_gather_bmm_fp8,
-    has_flashinfer_fused_all_gather_bmm_fp8,
-)
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
@@ -188,6 +184,11 @@ def fused_all_gather_bmm_fp8(
     group_name: str,
     backend: str,
 ) -> torch.Tensor:
+    from vllm.utils.flashinfer import (
+        flashinfer_fused_all_gather_bmm_fp8,
+        has_flashinfer_fused_all_gather_bmm_fp8,
+    )
+
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
