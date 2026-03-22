@@ -261,7 +261,9 @@ class AllGatherBMMFP8Pattern(BasePattern):
                 self.dtype,
                 "auto",
             )
-            return bmm_fp8.view(all_gather.shape[0], weight.shape[1])
+            return torch.ops.aten.reshape.default(
+                bmm_fp8, [all_gather.shape[0], weight.shape[1]]
+            )
 
         def replacement(
             x: torch.Tensor,
