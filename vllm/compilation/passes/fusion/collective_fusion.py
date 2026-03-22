@@ -307,6 +307,7 @@ def rewrite_all_gather_bmm_fp8(graph: fx.Graph) -> int:
                     match["backend"],
                 ),
             )
+            fused.meta = node.meta.copy()
 
         node.replace_all_uses_with(fused)
         rewrites += 1
