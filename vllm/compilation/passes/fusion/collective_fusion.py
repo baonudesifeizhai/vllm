@@ -6,6 +6,7 @@ import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
 from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+from torch.fx.node import Target
 
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
@@ -231,59 +232,90 @@ class AllGatherScaledMMPattern(BasePattern):
         )
 
 
-class AllGatherBMMFP8Pattern(BasePattern):
-    def get_inputs(self) -> list[torch.Tensor]:
-        x = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
-        weight = (
-            torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
-            .contiguous()
-            .transpose(0, 1)
-        )
-        scale_a = torch.ones(1, device=self.device, dtype=torch.float32)
-        scale_b = torch.ones(1, device=self.device, dtype=torch.float32)
-        return [x, weight, scale_a, scale_b]
+def _is_call_function(node: fx.Node | object, target: Target) -> bool:
+    return (
+        isinstance(node, fx.Node)
+        and node.op == "call_function"
+        and node.target == target
+    )
 
-    def register(self, pm_pass: PatternMatcherPass) -> None:
-        def pattern(
-            x: torch.Tensor,
-            weight: torch.Tensor,
-            scale_a: torch.Tensor,
-            scale_b: torch.Tensor,
-        ) -> torch.Tensor:
-            all_gather = torch.ops.vllm.all_gather.default(
-                x, dim=0, world_size=self.tp_size, group_name=self.tp.unique_name
-            )
-            bmm_fp8 = torch.ops.vllm.bmm_fp8.default(
-                all_gather.unsqueeze(0),
-                weight.unsqueeze(0),
-                scale_a,
-                scale_b,
-                self.dtype,
-                "auto",
-            )
-            return torch.ops.aten.reshape.default(
-                bmm_fp8, [all_gather.shape[0], weight.shape[1]]
+
+def _match_ag_bmm_fp8(reshape: fx.Node) -> dict[str, object] | None:
+    if not _is_call_function(reshape, torch.ops.aten.reshape.default):
+        return None
+
+    bmm_fp8 = reshape.args[0]
+    if not _is_call_function(bmm_fp8, torch.ops.vllm.bmm_fp8.default):
+        return None
+
+    if len(bmm_fp8.args) != 6:
+        return None
+
+    a_batched, b_batched, scale_a, scale_b, out_dtype, backend = bmm_fp8.args
+    if not _is_call_function(a_batched, torch.ops.aten.unsqueeze.default):
+        return None
+    if not _is_call_function(b_batched, torch.ops.aten.unsqueeze.default):
+        return None
+    if a_batched.args[1] != 0 or b_batched.args[1] != 0:
+        return None
+
+    all_gather = a_batched.args[0]
+    if not _is_call_function(all_gather, torch.ops.vllm.all_gather.default):
+        return None
+
+    if len(all_gather.args) != 4:
+        return None
+
+    a_input, dim, world_size, group_name = all_gather.args
+    if dim != 0:
+        return None
+
+    return {
+        "reshape": reshape,
+        "bmm_fp8": bmm_fp8,
+        "a_batched": a_batched,
+        "b_batched": b_batched,
+        "all_gather": all_gather,
+        "a_input": a_input,
+        "weight": b_batched.args[0],
+        "scale_a": scale_a,
+        "scale_b": scale_b,
+        "out_dtype": out_dtype,
+        "backend": backend,
+        "world_size": world_size,
+        "group_name": group_name,
+    }
+
+
+def rewrite_all_gather_bmm_fp8(graph: fx.Graph) -> int:
+    rewrites = 0
+    for node in list(graph.nodes):
+        match = _match_ag_bmm_fp8(node)
+        if match is None:
+            continue
+
+        with graph.inserting_before(node):
+            fused = graph.call_function(
+                torch.ops.vllm.fused_all_gather_bmm_fp8.default,
+                args=(
+                    match["a_input"],
+                    match["weight"],
+                    match["scale_a"],
+                    match["scale_b"],
+                    match["out_dtype"],
+                    match["group_name"],
+                    match["backend"],
+                ),
             )
 
-        def replacement(
-            x: torch.Tensor,
-            weight: torch.Tensor,
-            scale_a: torch.Tensor,
-            scale_b: torch.Tensor,
-        ) -> torch.Tensor:
-            return torch.ops.vllm.fused_all_gather_bmm_fp8.default(
-                x,
-                weight,
-                scale_a,
-                scale_b,
-                self.dtype,
-                self.tp.unique_name,
-                "auto",
-            )
+        node.replace_all_uses_with(fused)
+        rewrites += 1
 
-        pm.register_replacement(
-            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
-        )
+    if rewrites:
+        graph.eliminate_dead_code()
+        graph.lint()
+
+    return rewrites
 
 
 class CutlassScaledMMReduceScatterPattern(BasePattern):
@@ -440,10 +472,6 @@ class AsyncTPPass(VllmPatternMatcherPass):
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
-        if has_flashinfer():
-            AllGatherBMMFP8Pattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
@@ -480,4 +508,6 @@ class AsyncTPPass(VllmPatternMatcherPass):
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self.matched_count = self.patterns.apply(graph)
+        if has_flashinfer():
+            self.matched_count += rewrite_all_gather_bmm_fp8(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
