@@ -263,6 +263,58 @@ def fused_all_gather_bmm_fp8_fake(
     )
 
 
+def fused_bmm_fp8_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    output = torch.ops.vllm.bmm_fp8.default(
+        A.unsqueeze(0),
+        B.unsqueeze(0),
+        A_scale,
+        B_scale,
+        out_dtype,
+        backend,
+    ).squeeze(0)
+
+    if group.world_size == 1:
+        return output
+
+    return group._reduce_scatter_out_place(output, 0)
+
+
+def fused_bmm_fp8_reduce_scatter_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    world_size = 1
+    group_ref = _groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            world_size = group.world_size
+    return torch.empty(
+        A.shape[0] // world_size,
+        B.shape[1],
+        dtype=out_dtype,
+        device=A.device,
+    )
+
+
 def patched_fused_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -369,6 +421,12 @@ direct_register_custom_op(
     op_name="fused_all_gather_bmm_fp8",
     op_func=fused_all_gather_bmm_fp8,
     fake_impl=fused_all_gather_bmm_fp8_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_bmm_fp8_reduce_scatter",
+    op_func=fused_bmm_fp8_reduce_scatter,
+    fake_impl=fused_bmm_fp8_reduce_scatter_fake,
 )
 
 # TODO: Remove this once the pytorch fix
