@@ -16,7 +16,10 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.flashinfer import (
+    has_flashinfer,
+    has_flashinfer_fused_bmm_fp8_reduce_scatter,
+)
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
@@ -319,6 +322,96 @@ def rewrite_all_gather_bmm_fp8(graph: fx.Graph) -> int:
     return rewrites
 
 
+def _match_rs_bmm_fp8(reduce_scatter: fx.Node) -> dict[str, object] | None:
+    if not _is_call_function(reduce_scatter, torch.ops.vllm.reduce_scatter.default):
+        return None
+
+    if len(reduce_scatter.args) != 4:
+        return None
+
+    mm_output, dim, world_size, group_name = reduce_scatter.args
+    if dim != 0:
+        return None
+
+    if not _is_call_function(mm_output, torch.ops.aten.reshape.default):
+        return None
+    if len(mm_output.args) != 2:
+        return None
+
+    bmm_fp8 = mm_output.args[0]
+    if not _is_call_function(bmm_fp8, torch.ops.vllm.bmm_fp8.default):
+        return None
+
+    if len(bmm_fp8.args) != 6:
+        return None
+
+    a_batched, b_batched, scale_a, scale_b, out_dtype, backend = bmm_fp8.args
+    if not _is_call_function(a_batched, torch.ops.aten.unsqueeze.default):
+        return None
+    if not _is_call_function(b_batched, torch.ops.aten.unsqueeze.default):
+        return None
+    if a_batched.args[1] != 0 or b_batched.args[1] != 0:
+        return None
+
+    return {
+        "reduce_scatter": reduce_scatter,
+        "a_input": a_batched.args[0],
+        "weight": b_batched.args[0],
+        "scale_a": scale_a,
+        "scale_b": scale_b,
+        "out_dtype": out_dtype,
+        "backend": backend,
+        "world_size": world_size,
+        "group_name": group_name,
+    }
+
+
+def rewrite_bmm_fp8_reduce_scatter(graph: fx.Graph) -> int:
+    rewrites = 0
+    for node in list(graph.nodes):
+        match = _match_rs_bmm_fp8(node)
+        if match is None:
+            continue
+
+        out_meta = node.meta.get("val")
+        if out_meta is None:
+            continue
+
+        with graph.inserting_before(node):
+            output = graph.call_function(
+                torch.empty,
+                args=(tuple(out_meta.shape),),
+                kwargs={
+                    "dtype": out_meta.dtype,
+                    "device": out_meta.device,
+                },
+            )
+            output.meta = node.meta.copy()
+            fused = graph.call_function(
+                torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default,
+                args=(
+                    output,
+                    match["a_input"],
+                    match["weight"],
+                    match["scale_a"],
+                    match["scale_b"],
+                    match["out_dtype"],
+                    match["group_name"],
+                    match["backend"],
+                ),
+            )
+            fused.meta = node.meta.copy()
+
+        node.replace_all_uses_with(fused)
+        rewrites += 1
+
+    if rewrites:
+        graph.eliminate_dead_code()
+        graph.lint()
+
+    return rewrites
+
+
 class CutlassScaledMMReduceScatterPattern(BasePattern):
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -511,4 +604,6 @@ class AsyncTPPass(VllmPatternMatcherPass):
         self.matched_count = self.patterns.apply(graph)
         if has_flashinfer():
             self.matched_count += rewrite_all_gather_bmm_fp8(graph)
+        if has_flashinfer_fused_bmm_fp8_reduce_scatter():
+            self.matched_count += rewrite_bmm_fp8_reduce_scatter(graph)
         logger.debug("Replaced %s patterns", self.matched_count)

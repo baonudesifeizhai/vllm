@@ -200,6 +200,37 @@ class TestAGBmmFP8Model(torch.nn.Module):
         return [torch.ops.vllm.fused_all_gather_bmm_fp8.default]
 
 
+class TestRSBmmFP8Model(torch.nn.Module):
+    def __init__(self, hidden_size=16, dtype=torch.float16):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.dtype = dtype
+        self.weight = (
+            torch.empty([hidden_size, hidden_size], dtype=FP8_DTYPE)
+            .contiguous()
+            .transpose(0, 1)
+        )
+        self.scale_b = torch.ones(1, dtype=torch.float32)
+
+    def forward(self, input: torch.Tensor):
+        fp8_input = input.to(FP8_DTYPE)
+        scale_a = torch.ones(1, dtype=torch.float32, device=input.device)
+        mm = flashinfer_scaled_fp8_mm(
+            fp8_input,
+            self.weight,
+            scale_a,
+            self.scale_b,
+            self.dtype,
+        )
+        return tensor_model_parallel_reduce_scatter(mm, dim=0)
+
+    def ops_in_model_before(self):
+        return [torch.ops.vllm.reduce_scatter.default, torch.ops.vllm.bmm_fp8.default]
+
+    def ops_in_model_after(self):
+        return [torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default]
+
+
 class TestCutlassScaledMMRSModel(_BaseScaledMMModel):
     def forward(self, input: torch.Tensor):
         """
@@ -263,6 +294,7 @@ class TestAGCutlassScaledMMModel(_BaseScaledMMModel):
         TestMMRSModel,
         TestAGMMModel,
         TestAGBmmFP8Model,
+        TestRSBmmFP8Model,
         TestScaledMMRSModel,
         TestAGScaledMMModel,
         TestCutlassScaledMMRSModel,
@@ -283,7 +315,7 @@ def test_async_tp_pass_replace(
     dtype: torch.dtype,
     dynamic: bool,
 ):
-    if test_model is TestAGBmmFP8Model:
+    if test_model in (TestAGBmmFP8Model, TestRSBmmFP8Model):
         if not has_flashinfer():
             pytest.skip("FlashInfer is required for bmm_fp8 fusion")
         if not current_platform.has_device_capability(100):

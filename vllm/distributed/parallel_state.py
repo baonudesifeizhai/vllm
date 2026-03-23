@@ -262,6 +262,44 @@ def fused_all_gather_bmm_fp8_fake(
     )
 
 
+def fused_bmm_fp8_reduce_scatter(
+    output: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    from vllm.utils.flashinfer import flashinfer_fused_bmm_fp8_reduce_scatter
+
+    result = flashinfer_fused_bmm_fp8_reduce_scatter(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        group_name,
+        out_dtype=out_dtype,
+        backend=backend,
+    )
+    output.copy_(result)
+    return output
+
+
+def fused_bmm_fp8_reduce_scatter_fake(
+    output: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    return output
+
+
 def patched_fused_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -349,6 +387,13 @@ direct_register_custom_op(
     op_name="fused_all_gather_bmm_fp8",
     op_func=fused_all_gather_bmm_fp8,
     fake_impl=fused_all_gather_bmm_fp8_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_bmm_fp8_reduce_scatter",
+    op_func=fused_bmm_fp8_reduce_scatter,
+    mutates_args=["output"],
+    fake_impl=fused_bmm_fp8_reduce_scatter_fake,
 )
 
 # TODO: Remove this once the pytorch fix
