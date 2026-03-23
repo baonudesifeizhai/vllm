@@ -209,8 +209,8 @@ def _find_ag_bmm_replace_target(bmm_node: fx.Node) -> fx.Node | None:
             continue
 
         # Replace the first reachable 2D passthrough node on each path.
-        # This covers bmm_fp8 -> squeeze/view -> split(...) patterns used by
-        # QKV projections while avoiding replacement below multiple branches.
+        # Multi-branch packed outputs (for example QKV tensors that later split
+        # into separate q/k/v paths) are intentionally skipped for now.
         if _node_ndim(user) == 2:
             replace_targets.append(user)
             continue

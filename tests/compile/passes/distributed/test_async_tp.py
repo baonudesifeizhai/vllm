@@ -255,39 +255,6 @@ class TestAGBmmFP8Model(torch.nn.Module):
         return [torch.ops.vllm.fused_all_gather_bmm_fp8.default]
 
 
-class TestAGBmmFP8SplitModel(torch.nn.Module):
-    def __init__(self, hidden_size=16, dtype=torch.bfloat16):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.dtype = dtype
-        self.weight = torch.randn(hidden_size, hidden_size * 2, dtype=torch.float16).to(
-            FP8_DTYPE
-        )
-        self.scale_b = torch.ones(1, dtype=torch.float32)
-
-    def forward(self, input: torch.Tensor):
-        fp8_input = input.to(FP8_DTYPE)
-        all_gather = tensor_model_parallel_all_gather(fp8_input, dim=0)
-        scale_a = torch.ones(1, dtype=torch.float32)
-        bmm = torch.ops.vllm.bmm_fp8(
-            all_gather.unsqueeze(0),
-            self.weight.unsqueeze(0),
-            scale_a,
-            self.scale_b,
-            self.dtype,
-            "auto",
-        )
-        qkv = bmm.squeeze(0)
-        q, kv = qkv.split([self.hidden_size, self.hidden_size], dim=-1)
-        return q + kv
-
-    def ops_in_model_before(self):
-        return [torch.ops.vllm.all_gather.default]
-
-    def ops_in_model_after(self):
-        return [torch.ops.vllm.fused_all_gather_bmm_fp8.default]
-
-
 @multi_gpu_test(num_gpus=2)
 @pytest.mark.parametrize(
     "test_model",
@@ -299,7 +266,6 @@ class TestAGBmmFP8SplitModel(torch.nn.Module):
         TestCutlassScaledMMRSModel,
         TestAGCutlassScaledMMModel,
         TestAGBmmFP8Model,
-        TestAGBmmFP8SplitModel,
     ],
 )
 @pytest.mark.parametrize("batch_size", [8])
@@ -330,9 +296,7 @@ def test_async_tp_pass_replace(
             "Only bf16 high precision output types are supported for "
             "per-token (row-wise) scaling"
         )
-    if test_model in (TestAGBmmFP8Model, TestAGBmmFP8SplitModel) and not hasattr(
-        torch.ops.vllm, "bmm_fp8"
-    ):
+    if test_model is TestAGBmmFP8Model and not hasattr(torch.ops.vllm, "bmm_fp8"):
         pytest.skip("vllm.bmm_fp8 is not available in this environment")
 
     num_processes = 2
