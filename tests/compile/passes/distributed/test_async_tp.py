@@ -228,7 +228,7 @@ class TestRSBmmFP8Model(torch.nn.Module):
         return [torch.ops.vllm.reduce_scatter.default, torch.ops.vllm.bmm_fp8.default]
 
     def ops_in_model_after(self):
-        return [torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default]
+        return [torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter.default]
 
 
 class TestCutlassScaledMMRSModel(_BaseScaledMMModel):

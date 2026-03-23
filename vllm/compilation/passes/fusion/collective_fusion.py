@@ -332,8 +332,11 @@ def _match_rs_bmm_fp8(reduce_scatter: fx.Node) -> dict[str, object] | None:
 
     if not _is_call_function(mm_output, torch.ops.aten.reshape.default):
         return None
+    if len(mm_output.args) != 2:
+        return None
 
     bmm_fp8 = mm_output.args[0]
+    output_shape = mm_output.args[1]
     if not _is_call_function(bmm_fp8, torch.ops.vllm.bmm_fp8.default):
         return None
 
@@ -348,11 +351,14 @@ def _match_rs_bmm_fp8(reduce_scatter: fx.Node) -> dict[str, object] | None:
     if a_batched.args[1] != 0 or b_batched.args[1] != 0:
         return None
 
+    a_input = a_batched.args[0]
+
     return {
         "reduce_scatter": reduce_scatter,
         "mm_output": mm_output,
+        "output_shape": output_shape,
         "bmm_fp8": bmm_fp8,
-        "a_input": a_batched.args[0],
+        "a_input": a_input,
         "weight": b_batched.args[0],
         "scale_a": scale_a,
         "scale_b": scale_b,
@@ -372,15 +378,21 @@ def rewrite_bmm_fp8_reduce_scatter(graph: fx.Graph) -> int:
 
         with graph.inserting_before(node):
             fused = graph.call_function(
-                torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default,
+                torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter.default,
                 args=(
                     match["a_input"],
                     match["weight"],
                     match["scale_a"],
                     match["scale_b"],
-                    match["out_dtype"],
+                    "sum",
+                    0,
+                    0,
                     match["group_name"],
-                    match["backend"],
+                    match["output_shape"],
+                    None,
+                    None,
+                    match["out_dtype"],
+                    False,
                 ),
             )
             fused.meta = node.meta.copy()
