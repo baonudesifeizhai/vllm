@@ -360,6 +360,11 @@ def fused_all_gather_bmm_fp8(
 
     reg_buffer = ca_comm.buffer_ptrs[rank]
     reg_buffer_sz_bytes = ca_comm.max_size
+    a_bytes = A.numel() * A.element_size()
+    if reg_buffer_sz_bytes < a_bytes:
+        return _fallback_all_gather_bmm_fp8(
+            A, B, A_scale, B_scale, out_dtype, backend, group
+        )
 
     return torch.ops._C.fused_all_gather_bmm_fp8(
         A,
