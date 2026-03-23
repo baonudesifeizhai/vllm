@@ -144,8 +144,6 @@ class ScaledMMReduceScatterPattern(BasePattern):
             scale_a: torch.Tensor,
             scale_b: torch.Tensor,
         ) -> torch.Tensor:
-            # Calculate output shape: input @ mat2 with scatter_dim reduced
-            output_shape = [*input.shape[:-1], mat2.shape[1]]
             scatter_dim = 0
             gemm_rs = torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter(
                 input,
@@ -156,7 +154,6 @@ class ScaledMMReduceScatterPattern(BasePattern):
                 scatter_dim,  # orig_scatter_dim
                 scatter_dim,  # scatter_dim_after_maybe_reshape
                 self.tp.device_group.group_name,
-                output_shape,
                 None,  # bias
                 None,  # result_scale
                 self.dtype,  # out_dtype
@@ -336,7 +333,6 @@ def _match_rs_bmm_fp8(reduce_scatter: fx.Node) -> dict[str, object] | None:
         return None
 
     bmm_fp8 = mm_output.args[0]
-    output_shape = mm_output.args[1]
     if not _is_call_function(bmm_fp8, torch.ops.vllm.bmm_fp8.default):
         return None
 
@@ -356,7 +352,6 @@ def _match_rs_bmm_fp8(reduce_scatter: fx.Node) -> dict[str, object] | None:
     return {
         "reduce_scatter": reduce_scatter,
         "mm_output": mm_output,
-        "output_shape": output_shape,
         "bmm_fp8": bmm_fp8,
         "a_input": a_input,
         "weight": b_batched.args[0],
@@ -388,7 +383,6 @@ def rewrite_bmm_fp8_reduce_scatter(graph: fx.Graph) -> int:
                     0,
                     0,
                     match["group_name"],
-                    match["output_shape"],
                     None,
                     None,
                     match["out_dtype"],
@@ -454,8 +448,6 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
             scale_b: torch.Tensor,
             cutlass_mm_output: torch.Tensor,
         ) -> torch.Tensor:
-            # Calculate output shape: input @ mat2 with scatter_dim reduced
-            output_shape = [*input.shape[:-1], mat2.shape[1]]
             scatter_dim = 0
             gemm_rs = torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter(
                 input,
@@ -466,7 +458,6 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
                 scatter_dim,  # orig_scatter_dim
                 scatter_dim,  # scatter_dim_after_maybe_reshape
                 self.tp.device_group.group_name,
-                output_shape,
                 None,  # bias
                 None,  # result_scale
                 self.dtype,  # out_dtype

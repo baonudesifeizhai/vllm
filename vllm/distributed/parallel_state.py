@@ -271,7 +271,6 @@ def patched_fused_scaled_matmul_reduce_scatter_fake(
     orig_scatter_dim: int,
     scatter_dim_after_maybe_reshape: int,
     group_name: str,
-    output_shape: list[int],
     bias: torch.Tensor | None = None,
     result_scale: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
@@ -284,7 +283,7 @@ def patched_fused_scaled_matmul_reduce_scatter_fake(
         if group is not None:
             world_size = group.world_size
 
-    new_shape = list(output_shape)
+    new_shape = [*A.shape[:-1], B.shape[1]]
     new_shape[scatter_dim_after_maybe_reshape] = (
         new_shape[scatter_dim_after_maybe_reshape] // world_size
     )
@@ -304,12 +303,12 @@ def patched_fused_scaled_matmul_reduce_scatter(
     orig_scatter_dim: int,
     scatter_dim_after_maybe_reshape: int,
     group_name: str,
-    output_shape: list[int],
     bias: torch.Tensor | None = None,
     result_scale: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
+    output_shape = [*A.shape[:-1], B.shape[1]]
     return torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
         A,
         B,
