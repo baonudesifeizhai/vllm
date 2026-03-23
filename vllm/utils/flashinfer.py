@@ -163,11 +163,10 @@ def has_flashinfer_fused_all_gather_bmm_fp8() -> bool:
 
 @functools.cache
 def has_flashinfer_fused_bmm_fp8_reduce_scatter() -> bool:
-    """Return `True` if FlashInfer's RS+FP8 GEMM primitive is available."""
-    if not has_flashinfer():
-        return False
-    mod = _get_submodule("flashinfer")
-    return mod is not None and hasattr(mod, "fused_bmm_fp8_reduce_scatter")
+    """Return `True` if the direct FlashInfer RS+FP8 GEMM op is registered."""
+    return has_flashinfer() and hasattr(
+        torch.ops.flashinfer, "fused_bmm_fp8_reduce_scatter"
+    )
 
 
 @functools.cache
