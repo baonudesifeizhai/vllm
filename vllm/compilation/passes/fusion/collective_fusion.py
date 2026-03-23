@@ -14,6 +14,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 from vllm.distributed import get_tp_group
 from vllm.distributed.parallel_state import (
+    _register_inductor_lowering_for_fused_collective_fp8_ops,
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
@@ -575,6 +576,10 @@ class AsyncTPPass(VllmPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
+
+        # Register Inductor extern-call lowering only when AsyncTP compilation
+        # is actually enabled, instead of at module import time.
+        _register_inductor_lowering_for_fused_collective_fp8_ops()
 
         # Enable symmetric memory for the TP process group
         enable_symm_mem_for_group(get_tp_group().device_group.group_name)

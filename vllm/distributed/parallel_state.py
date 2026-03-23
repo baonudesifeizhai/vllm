@@ -518,9 +518,6 @@ def _register_inductor_lowering_for_fused_collective_fp8_ops() -> None:
             _lowering.make_fallback(op)
 
 
-_register_inductor_lowering_for_fused_collective_fp8_ops()
-
-
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
