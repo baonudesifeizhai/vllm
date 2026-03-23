@@ -123,9 +123,6 @@ flashinfer_cutedsl_grouped_gemm_nt_masked = _lazy_import_wrapper(
 flashinfer_fused_all_gather_bmm_fp8 = _lazy_import_wrapper(
     "flashinfer", "fused_all_gather_bmm_fp8"
 )
-flashinfer_fused_bmm_fp8_reduce_scatter = _lazy_import_wrapper(
-    "flashinfer", "fused_bmm_fp8_reduce_scatter"
-)
 flashinfer_fp4_quantize = _lazy_import_wrapper("flashinfer", "fp4_quantize")
 nvfp4_batched_quantize = _lazy_import_wrapper("flashinfer", "nvfp4_batched_quantize")
 silu_and_mul_scaled_nvfp4_experts_quantize = _lazy_import_wrapper(
@@ -791,7 +788,6 @@ __all__ = [
     "flashinfer_cutlass_fused_moe",
     "flashinfer_cutedsl_grouped_gemm_nt_masked",
     "flashinfer_fused_all_gather_bmm_fp8",
-    "flashinfer_fused_bmm_fp8_reduce_scatter",
     "flashinfer_fp4_quantize",
     "silu_and_mul_scaled_nvfp4_experts_quantize",
     "scaled_fp4_grouped_quantize",

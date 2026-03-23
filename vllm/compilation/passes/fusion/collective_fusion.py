@@ -373,30 +373,17 @@ def rewrite_bmm_fp8_reduce_scatter(graph: fx.Graph) -> int:
         if match is None:
             continue
 
-        out_meta = node.meta.get("val")
-        if out_meta is None:
-            continue
-
         with graph.inserting_before(node):
-            output = graph.call_function(
-                torch.empty,
-                args=(tuple(out_meta.shape),),
-                kwargs={
-                    "dtype": out_meta.dtype,
-                    "device": out_meta.device,
-                },
-            )
-            output.meta = node.meta.copy()
             fused = graph.call_function(
-                torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default,
+                torch.ops.flashinfer.fused_bmm_fp8_reduce_scatter.default,
                 args=(
-                    output,
                     match["a_input"],
                     match["weight"],
                     match["scale_a"],
                     match["scale_b"],
-                    match["out_dtype"],
+                    match["world_size"],
                     match["group_name"],
+                    match["out_dtype"],
                     match["backend"],
                 ),
             )
