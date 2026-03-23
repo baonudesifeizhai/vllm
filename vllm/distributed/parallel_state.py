@@ -262,6 +262,95 @@ def fused_all_gather_bmm_fp8_fake(
     )
 
 
+def fused_bmm_fp8_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    from vllm.utils.flashinfer import (
+        flashinfer_fused_bmm_fp8_reduce_scatter,
+        has_flashinfer_fused_bmm_fp8_reduce_scatter,
+    )
+
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+
+    if group.world_size == 1:
+        return torch.ops.vllm.bmm_fp8.default(
+            A.unsqueeze(0),
+            B.unsqueeze(0),
+            A_scale,
+            B_scale,
+            out_dtype,
+            backend,
+        ).squeeze(0)
+
+    device_communicator = group.device_communicator
+    ca_comm = (
+        getattr(device_communicator, "ca_comm", None)
+        if device_communicator is not None
+        else None
+    )
+    if not has_flashinfer_fused_bmm_fp8_reduce_scatter():
+        raise RuntimeError("FlashInfer fused_bmm_fp8_reduce_scatter is unavailable")
+    if ca_comm is None or ca_comm.disabled:
+        raise RuntimeError(
+            "FlashInfer fused_bmm_fp8_reduce_scatter requires "
+            "an enabled custom AR communicator"
+        )
+
+    min_chunk_bytes = (
+        group.world_size * B.shape[1] * torch.empty((), dtype=out_dtype).element_size()
+    )
+    if ca_comm.max_size < min_chunk_bytes:
+        raise RuntimeError(
+            "FlashInfer fused_bmm_fp8_reduce_scatter requires a larger staging buffer: "
+            f"need at least {min_chunk_bytes} bytes, got {ca_comm.max_size}"
+        )
+
+    return flashinfer_fused_bmm_fp8_reduce_scatter(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        ca_comm._ptr,
+        ca_comm.buffer_ptrs[group.rank_in_group],
+        ca_comm.max_size,
+        group.world_size,
+        out_dtype=out_dtype,
+        backend=backend,
+    )
+
+
+def fused_bmm_fp8_reduce_scatter_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    group_name: str,
+    backend: str,
+) -> torch.Tensor:
+    world_size = 1
+    group_ref = _groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            world_size = group.world_size
+    return torch.empty(
+        A.shape[0] // world_size,
+        B.shape[1],
+        dtype=out_dtype,
+        device=A.device,
+    )
+
+
 def patched_fused_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -349,6 +438,12 @@ direct_register_custom_op(
     op_name="fused_all_gather_bmm_fp8",
     op_func=fused_all_gather_bmm_fp8,
     fake_impl=fused_all_gather_bmm_fp8_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_bmm_fp8_reduce_scatter",
+    op_func=fused_bmm_fp8_reduce_scatter,
+    fake_impl=fused_bmm_fp8_reduce_scatter_fake,
 )
 
 # TODO: Remove this once the pytorch fix

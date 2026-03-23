@@ -28,7 +28,11 @@ from vllm.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from vllm.platforms import current_platform
-from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm, has_flashinfer
+from vllm.utils.flashinfer import (
+    flashinfer_scaled_fp8_mm,
+    has_flashinfer,
+    has_flashinfer_fused_bmm_fp8_reduce_scatter,
+)
 from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
@@ -215,20 +219,20 @@ class TestRSBmmFP8Model(torch.nn.Module):
     def forward(self, input: torch.Tensor):
         fp8_input = input.to(FP8_DTYPE)
         scale_a = torch.ones(1, dtype=torch.float32, device=input.device)
-        mm = flashinfer_scaled_fp8_mm(
+        bmm_fp8 = flashinfer_scaled_fp8_mm(
             fp8_input,
             self.weight,
             scale_a,
             self.scale_b,
             self.dtype,
         )
-        return tensor_model_parallel_reduce_scatter(mm, dim=0)
+        return tensor_model_parallel_reduce_scatter(bmm_fp8, dim=0)
 
     def ops_in_model_before(self):
-        return [torch.ops.vllm.reduce_scatter.default, torch.ops.vllm.bmm_fp8.default]
+        return [torch.ops.vllm.bmm_fp8.default, torch.ops.vllm.reduce_scatter.default]
 
     def ops_in_model_after(self):
-        return [torch.ops.flashinfer.fused_bmm_fp8_reduce_scatter.default]
+        return [torch.ops.vllm.fused_bmm_fp8_reduce_scatter.default]
 
 
 class TestCutlassScaledMMRSModel(_BaseScaledMMModel):
@@ -320,6 +324,11 @@ def test_async_tp_pass_replace(
             pytest.skip("FlashInfer is required for bmm_fp8 fusion")
         if not current_platform.has_device_capability(100):
             pytest.skip("bmm_fp8 fusion requires compute capability 100+")
+    if (
+        test_model is TestRSBmmFP8Model
+        and not has_flashinfer_fused_bmm_fp8_reduce_scatter()
+    ):
+        pytest.skip("FlashInfer RS primitive is unavailable")
 
     if (
         test_model
