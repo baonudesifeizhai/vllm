@@ -38,7 +38,6 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
-import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
 
@@ -278,41 +277,22 @@ def patched_fused_scaled_matmul_reduce_scatter_fake(
     out_dtype: torch.dtype | None = None,
     use_fast_accum: bool = False,
 ) -> torch.Tensor:
-    # Copied from
-    # https://github.com/pytorch/pytorch/blob/50c338c2da905062449e4d9ac807832d1b5cd90e/torch/distributed/_symmetric_memory/__init__.py#L1189
-    if A_scale.numel() > 1:
-        if A_scale.shape[:-1] != A.shape[:-1]:
-            raise ValueError(
-                "For row-wise scaling, the leading dims of A_scale "
-                "must match the leading dims of A "
-                f"(A shape: {A.shape}, A_scale shape: {A_scale.shape})"
-            )
-        A_scale = A_scale.flatten(0, -2).contiguous()
-    elif A_scale.numel() != 1:
-        raise ValueError(
-            "Invalid A_scale shape "
-            f"(A shape: {A.shape}, A_scale shape: {A_scale.shape})"
-        )
+    world_size = 1
+    group_ref = _groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            world_size = group.world_size
 
-    C = torch._scaled_mm(
-        A.flatten(0, -2).contiguous(),
-        B,
-        A_scale,
-        B_scale,
-        bias,
-        result_scale,
-        out_dtype,
-        use_fast_accum,
+    new_shape = list(output_shape)
+    new_shape[scatter_dim_after_maybe_reshape] = (
+        new_shape[scatter_dim_after_maybe_reshape] // world_size
     )
-    C = C.view(*output_shape[:-1], B.shape[1])
-    res = funcol.reduce_scatter_tensor(
-        C,
-        reduce_op,
-        orig_scatter_dim,  # need original scatter dim for 3D+ output tensor here
-        group_name,
+    return torch.empty(
+        new_shape,
+        dtype=out_dtype if out_dtype is not None else A.dtype,
+        device=A.device,
     )
-    res = funcol.wait_tensor(res)
-    return res
 
 
 def patched_fused_scaled_matmul_reduce_scatter(
