@@ -105,6 +105,14 @@ os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
 # see https://github.com/vllm-project/vllm/issues/10619
 torch._inductor.config.compile_threads = 1
 
+# Enable Triton autotuning result caching to disk by default.
+# Without this, Triton re-runs autotuning on every process restart,
+# adding significant latency to the first inference request.
+# This writes autotuning results to TRITON_CACHE_DIR.
+# It can still be overridden by setting TRITON_CACHE_AUTOTUNING=0
+# in the environment.
+os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")
+
 # ===================================================
 # torch 2.9 Inductor PythonWrapperCodegen monkeypatch
 # ===================================================
@@ -499,8 +507,6 @@ if is_torch_equal_or_newer("2.11.0.dev"):
     import torch._inductor.ir as _ir
     import torch._inductor.lowering as _lowering
     from torch._inductor.virtualized import V as _V
-
-    _orig_constrain = _lowering.constrain_to_fx_strides
 
     def _patched_constrain_to_fx_strides(fx_node, *args, **kwargs):
         # These fused collective FP8 ops have strict runtime kernel checks and
