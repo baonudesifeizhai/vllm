@@ -31,6 +31,8 @@ VIEW_LIKE_OPS = (
     torch.ops.aten.view.default,
     torch.ops.aten.reshape.default,
     torch.ops.aten._unsafe_view.default,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.squeeze.default,
 )
 
 # These ops may preserve values but can change layout/aliasing.
@@ -192,11 +194,31 @@ def _find_bmm_reduce_scatter(
 
 
 def _find_ag_bmm_replace_target(bmm_node: fx.Node) -> fx.Node | None:
-    replace_targets = [
-        user
-        for user in bmm_node.users
-        if _is_passthrough(user) and _node_ndim(user) == 2
-    ]
+    worklist = list(bmm_node.users)
+    visited: set[fx.Node] = set()
+    replace_targets: list[fx.Node] = []
+
+    while worklist:
+        user = worklist.pop()
+        if user in visited:
+            continue
+        visited.add(user)
+
+        if not _is_passthrough(user):
+            continue
+
+        # Replace the first reachable 2D passthrough node on each path.
+        # This covers bmm_fp8 -> squeeze/view -> split(...) patterns used by
+        # QKV projections while avoiding replacement below multiple branches.
+        if _node_ndim(user) == 2:
+            replace_targets.append(user)
+            continue
+
+        worklist.extend(user.users)
+
+    if not replace_targets and _node_ndim(bmm_node) == 2:
+        replace_targets = [bmm_node]
+
     if len(replace_targets) != 1:
         return None
     return replace_targets[0]
