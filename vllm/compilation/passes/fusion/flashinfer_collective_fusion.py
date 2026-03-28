@@ -17,6 +17,7 @@ from ..fx_utils import is_func
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FLASHINFER_BMM_FP8_MIN_M = 64
+FLASHINFER_VIEW_OP = torch.ops.aten.reshape.default
 FLASHINFER_VIEW_OPS = (
     torch.ops.aten.view.default,
     torch.ops.aten.reshape.default,
@@ -96,17 +97,11 @@ def _has_exact_qkv_split_user(node: fx.Node) -> bool:
 
 
 class _BaseFlashInferPattern:
-    def __init__(
-        self,
-        dtype: torch.dtype,
-        device: str | None,
-        view_op: Any,
-    ) -> None:
+    def __init__(self, dtype: torch.dtype, device: str | None) -> None:
         self.dtype = dtype
         self.device = device
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.view_op = view_op
 
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -151,7 +146,7 @@ class FlashInferBMMFP8ReduceScatterPattern(_BaseFlashInferPattern):
                 self.dtype,
                 "auto",
             )
-            mm_result = self.view_op(
+            mm_result = FLASHINFER_VIEW_OP(
                 bmm_result,
                 [input.shape[0], weight.shape[1]],
             )
@@ -190,7 +185,7 @@ class FlashInferBMMFP8ReduceScatterPattern(_BaseFlashInferPattern):
         pattern_expr = pm.CallFunction(
             torch.ops.vllm.reduce_scatter.default,
             pm.CallFunction(
-                self.view_op,
+                FLASHINFER_VIEW_OPS,
                 pm.CallFunction(
                     torch.ops.vllm.bmm_fp8.default,
                     pm.CallFunction(
@@ -245,7 +240,7 @@ class AllGatherFlashInferBMMFP8QKVPattern(_BaseFlashInferPattern):
                 self.dtype,
                 "auto",
             )
-            return self.view_op(
+            return FLASHINFER_VIEW_OP(
                 bmm_result,
                 [all_gather.shape[0], weight.shape[1]],
             )
@@ -274,7 +269,7 @@ class AllGatherFlashInferBMMFP8QKVPattern(_BaseFlashInferPattern):
             return _passes_min_m(qkv_output) and _has_exact_qkv_split_user(qkv_output)
 
         pattern_expr = pm.CallFunction(
-            self.view_op,
+            FLASHINFER_VIEW_OPS,
             pm.CallFunction(
                 torch.ops.vllm.bmm_fp8.default,
                 pm.CallFunction(
