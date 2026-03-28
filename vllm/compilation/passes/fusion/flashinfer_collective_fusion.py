@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from typing import Any
+
 import torch
 import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
@@ -15,7 +17,10 @@ from ..fx_utils import is_func
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FLASHINFER_BMM_FP8_MIN_M = 64
-FLASHINFER_VIEW_OP = torch.ops.aten.reshape.default
+FLASHINFER_VIEW_OPS = (
+    torch.ops.aten.view.default,
+    torch.ops.aten.reshape.default,
+)
 
 
 def _get_node_arg(node: fx.Node, name: str, index: int) -> object:
@@ -91,11 +96,17 @@ def _has_exact_qkv_split_user(node: fx.Node) -> bool:
 
 
 class _BaseFlashInferPattern:
-    def __init__(self, dtype: torch.dtype, device: str | None) -> None:
+    def __init__(
+        self,
+        dtype: torch.dtype,
+        device: str | None,
+        view_op: Any,
+    ) -> None:
         self.dtype = dtype
         self.device = device
         self.tp = get_tp_group()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.view_op = view_op
 
     def get_inputs(self) -> list[torch.Tensor]:
         input = torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -103,6 +114,25 @@ class _BaseFlashInferPattern:
         scale_a = torch.tensor(1.0, device=self.device, dtype=torch.float32)
         scale_b = torch.tensor(1.0, device=self.device, dtype=torch.float32)
         return [input, weight, scale_a, scale_b]
+
+    def _register(
+        self,
+        search_fn: Any,
+        replacement_fn: Any,
+        pm_pass: PatternMatcherPass,
+        extra_check: Any,
+        pattern_expr: pm.PatternExpr,
+    ) -> None:
+        pm.register_replacement(
+            search_fn,
+            replacement_fn,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=extra_check,
+            search_fn_pattern=pattern_expr,
+            skip_duplicates=True,
+        )
 
 
 class FlashInferBMMFP8ReduceScatterPattern(_BaseFlashInferPattern):
@@ -121,7 +151,7 @@ class FlashInferBMMFP8ReduceScatterPattern(_BaseFlashInferPattern):
                 self.dtype,
                 "auto",
             )
-            mm_result = FLASHINFER_VIEW_OP(
+            mm_result = self.view_op(
                 bmm_result,
                 [input.shape[0], weight.shape[1]],
             )
@@ -157,13 +187,39 @@ class FlashInferBMMFP8ReduceScatterPattern(_BaseFlashInferPattern):
             rs_input = _get_node_arg(rs_node, "tensor", 0)
             return isinstance(rs_input, fx.Node) and _passes_min_m(rs_input)
 
-        pm.register_replacement(
+        pattern_expr = pm.CallFunction(
+            torch.ops.vllm.reduce_scatter.default,
+            pm.CallFunction(
+                self.view_op,
+                pm.CallFunction(
+                    torch.ops.vllm.bmm_fp8.default,
+                    pm.CallFunction(
+                        torch.ops.aten.unsqueeze.default,
+                        pm.KeywordArg("input"),
+                        pm.Ignored(),
+                    ),
+                    pm.CallFunction(
+                        torch.ops.aten.unsqueeze.default,
+                        pm.KeywordArg("weight"),
+                        pm.Ignored(),
+                    ),
+                    pm.KeywordArg("scale_a"),
+                    pm.KeywordArg("scale_b"),
+                    pm.Ignored(),
+                    "auto",
+                ),
+                pm.Ignored(),
+            ),
+            pm.Ignored(),
+            pm.Ignored(),
+            self.tp.unique_name,
+        )
+        self._register(
             pattern,
             replacement,
-            self.get_inputs(),
-            pm.fwd_only,
             pm_pass,
             extra_check=extra_check,
+            pattern_expr=pattern_expr,
         )
 
 
@@ -189,7 +245,7 @@ class AllGatherFlashInferBMMFP8QKVPattern(_BaseFlashInferPattern):
                 self.dtype,
                 "auto",
             )
-            return FLASHINFER_VIEW_OP(
+            return self.view_op(
                 bmm_result,
                 [all_gather.shape[0], weight.shape[1]],
             )
@@ -217,11 +273,37 @@ class AllGatherFlashInferBMMFP8QKVPattern(_BaseFlashInferPattern):
             qkv_output = match.output_node()
             return _passes_min_m(qkv_output) and _has_exact_qkv_split_user(qkv_output)
 
-        pm.register_replacement(
+        pattern_expr = pm.CallFunction(
+            self.view_op,
+            pm.CallFunction(
+                torch.ops.vllm.bmm_fp8.default,
+                pm.CallFunction(
+                    torch.ops.aten.unsqueeze.default,
+                    pm.CallFunction(
+                        torch.ops.vllm.all_gather.default,
+                        pm.KeywordArg("x"),
+                        pm.Ignored(),
+                        pm.Ignored(),
+                        self.tp.unique_name,
+                    ),
+                    pm.Ignored(),
+                ),
+                pm.CallFunction(
+                    torch.ops.aten.unsqueeze.default,
+                    pm.KeywordArg("weight"),
+                    pm.Ignored(),
+                ),
+                pm.KeywordArg("scale_a"),
+                pm.KeywordArg("scale_b"),
+                pm.Ignored(),
+                "auto",
+            ),
+            pm.Ignored(),
+        )
+        self._register(
             pattern,
             replacement,
-            self.get_inputs(),
-            pm.fwd_only,
             pm_pass,
             extra_check=extra_check,
+            pattern_expr=pattern_expr,
         )
