@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Mapping, Set
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -10,6 +11,8 @@ from packaging.version import Version
 from transformers import __version__ as TRANSFORMERS_VERSION
 
 from vllm.config.model import ModelDType, TokenizerMode
+
+LOCAL_INTERNVL2_HF_MODEL = os.environ.get("VLLM_TEST_INTERNVL2_HF_MODEL")
 
 
 @dataclass(frozen=True)
@@ -871,7 +874,12 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         },
         trust_remote_code=True,
     ),
-    "InternVLForConditionalGeneration": _HfExamplesInfo("OpenGVLab/InternVL3-1B-hf"),
+    "InternVLForConditionalGeneration": _HfExamplesInfo(
+        "OpenGVLab/InternVL3-1B-hf",
+        extras=(
+            {"2.0-local": LOCAL_INTERNVL2_HF_MODEL} if LOCAL_INTERNVL2_HF_MODEL else {}
+        ),
+    ),
     "KananaVForConditionalGeneration": _HfExamplesInfo(
         "kakaocorp/kanana-1.5-v-3b-instruct",
         trust_remote_code=True,

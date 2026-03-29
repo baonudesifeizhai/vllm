@@ -5,6 +5,7 @@ image, embedding, and video support for different VLMs in vLLM.
 """
 
 import math
+import os
 from collections import defaultdict
 from pathlib import PosixPath
 
@@ -39,6 +40,8 @@ from .vlm_utils.types import (
     VLMTestInfo,
     VLMTestType,
 )
+
+LOCAL_INTERNVL2_HF_MODEL = os.environ.get("VLLM_TEST_INTERNVL2_HF_MODEL")
 
 COMMON_BROADCAST_SETTINGS = {
     "test_type": VLMTestType.IMAGE,
@@ -543,6 +546,29 @@ VLM_TEST_SETTINGS = {
         max_model_len=8192,
         use_tokenizer_eos=True,
         auto_cls=AutoModelForImageTextToText,
+    ),
+    "intern_vl2-hf-local": VLMTestInfo(
+        models=[LOCAL_INTERNVL2_HF_MODEL or "/tmp/InternVL2-1B-hf"],
+        test_type=(
+            VLMTestType.IMAGE,
+            VLMTestType.MULTI_IMAGE,
+        ),
+        prompt_formatter=lambda img_prompt: f"<|im_start|>User\n{img_prompt}<|im_end|>\n<|im_start|>Assistant\n",  # noqa: E501
+        img_idx_to_prompt=lambda idx: "<IMG_CONTEXT>",
+        max_model_len=4096,
+        use_tokenizer_eos=True,
+        auto_cls=AutoModelForImageTextToText,
+        marks=[
+            pytest.mark.skipif(
+                not LOCAL_INTERNVL2_HF_MODEL
+                or not os.path.isdir(LOCAL_INTERNVL2_HF_MODEL),
+                reason=(
+                    "Set VLLM_TEST_INTERNVL2_HF_MODEL to a local converted "
+                    "InternVL2 HF-native checkpoint directory to run this "
+                    "experiment."
+                ),
+            )
+        ],
     ),
     "isaac": VLMTestInfo(
         # NOTE: PerceptronAI/Isaac-0.1 removed because the upstream HF
