@@ -539,6 +539,13 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
 
+    def _all_gather_into(
+        self, output_tensor: torch.Tensor, input_: torch.Tensor, dim: int
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_gather_into(output_tensor, input_, dim)
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -576,6 +583,13 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.reduce_scatter(input_, dim)
+
+    def _reduce_scatter_into(
+        self, output_tensor: torch.Tensor, input_: torch.Tensor, dim: int
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.reduce_scatter_into(output_tensor, input_, dim)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1
