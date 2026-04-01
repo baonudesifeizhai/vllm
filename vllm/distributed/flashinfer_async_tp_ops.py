@@ -10,7 +10,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 _FLASHINFER_ASYNC_TP_OPS_REGISTERED = False
 _AG_OVERLAP_LOCAL_ROWS = 256
-_MIN_AG_OVERLAP_LOCAL_ROWS = 512
+_MIN_AG_OVERLAP_LOCAL_ROWS = 2048
 _RS_OVERLAP_OUTPUT_ROWS = 256
 _MIN_RS_OVERLAP_OUTPUT_ROWS = 512
 
@@ -101,16 +101,6 @@ def _get_group(group_name: str):
     return None
 
 
-def _get_group_world_size(group_name: str) -> int:
-    group = _get_group(group_name)
-    if group is not None:
-        return group.world_size
-
-    from torch.distributed.distributed_c10d import _get_group_size_by_name
-
-    return _get_group_size_by_name(group_name)
-
-
 def _require_group(group_name: str):
     group = _get_group(group_name)
     if group is None:
@@ -125,7 +115,16 @@ def _resolve_out_dtype(
 
 
 def _resolve_world_size(group_name: str, group=None) -> int:
-    return group.world_size if group is not None else _get_group_world_size(group_name)
+    if group is not None:
+        return group.world_size
+
+    resolved_group = _get_group(group_name)
+    if resolved_group is not None:
+        return resolved_group.world_size
+
+    from torch.distributed.distributed_c10d import _get_group_size_by_name
+
+    return _get_group_size_by_name(group_name)
 
 
 def _allocate_mm_out(
@@ -222,14 +221,18 @@ def _iter_ag_chunk_slices(
     return tuple(chunks)
 
 
+def _is_overlap_eligible(tensor: torch.Tensor) -> bool:
+    if tensor.ndim != 2 or not tensor.is_contiguous():
+        return False
+    if _has_symbolic_shape(tensor):
+        return False
+    return not torch.cuda.is_current_stream_capturing()
+
+
 def _should_use_ag_overlap(A_shard: torch.Tensor, gather_dim: int) -> bool:
     if gather_dim != 0:
         return False
-    if A_shard.ndim != 2 or not A_shard.is_contiguous():
-        return False
-    if _has_symbolic_shape(A_shard):
-        return False
-    if torch.cuda.is_current_stream_capturing():
+    if not _is_overlap_eligible(A_shard):
         return False
     return A_shard.shape[0] >= _MIN_AG_OVERLAP_LOCAL_ROWS
 
@@ -254,36 +257,12 @@ def _iter_rs_chunk_slices(
 
 
 def _should_use_rs_overlap(A: torch.Tensor, group_world_size: int) -> bool:
-    if A.ndim != 2 or not A.is_contiguous():
-        return False
-    if _has_symbolic_shape(A):
-        return False
-    if torch.cuda.is_current_stream_capturing():
+    if not _is_overlap_eligible(A):
         return False
     if A.shape[0] % group_world_size != 0:
         return False
     output_rows = A.shape[0] // group_world_size
     return output_rows >= _MIN_RS_OVERLAP_OUTPUT_ROWS
-
-
-def _fused_all_gather_flashinfer_scaled_matmul_functional(
-    A_shard: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    gather_dim: int,
-    world_size: int,
-    group_name: str,
-    out_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    A = torch.ops.vllm.all_gather(
-        A_shard,
-        gather_dim,
-        world_size,
-        group_name,
-    )
-    mm_out = _flashinfer_scaled_mm(A, B, A_scale, B_scale, out_dtype)
-    return A, mm_out
 
 
 def _fused_all_gather_flashinfer_scaled_matmul_compile(
@@ -295,29 +274,15 @@ def _fused_all_gather_flashinfer_scaled_matmul_compile(
     group_name: str,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _fused_all_gather_flashinfer_scaled_matmul_functional(
+    world_size = _resolve_world_size(group_name)
+    gathered = torch.ops.vllm.all_gather(
         A_shard,
-        B,
-        A_scale,
-        B_scale,
         gather_dim,
-        _resolve_world_size(group_name),
+        world_size,
         group_name,
-        out_dtype,
     )
-
-
-def _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    group_name: str,
-    world_size: int,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    mm_out = _flashinfer_scaled_mm(A, B, A_scale, B_scale, out_dtype)
-    return torch.ops.vllm.reduce_scatter(mm_out, 0, world_size, group_name)
+    mm_out = _flashinfer_scaled_mm(gathered, B, A_scale, B_scale, out_dtype)
+    return gathered, mm_out
 
 
 def _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
@@ -328,14 +293,12 @@ def _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
     group_name: str,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    return _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
-        A,
-        B,
-        A_scale,
-        B_scale,
-        group_name,
+    mm_out = _flashinfer_scaled_mm(A, B, A_scale, B_scale, out_dtype)
+    return torch.ops.vllm.reduce_scatter(
+        mm_out,
+        0,
         _resolve_world_size(group_name),
-        out_dtype,
+        group_name,
     )
 
 

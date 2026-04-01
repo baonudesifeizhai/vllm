@@ -184,34 +184,32 @@ def _unwrap_bmm_fp8_arg_to_2d(arg: object) -> fx.Node | None:
     return node
 
 
-def _parse_reduce_scatter(
+def _parse_collective_op(
     node: fx.Node,
+    op,
 ) -> tuple[fx.Node, object, object, object] | None:
-    if not is_func(node, torch.ops.vllm.reduce_scatter.default):
+    if not is_func(node, op):
         return None
 
-    rs_input = _get_node_arg(node, "tensor", 0)
+    input_node = _get_node_arg(node, "tensor", 0)
     dim = _get_node_arg(node, "dim", 1)
     world_size = _get_node_arg(node, "world_size", 2)
     group_name = _get_node_arg(node, "group_name", 3)
-    if not isinstance(rs_input, fx.Node):
+    if not isinstance(input_node, fx.Node):
         return None
-    return rs_input, dim, world_size, group_name
+    return input_node, dim, world_size, group_name
+
+
+def _parse_reduce_scatter(
+    node: fx.Node,
+) -> tuple[fx.Node, object, object, object] | None:
+    return _parse_collective_op(node, torch.ops.vllm.reduce_scatter.default)
 
 
 def _parse_all_gather(
     node: fx.Node,
 ) -> tuple[fx.Node, object, object, object] | None:
-    if not is_func(node, torch.ops.vllm.all_gather.default):
-        return None
-
-    ag_input = _get_node_arg(node, "tensor", 0)
-    dim = _get_node_arg(node, "dim", 1)
-    world_size = _get_node_arg(node, "world_size", 2)
-    group_name = _get_node_arg(node, "group_name", 3)
-    if not isinstance(ag_input, fx.Node):
-        return None
-    return ag_input, dim, world_size, group_name
+    return _parse_collective_op(node, torch.ops.vllm.all_gather.default)
 
 
 def _parse_collective_group_name(
