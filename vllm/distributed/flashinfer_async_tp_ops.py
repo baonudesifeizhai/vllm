@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -86,17 +88,33 @@ def _has_symbolic_shape(tensor: torch.Tensor) -> bool:
     return any(is_symbolic(dim) for dim in tensor.shape)
 
 
+def _is_fake_tensor(tensor: torch.Tensor) -> bool:
+    return isinstance(tensor, FakeTensor)
+
+
+def _is_compile_time_context() -> bool:
+    return (
+        torch.compiler.is_compiling()
+        or torch._dynamo.is_compiling()
+        or torch.jit.is_tracing()
+    )
+
+
+def _should_use_compile_safe_path(*tensors: torch.Tensor) -> bool:
+    if _is_compile_time_context():
+        return True
+
+    return any(
+        _is_fake_tensor(tensor) or _has_symbolic_shape(tensor) for tensor in tensors
+    )
+
+
 def _get_group(group_name: str):
-    try:
+    with suppress(Exception):
         from vllm.distributed.parallel_state import _groups
 
-        group_ref = _groups.get(group_name)
-        if group_ref is not None:
-            group = group_ref()
-            if group is not None:
-                return group
-    except Exception:
-        pass
+        if (group_ref := _groups.get(group_name)) is not None:
+            return group_ref()
 
     return None
 
@@ -224,7 +242,7 @@ def _iter_ag_chunk_slices(
 def _is_overlap_eligible(tensor: torch.Tensor) -> bool:
     if tensor.ndim != 2 or not tensor.is_contiguous():
         return False
-    if _has_symbolic_shape(tensor):
+    if _should_use_compile_safe_path(tensor):
         return False
     return not torch.cuda.is_current_stream_capturing()
 
@@ -522,7 +540,7 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
         )
 
     out_dtype = _resolve_out_dtype(A, out_dtype)
-    if _has_symbolic_shape(A) or _has_symbolic_shape(B):
+    if _should_use_compile_safe_path(A, B):
         return _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
             A,
             B,
@@ -562,13 +580,14 @@ def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    return _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
-        A.flatten(0, -2).contiguous(),
-        B,
-        A_scale,
-        B_scale,
-        group_name,
-        out_dtype,
+    resolved_out_dtype = _resolve_out_dtype(A, out_dtype)
+    world_size = _resolve_world_size(group_name)
+    output_shape = _flashinfer_mm_output_shape(A, B)
+    output_shape[0] //= world_size
+    return torch.empty(
+        output_shape,
+        dtype=resolved_out_dtype,
+        device=A.device,
     )
 
 
@@ -587,7 +606,7 @@ def fused_all_gather_flashinfer_scaled_matmul(
         )
 
     out_dtype = _resolve_out_dtype(A_shard, out_dtype)
-    if _has_symbolic_shape(A_shard) or _has_symbolic_shape(B):
+    if _should_use_compile_safe_path(A_shard, B):
         return _fused_all_gather_flashinfer_scaled_matmul_compile(
             A_shard,
             B,
@@ -627,15 +646,21 @@ def fused_all_gather_flashinfer_scaled_matmul_fake(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _fused_all_gather_flashinfer_scaled_matmul_compile(
-        A_shard,
-        B,
-        A_scale,
-        B_scale,
-        gather_dim,
-        group_name,
-        _resolve_out_dtype(A_shard, out_dtype),
+    resolved_out_dtype = _resolve_out_dtype(A_shard, out_dtype)
+    world_size = _resolve_world_size(group_name)
+    gathered_shape = list(A_shard.shape)
+    gathered_shape[gather_dim] *= world_size
+    gathered = torch.empty(
+        gathered_shape,
+        dtype=A_shard.dtype,
+        device=A_shard.device,
     )
+    mm_out = torch.empty(
+        _flashinfer_mm_output_shape(gathered, B),
+        dtype=resolved_out_dtype,
+        device=A_shard.device,
+    )
+    return gathered, mm_out
 
 
 def register_flashinfer_async_tp_ops() -> None:
