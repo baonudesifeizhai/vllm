@@ -214,6 +214,16 @@ def _parse_all_gather(
     return ag_input, dim, world_size, group_name
 
 
+def _parse_collective_group_name(
+    dim: object,
+    world_size: object,
+    group_name: object,
+) -> str | None:
+    if dim != 0 or not isinstance(world_size, int) or not isinstance(group_name, str):
+        return None
+    return group_name
+
+
 def _parse_bmm_fp8(
     node: fx.Node,
 ) -> tuple[fx.Node, fx.Node, object, object, object, object] | None:
@@ -278,17 +288,17 @@ def _is_qkv_split(node: fx.Node) -> bool:
     )
 
 
-def _branch_has_direct_qkv_split(node: fx.Node) -> bool:
-    return any(_is_qkv_split(user) for user in _walk_reachable_users(list(node.users)))
-
-
-def _branch_has_slice_scatter_qkv_split(node: fx.Node) -> bool:
-    return any(
+def _classify_qkv_branch(node: fx.Node) -> str | None:
+    if any(_is_qkv_split(user) for user in _walk_reachable_users(list(node.users))):
+        return "direct"
+    if any(
         saw_slice_scatter and _is_qkv_split(user)
         for user, saw_slice_scatter in _walk_reachable_users_with_slice_scatter_state(
             list(node.users)
         )
-    )
+    ):
+        return "rotary"
+    return None
 
 
 def _find_ag_qkv_replace_targets(bmm_node: fx.Node) -> list[fx.Node] | None:
@@ -303,14 +313,8 @@ def _find_ag_qkv_replace_targets(bmm_node: fx.Node) -> list[fx.Node] | None:
     if _node_shape(replace_targets[0]) != _node_shape(replace_targets[1]):
         return None
 
-    first_is_direct = _branch_has_direct_qkv_split(replace_targets[0])
-    second_is_direct = _branch_has_direct_qkv_split(replace_targets[1])
-    first_is_rotary = _branch_has_slice_scatter_qkv_split(replace_targets[0])
-    second_is_rotary = _branch_has_slice_scatter_qkv_split(replace_targets[1])
-
-    if first_is_direct and second_is_rotary:
-        return replace_targets
-    if second_is_direct and first_is_rotary:
+    branch_kinds = [_classify_qkv_branch(node) for node in replace_targets]
+    if set(branch_kinds) == {"direct", "rotary"}:
         return replace_targets
     return None
 
@@ -356,7 +360,8 @@ def match_bmm_rs(bmm_node: fx.Node) -> _FP8CollectiveGemmMatch | None:
         return None
 
     rs_node, dim, world_size, group_name = rs_match
-    if dim != 0 or not isinstance(world_size, int) or not isinstance(group_name, str):
+    parsed_group_name = _parse_collective_group_name(dim, world_size, group_name)
+    if parsed_group_name is None:
         return None
 
     return _FP8CollectiveGemmMatch(
@@ -366,7 +371,7 @@ def match_bmm_rs(bmm_node: fx.Node) -> _FP8CollectiveGemmMatch | None:
         a_scale=a_scale,
         b_scale=b_scale,
         out_dtype=out_dtype,
-        group_name=group_name,
+        group_name=parsed_group_name,
     )
 
 
@@ -382,7 +387,8 @@ def match_ag_bmm(bmm_node: fx.Node) -> _FP8CollectiveGemmMatch | None:
         return None
 
     ag_input, dim, world_size, group_name = parsed_ag
-    if dim != 0 or not isinstance(world_size, int) or not isinstance(group_name, str):
+    parsed_group_name = _parse_collective_group_name(dim, world_size, group_name)
+    if parsed_group_name is None:
         return None
 
     targets = _find_ag_replace_targets(bmm_node)
@@ -396,7 +402,7 @@ def match_ag_bmm(bmm_node: fx.Node) -> _FP8CollectiveGemmMatch | None:
         a_scale=a_scale,
         b_scale=b_scale,
         out_dtype=out_dtype,
-        group_name=group_name,
+        group_name=parsed_group_name,
     )
 
 

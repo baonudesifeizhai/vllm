@@ -124,6 +124,10 @@ def _resolve_out_dtype(
     return out_dtype or tensor.dtype
 
 
+def _resolve_world_size(group_name: str, group=None) -> int:
+    return group.world_size if group is not None else _get_group_world_size(group_name)
+
+
 def _allocate_mm_out(
     A: torch.Tensor, B: torch.Tensor, out_dtype: torch.dtype
 ) -> torch.Tensor:
@@ -282,6 +286,27 @@ def _fused_all_gather_flashinfer_scaled_matmul_functional(
     return A, mm_out
 
 
+def _fused_all_gather_flashinfer_scaled_matmul_compile(
+    A_shard: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    gather_dim: int,
+    group_name: str,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _fused_all_gather_flashinfer_scaled_matmul_functional(
+        A_shard,
+        B,
+        A_scale,
+        B_scale,
+        gather_dim,
+        _resolve_world_size(group_name),
+        group_name,
+        out_dtype,
+    )
+
+
 def _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -295,16 +320,34 @@ def _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
     return torch.ops.vllm.reduce_scatter(mm_out, 0, world_size, group_name)
 
 
+def _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    group_name: str,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        group_name,
+        _resolve_world_size(group_name),
+        out_dtype,
+    )
+
+
 def _fused_all_gather_flashinfer_scaled_matmul_one_shot(
     A_shard: torch.Tensor,
     B: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
     gather_dim: int,
-    group_name: str,
+    group,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    group = _require_group(group_name)
     A, mm_out = _allocate_all_gather_outputs(
         A_shard,
         B,
@@ -324,37 +367,14 @@ def _fused_all_gather_flashinfer_scaled_matmul_one_shot(
     return A, mm_out
 
 
-def _fused_all_gather_flashinfer_scaled_matmul_symbolic(
-    A_shard: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    gather_dim: int,
-    group_name: str,
-    out_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return _fused_all_gather_flashinfer_scaled_matmul_functional(
-        A_shard,
-        B,
-        A_scale,
-        B_scale,
-        gather_dim,
-        _require_group(group_name).world_size,
-        group_name,
-        out_dtype,
-    )
-
-
 def _fused_all_gather_flashinfer_scaled_matmul_overlap(
     A_shard: torch.Tensor,
     B: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
-    group_name: str,
+    group,
     out_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    group = _require_group(group_name)
-
     chunk_local_rows = min(_AG_OVERLAP_LOCAL_ROWS, A_shard.shape[0])
     chunks = _iter_ag_chunk_slices(
         A_shard.shape[0],
@@ -368,7 +388,7 @@ def _fused_all_gather_flashinfer_scaled_matmul_overlap(
             A_scale,
             B_scale,
             0,
-            group_name,
+            group,
             out_dtype,
         )
 
@@ -424,10 +444,9 @@ def _fused_flashinfer_scaled_matmul_reduce_scatter_one_shot(
     B: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
-    group_name: str,
+    group,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    group = _require_group(group_name)
     output, mm_output_shape = _allocate_reduce_scatter_output(
         A,
         B,
@@ -447,35 +466,14 @@ def _fused_flashinfer_scaled_matmul_reduce_scatter_one_shot(
     return output
 
 
-def _fused_flashinfer_scaled_matmul_reduce_scatter_symbolic(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    group_name: str,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    return _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
-        A,
-        B,
-        A_scale,
-        B_scale,
-        group_name,
-        _require_group(group_name).world_size,
-        out_dtype,
-    )
-
-
 def _fused_flashinfer_scaled_matmul_reduce_scatter_overlap(
     A: torch.Tensor,
     B: torch.Tensor,
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
-    group_name: str,
+    group,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    group = _require_group(group_name)
-
     chunk_output_rows = min(_RS_OVERLAP_OUTPUT_ROWS, A.shape[0] // group.world_size)
     chunks = _iter_rs_chunk_slices(A.shape[0], group.world_size, chunk_output_rows)
     if len(chunks) < 2:
@@ -484,7 +482,7 @@ def _fused_flashinfer_scaled_matmul_reduce_scatter_overlap(
             B,
             A_scale,
             B_scale,
-            group_name,
+            group,
             out_dtype,
         )
 
@@ -560,10 +558,9 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
             "FlashInfer fused matmul+reduce_scatter currently expects scatter dim 0."
         )
 
-    group = _require_group(group_name)
     out_dtype = _resolve_out_dtype(A, out_dtype)
     if _has_symbolic_shape(A) or _has_symbolic_shape(B):
-        return _fused_flashinfer_scaled_matmul_reduce_scatter_symbolic(
+        return _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
             A,
             B,
             A_scale,
@@ -571,13 +568,14 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
             group_name,
             out_dtype,
         )
+    group = _require_group(group_name)
     if _should_use_rs_overlap(A, group.world_size):
         return _fused_flashinfer_scaled_matmul_reduce_scatter_overlap(
             A,
             B,
             A_scale,
             B_scale,
-            group_name,
+            group,
             out_dtype,
         )
     return _fused_flashinfer_scaled_matmul_reduce_scatter_one_shot(
@@ -585,7 +583,7 @@ def fused_flashinfer_scaled_matmul_reduce_scatter(
         B,
         A_scale,
         B_scale,
-        group_name,
+        group,
         out_dtype,
     )
 
@@ -601,13 +599,12 @@ def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    return _fused_flashinfer_scaled_matmul_reduce_scatter_functional(
+    return _fused_flashinfer_scaled_matmul_reduce_scatter_compile(
         A.flatten(0, -2).contiguous(),
         B,
         A_scale,
         B_scale,
         group_name,
-        _get_group_world_size(group_name),
         out_dtype,
     )
 
@@ -628,7 +625,7 @@ def fused_all_gather_flashinfer_scaled_matmul(
 
     out_dtype = _resolve_out_dtype(A_shard, out_dtype)
     if _has_symbolic_shape(A_shard) or _has_symbolic_shape(B):
-        return _fused_all_gather_flashinfer_scaled_matmul_symbolic(
+        return _fused_all_gather_flashinfer_scaled_matmul_compile(
             A_shard,
             B,
             A_scale,
@@ -637,13 +634,14 @@ def fused_all_gather_flashinfer_scaled_matmul(
             group_name,
             out_dtype,
         )
+    group = _require_group(group_name)
     if _should_use_ag_overlap(A_shard, gather_dim):
         return _fused_all_gather_flashinfer_scaled_matmul_overlap(
             A_shard,
             B,
             A_scale,
             B_scale,
-            group_name,
+            group,
             out_dtype,
         )
     return _fused_all_gather_flashinfer_scaled_matmul_one_shot(
@@ -652,7 +650,7 @@ def fused_all_gather_flashinfer_scaled_matmul(
         A_scale,
         B_scale,
         gather_dim,
-        group_name,
+        group,
         out_dtype,
     )
 
@@ -666,13 +664,12 @@ def fused_all_gather_flashinfer_scaled_matmul_fake(
     group_name: str,
     out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return _fused_all_gather_flashinfer_scaled_matmul_functional(
+    return _fused_all_gather_flashinfer_scaled_matmul_compile(
         A_shard,
         B,
         A_scale,
         B_scale,
         gather_dim,
-        _get_group_world_size(group_name),
         group_name,
         _resolve_out_dtype(A_shard, out_dtype),
     )
