@@ -347,11 +347,7 @@ class InternS1MultiModalProcessor(BaseMultiModalProcessor[InternS1ProcessingInfo
 
         hf_processor = self.info.get_hf_processor(**mm_kwargs)
         tokenizer = hf_processor.tokenizer
-        video_token_id = tokenizer.encode(
-            hf_processor.video_token, add_special_tokens=False
-        )
-        assert len(video_token_id) == 1
-        video_token_id = video_token_id[0]
+        video_token_id = None
 
         prompt = re.sub(hf_processor.image_token, "<image_placeholder>", prompt)
         prompt = re.sub(hf_processor.video_token, "<video_placeholder>", prompt)
@@ -381,6 +377,11 @@ class InternS1MultiModalProcessor(BaseMultiModalProcessor[InternS1ProcessingInfo
 
         video_outputs = {}
         if videos:
+            video_token_ids = tokenizer.encode(
+                hf_processor.video_token, add_special_tokens=False
+            )
+            assert len(video_token_ids) == 1
+            video_token_id = video_token_ids[0]
             video_pixel_values = []
             for video in videos:
                 processed_outputs = super()._call_hf_processor(
@@ -509,14 +510,47 @@ class InternS1MultiModalProcessor(BaseMultiModalProcessor[InternS1ProcessingInfo
 class InternS1ForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA
 ):
-    # To ensure correct weight loading and mapping.
+    # Support both the official InternVL checkpoint layout and the legacy
+    # OpenGVLab InternVL2-style keys used by our local HF conversion flow.
     hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_regex={
+            re.compile(
+                r"^vision_model\.embeddings\.position_embedding$"
+            ): "vision_tower.embeddings.position_embeddings",
+        },
+        orig_to_new_substr={
+            ".encoder.layers.": ".encoder.layer.",
+            ".post.attn.layernorm.": ".post_attention_layernorm.",
+            ".attn.proj.": ".attention.projection_layer.",
+            ".attn.": ".attention.",
+            ".norm1.": ".layernorm_before.",
+            ".norm2.": ".layernorm_after.",
+            ".ls1": ".lambda_1",
+            ".ls2": ".lambda_2",
+            ".class_embedding": ".cls_token",
+            ".patch_embedding.": ".patch_embeddings.projection.",
+            ".attention.wo.": ".self_attn.o_proj.",
+            ".feed_forward.w1.": ".mlp.gate_proj.",
+            ".feed_forward.w2.": ".mlp.down_proj.",
+            ".feed_forward.w3.": ".mlp.up_proj.",
+            ".attention_norm.": ".input_layernorm.",
+        },
         orig_to_new_prefix={
             "lm_head.": "language_model.lm_head.",
+            "language_model.lm_head.": "language_model.lm_head.",
+            "language_model.output.": "language_model.lm_head.",
+            "language_model.model.tok_embeddings.": (
+                "language_model.model.embed_tokens."
+            ),
+            "model.language_model.model.": "language_model.model.",
             "model.language_model.": "language_model.model.",
             "model.vision_tower.": "vision_tower.",
             "model.multi_modal_projector.": "multi_modal_projector.",
-        }
+            "mlp1.0.": "multi_modal_projector.layer_norm.",
+            "mlp1.1.": "multi_modal_projector.linear_1.",
+            "mlp1.3.": "multi_modal_projector.linear_2.",
+            "vision_model.": "vision_tower.",
+        },
     )
 
     @classmethod
