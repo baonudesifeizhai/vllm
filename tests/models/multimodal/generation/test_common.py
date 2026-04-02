@@ -516,6 +516,7 @@ VLM_TEST_SETTINGS = {
         multi_image_prompt="Image-1: <image>\nImage-2: <image>\nDescribe the two images in short.",  # noqa: E501
         max_model_len=4096,
         use_tokenizer_eos=True,
+        auto_cls=AutoModelForImageTextToText,
         patch_hf_runner=model_utils.internvl_patch_hf_runner,
     ),
     "intern_vl-video": VLMTestInfo(
@@ -527,6 +528,7 @@ VLM_TEST_SETTINGS = {
         video_idx_to_prompt=lambda idx: "<video>",
         max_model_len=8192,
         use_tokenizer_eos=True,
+        auto_cls=AutoModelForImageTextToText,
         patch_hf_runner=model_utils.internvl_patch_hf_runner,
         num_logprobs=10 if current_platform.is_rocm() else 5,
     ),

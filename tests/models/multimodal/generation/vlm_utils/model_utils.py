@@ -799,21 +799,51 @@ def skyworkr1v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
 def internvl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     """Patches and returns an instance of the HfRunner to use for InternVL."""
 
+    def _resolve_square_size(value: int | tuple[int, int], *, name: str) -> int:
+        if isinstance(value, int):
+            return value
+
+        if len(value) != 2:
+            raise TypeError(f"{name} must be an int or a pair of ints, got {value!r}")
+
+        height, width = int(value[0]), int(value[1])
+        if height != width:
+            raise ValueError(
+                f"{name} must be square for InternVL tests, got {(height, width)!r}"
+            )
+
+        return height
+
+    def _compute_num_image_token(config) -> int:
+        image_size = _resolve_square_size(
+            config.vision_config.image_size, name="vision_config.image_size"
+        )
+        patch_size = _resolve_square_size(
+            config.vision_config.patch_size, name="vision_config.patch_size"
+        )
+        patch_tokens = (image_size // patch_size) ** 2
+        return int(patch_tokens * (config.downsample_ratio**2))
+
     class InternVLProcessor:
         """A simple processor for InternVL2 which misses a processor."""
 
         def __init__(self, hf_runner: HfRunner):
-            self.num_image_token = hf_runner.model.num_image_token
-            self.tokenizer = hf_runner.tokenizer
-
             self.config = AutoConfig.from_pretrained(
                 hf_runner.model_name, trust_remote_code=True
             )
+            self.num_image_token = getattr(
+                hf_runner.model,
+                "num_image_token",
+                _compute_num_image_token(self.config),
+            )
+            self.tokenizer = hf_runner.tokenizer
             self.vision_config = self.config.vision_config
             self.use_thumbnail = self.config.use_thumbnail
             self.min_num = self.config.min_dynamic_patch
             self.max_num = self.config.max_dynamic_patch
-            self.image_size = self.vision_config.image_size
+            self.image_size = _resolve_square_size(
+                self.vision_config.image_size, name="vision_config.image_size"
+            )
 
         def __call__(
             self,
@@ -895,13 +925,15 @@ def internvl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
             prompt.update({"pixel_values": pixel_values})
             return prompt
 
-    img_context_token_id = hf_model.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
-    hf_model.model.img_context_token_id = img_context_token_id
     hf_model.processor = InternVLProcessor(hf_model)
-    hf_model.model.get_output_embeddings = (
-        lambda: hf_model.model.language_model.get_output_embeddings()
-    )
-    hf_model.model.generate = types.MethodType(_internvl_generate, hf_model.model)
+    if hasattr(hf_model.model, "extract_feature"):
+        img_context_token_id = hf_model.tokenizer.convert_tokens_to_ids("<IMG_CONTEXT>")
+        hf_model.model.img_context_token_id = img_context_token_id
+        hf_model.model.get_output_embeddings = (
+            lambda: hf_model.model.language_model.get_output_embeddings()
+        )
+        hf_model.model.generate = types.MethodType(_internvl_generate, hf_model.model)
+
     return hf_model
 
 

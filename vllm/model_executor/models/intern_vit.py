@@ -46,13 +46,24 @@ NORM2FN = {
 }
 
 
+def _resolve_hw(value: int | Iterable[int], *, name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        return value, value
+
+    value = tuple(value)
+    if len(value) != 2:
+        raise TypeError(f"{name} must be an int or a pair of ints, got {value!r}")
+
+    return int(value[0]), int(value[1])
+
+
 class InternVisionEmbeddings(nn.Module):
     def __init__(self, config: PretrainedConfig):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
+        self.image_size = _resolve_hw(config.image_size, name="image_size")
+        self.patch_size = _resolve_hw(config.patch_size, name="patch_size")
 
         self.class_embedding = nn.Parameter(torch.randn(1, 1, self.embed_dim))
 
@@ -63,7 +74,11 @@ class InternVisionEmbeddings(nn.Module):
             stride=self.patch_size,
         )
 
-        self.num_patches = (self.image_size // self.patch_size) ** 2
+        self.grid_size = tuple(
+            image_dim // patch_dim
+            for image_dim, patch_dim in zip(self.image_size, self.patch_size)
+        )
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
         self.num_positions = self.num_patches + 1
 
         self.position_embedding = nn.Parameter(
@@ -76,8 +91,8 @@ class InternVisionEmbeddings(nn.Module):
             pos_embed.float()
             .reshape(
                 1,
-                self.image_size // self.patch_size,
-                self.image_size // self.patch_size,
+                self.grid_size[0],
+                self.grid_size[1],
                 -1,
             )
             .permute(0, 3, 1, 2)

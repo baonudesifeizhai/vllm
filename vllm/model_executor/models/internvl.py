@@ -122,6 +122,33 @@ class InternVLVideoEmbeddingInputs(TensorSchema):
 InternVLVideoInputs: TypeAlias = InternVLVideoPixelInputs | InternVLVideoEmbeddingInputs
 
 
+def _resolve_hw(value: int | Sequence[int], *, name: str) -> tuple[int, int]:
+    if isinstance(value, int):
+        return value, value
+
+    if len(value) != 2:
+        raise TypeError(f"{name} must be an int or a pair of ints, got {value!r}")
+
+    return int(value[0]), int(value[1])
+
+
+def _resolve_square_size(value: int | Sequence[int], *, name: str) -> int:
+    height, width = _resolve_hw(value, name=name)
+    if height != width:
+        raise ValueError(f"{name} must be square for InternVL, got {(height, width)!r}")
+
+    return height
+
+
+def _get_num_patches(
+    image_size: int | Sequence[int],
+    patch_size: int | Sequence[int],
+) -> int:
+    image_height, image_width = _resolve_hw(image_size, name="image_size")
+    patch_height, patch_width = _resolve_hw(patch_size, name="patch_size")
+    return (image_height // patch_height) * (image_width // patch_width)
+
+
 class BaseInternVLProcessingInfo(BaseProcessingInfo):
     """Basic image-only ProcessingInfo for InternVL-style models."""
 
@@ -326,6 +353,9 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
 
         kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
         kwargs.setdefault("image_size", vision_config.image_size)
+        kwargs["image_size"] = _resolve_square_size(
+            kwargs["image_size"], name="image_size"
+        )
         kwargs.setdefault("min_dynamic_patch", config.min_dynamic_patch)
         kwargs.setdefault("max_dynamic_patch", config.max_dynamic_patch)
         kwargs.setdefault("dynamic_image_size", config.dynamic_image_size)
@@ -339,6 +369,9 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
 
         kwargs = self.ctx.get_merged_mm_kwargs(kwargs)
         kwargs.setdefault("image_size", vision_config.image_size)
+        kwargs["image_size"] = _resolve_square_size(
+            kwargs["image_size"], name="image_size"
+        )
 
         return InternVLVideoProcessor(**kwargs)
 
@@ -369,7 +402,9 @@ class InternVLProcessingInfo(BaseInternVLProcessingInfo):
         image_size = image_processor.image_size
         patch_size = vision_config.patch_size
         downsample_ratio = config.downsample_ratio
-        image_seq_length = int((image_size // patch_size) ** 2 * (downsample_ratio**2))
+        image_seq_length = int(
+            _get_num_patches(image_size, patch_size) * (downsample_ratio**2)
+        )
 
         ctx_video_token = self.ctx_video_token
         video_processor = (
@@ -425,7 +460,9 @@ class InternVLDummyInputsBuilder(
         dummy_image = super().get_dummy_mm_data(seq_len, mm_counts, mm_options)
         if self.info.ctx_video_token:
             config = self.info.get_hf_config()
-            image_size: int = config.vision_config.image_size
+            image_size = _resolve_square_size(
+                config.vision_config.image_size, name="vision_config.image_size"
+            )
             target_num_frames = self.info.get_num_frames_with_most_features(
                 seq_len, mm_counts
             )
@@ -568,7 +605,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         image_size = config.force_image_size or config.vision_config.image_size
         patch_size = config.vision_config.patch_size
         self.patch_size = patch_size
-        self.patch_tokens = (image_size // patch_size) ** 2
+        self.patch_tokens = _get_num_patches(image_size, patch_size)
         self.num_image_token = int(self.patch_tokens * (config.downsample_ratio**2))
         self.downsample_ratio = config.downsample_ratio
         self.ps_version = config.ps_version
@@ -705,7 +742,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         self.img_context_token_id = image_token_id
 
         if pixel_values_flat is not None:
-            expected_h = expected_w = self.config.vision_config.image_size
+            expected_h, expected_w = _resolve_hw(
+                self.config.vision_config.image_size,
+                name="vision_config.image_size",
+            )
             resolve_bindings = {"h": expected_h, "w": expected_w}
 
             return InternVLImagePixelInputs(
@@ -741,7 +781,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP, SupportsLoRA)
         self.video_context_token_id = video_token_id
 
         if pixel_values_flat_video is not None:
-            expected_h = expected_w = self.config.vision_config.image_size
+            expected_h, expected_w = _resolve_hw(
+                self.config.vision_config.image_size,
+                name="vision_config.image_size",
+            )
             resolve_bindings = {"h": expected_h, "w": expected_w}
 
             return InternVLVideoPixelInputs(
