@@ -291,18 +291,6 @@ void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs,
                      int64_t buffer_bytes);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>>
 get_graph_buffer_ipc_meta(fptr_t _fa);
-
-torch::Tensor fused_bmm_fp8_reduce_scatter(
-    const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& a_scale, const torch::Tensor& b_scale,
-    at::ScalarType out_dtype, fptr_t custom_ar_ptr, fptr_t reg_buffer,
-    int64_t reg_buffer_sz_bytes, int64_t rank, int64_t world_size);
-
-torch::Tensor fused_all_gather_bmm_fp8(
-    const torch::Tensor& a, const torch::Tensor& b,
-    const torch::Tensor& a_scale, const torch::Tensor& b_scale,
-    at::ScalarType out_dtype, fptr_t custom_ar_ptr, fptr_t reg_buffer,
-    int64_t reg_buffer_sz_bytes, int64_t rank, int64_t world_size);
 void register_graph_buffers(fptr_t _fa,
                             const std::vector<std::vector<int64_t>>& handles,
                             const std::vector<std::vector<int64_t>>& offsets);

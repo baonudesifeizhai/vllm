@@ -381,25 +381,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       " -> ()");
   // conditionally compiled so impl registration is in source file
 
-  // Fused all_gather + FP8 BMM for Blackwell AsyncTP.
-  ops.def(
-      "fused_all_gather_bmm_fp8("
-      "    Tensor a, Tensor b, Tensor a_scale, Tensor b_scale,"
-      "    ScalarType out_dtype, int custom_ar_ptr, int reg_buffer,"
-      "    int reg_buffer_sz_bytes, int rank, int world_size"
-      ") -> Tensor");
-  ops.impl("fused_all_gather_bmm_fp8", torch::kCUDA, &fused_all_gather_bmm_fp8);
-
-  // Fused FP8 BMM + reduce_scatter for Blackwell AsyncTP.
-  ops.def(
-      "fused_bmm_fp8_reduce_scatter("
-      "    Tensor a, Tensor b, Tensor a_scale, Tensor b_scale,"
-      "    ScalarType out_dtype, int custom_ar_ptr, int reg_buffer,"
-      "    int reg_buffer_sz_bytes, int rank, int world_size"
-      ") -> Tensor");
-  ops.impl("fused_bmm_fp8_reduce_scatter", torch::kCUDA,
-           &fused_bmm_fp8_reduce_scatter);
-
   // Expert-specialization mxfp8 blockscaled grouped GEMM (SM100+).
   ops.def(
       "cutlass_mxfp8_grouped_mm("

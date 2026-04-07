@@ -43,6 +43,7 @@ import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
 
 import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -65,6 +66,24 @@ if TYPE_CHECKING:
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+
+
+@dataclass
+class _PythonFusedAGWorkspace:
+    comm_stream: torch.cuda.Stream
+    compute_stream: torch.cuda.Stream
+    gather_done: tuple[torch.cuda.Event, torch.cuda.Event]
+    compute_done: tuple[torch.cuda.Event, torch.cuda.Event]
+    gathered_slots: tuple[torch.Tensor, torch.Tensor]
+
+
+@dataclass
+class _PythonFusedRSWorkspace:
+    comm_stream: torch.cuda.Stream
+    compute_stream: torch.cuda.Stream
+    gemm_done: tuple[torch.cuda.Event, torch.cuda.Event]
+    rs_done: tuple[torch.cuda.Event, torch.cuda.Event]
+    reduced_slots: tuple[torch.Tensor, torch.Tensor]
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -121,10 +140,97 @@ def _get_unique_name(name: str) -> str:
 
 
 _groups: dict[str, Callable[[], "GroupCoordinator | None"]] = {}
+_PYTHON_FUSED_AG_WORKSPACES: dict[tuple[Any, ...], _PythonFusedAGWorkspace] = {}
+_PYTHON_FUSED_RS_WORKSPACES: dict[tuple[Any, ...], _PythonFusedRSWorkspace] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
     _groups[group.unique_name] = weakref.ref(group)
+
+
+def _select_double_buffer_chunk_rows(
+    buffer_bytes: int,
+    bytes_per_row: int,
+    max_rows: int,
+    world_size: int = 1,
+    align_to_world_size: bool = False,
+) -> int:
+    if buffer_bytes <= 0 or bytes_per_row <= 0 or max_rows <= 0:
+        return 0
+    slot_bytes = buffer_bytes // 2
+    rows = slot_bytes // bytes_per_row
+    if align_to_world_size and world_size > 1:
+        rows = (rows // world_size) * world_size
+    return min(rows, max_rows)
+
+
+def _get_python_fused_ag_workspace(
+    *,
+    device: torch.device,
+    k: int,
+    chunk_rows: int,
+    world_size: int,
+    input_dtype: torch.dtype,
+) -> _PythonFusedAGWorkspace:
+    key = (device.type, device.index, k, chunk_rows, world_size, input_dtype)
+    ws = _PYTHON_FUSED_AG_WORKSPACES.get(key)
+    if ws is not None:
+        return ws
+
+    gathered_shape = (chunk_rows * world_size, k)
+    gathered_slots = (
+        torch.empty(gathered_shape, dtype=input_dtype, device=device),
+        torch.empty(gathered_shape, dtype=input_dtype, device=device),
+    )
+    ws = _PythonFusedAGWorkspace(
+        comm_stream=torch.cuda.Stream(device=device),
+        compute_stream=torch.cuda.Stream(device=device),
+        gather_done=(
+            torch.cuda.Event(enable_timing=False),
+            torch.cuda.Event(enable_timing=False),
+        ),
+        compute_done=(
+            torch.cuda.Event(enable_timing=False),
+            torch.cuda.Event(enable_timing=False),
+        ),
+        gathered_slots=gathered_slots,
+    )
+    _PYTHON_FUSED_AG_WORKSPACES[key] = ws
+    return ws
+
+
+def _get_python_fused_rs_workspace(
+    *,
+    device: torch.device,
+    n: int,
+    chunk_rows: int,
+    out_dtype: torch.dtype,
+) -> _PythonFusedRSWorkspace:
+    key = (device.type, device.index, n, chunk_rows, out_dtype)
+    ws = _PYTHON_FUSED_RS_WORKSPACES.get(key)
+    if ws is not None:
+        return ws
+
+    reduced_shape = (chunk_rows, n)
+    reduced_slots = (
+        torch.empty(reduced_shape, dtype=out_dtype, device=device),
+        torch.empty(reduced_shape, dtype=out_dtype, device=device),
+    )
+    ws = _PythonFusedRSWorkspace(
+        comm_stream=torch.cuda.Stream(device=device),
+        compute_stream=torch.cuda.Stream(device=device),
+        gemm_done=(
+            torch.cuda.Event(enable_timing=False),
+            torch.cuda.Event(enable_timing=False),
+        ),
+        rs_done=(
+            torch.cuda.Event(enable_timing=False),
+            torch.cuda.Event(enable_timing=False),
+        ),
+        reduced_slots=reduced_slots,
+    )
+    _PYTHON_FUSED_RS_WORKSPACES[key] = ws
+    return ws
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -337,6 +443,92 @@ def _fallback_all_gather_bmm_fp8(
     return bmm_out.view(ag_out.shape[0], B.shape[1])
 
 
+def _python_fused_all_gather_bmm_fp8(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    backend: str,
+    *,
+    custom_ar_ptr: int,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    world_size: int,
+) -> torch.Tensor:
+    m, k = A.shape
+    n = B.shape[1]
+    bytes_per_input_row = k * A.element_size()
+    chunk_rows = _select_double_buffer_chunk_rows(
+        reg_buffer_sz_bytes, bytes_per_input_row, m
+    )
+    if chunk_rows <= 0:
+        raise RuntimeError("reg_buffer is too small for Python fused all_gather")
+
+    ws = _get_python_fused_ag_workspace(
+        device=A.device,
+        k=k,
+        chunk_rows=chunk_rows,
+        world_size=world_size,
+        input_dtype=A.dtype,
+    )
+    out = torch.empty((m * world_size, n), dtype=out_dtype, device=A.device)
+    slot_bytes = chunk_rows * bytes_per_input_row
+    caller_stream = torch.cuda.current_stream(device=A.device)
+    ws.comm_stream.wait_stream(caller_stream)
+    ws.compute_stream.wait_stream(caller_stream)
+
+    num_tiles = (m + chunk_rows - 1) // chunk_rows
+
+    def enqueue_gather(tile_idx: int) -> None:
+        slot = tile_idx % 2
+        row_start = tile_idx * chunk_rows
+        rows = min(chunk_rows, m - row_start)
+        reg_buffer_slot = reg_buffer + slot * slot_bytes
+        gathered_chunk = ws.gathered_slots[slot].narrow(0, 0, rows * world_size)
+        if tile_idx >= 2:
+            ws.comm_stream.wait_event(ws.compute_done[slot])
+        with torch.cuda.stream(ws.comm_stream):
+            ops.all_gather(
+                custom_ar_ptr,
+                A.narrow(0, row_start, rows),
+                gathered_chunk,
+                reg_buffer_slot,
+                rows * bytes_per_input_row,
+            )
+            ws.gather_done[slot].record(ws.comm_stream)
+
+    enqueue_gather(0)
+
+    for tile_idx in range(num_tiles):
+        slot = tile_idx % 2
+        row_start = tile_idx * chunk_rows
+        rows = min(chunk_rows, m - row_start)
+        gathered_chunk = ws.gathered_slots[slot].narrow(0, 0, rows * world_size)
+
+        with torch.cuda.stream(ws.compute_stream):
+            ws.compute_stream.wait_event(ws.gather_done[slot])
+            mm_chunk = torch.ops.vllm.bmm_fp8.default(
+                gathered_chunk.unsqueeze(0),
+                B.unsqueeze(0),
+                A_scale,
+                B_scale,
+                out_dtype,
+                backend,
+            ).view(rows * world_size, n)
+            for peer in range(world_size):
+                src_rows = mm_chunk.narrow(0, peer * rows, rows)
+                dst_rows = out.narrow(0, peer * m + row_start, rows)
+                dst_rows.copy_(src_rows, non_blocking=True)
+            ws.compute_done[slot].record(ws.compute_stream)
+
+        if tile_idx + 1 < num_tiles:
+            enqueue_gather(tile_idx + 1)
+
+    caller_stream.wait_event(ws.compute_done[(num_tiles - 1) % 2])
+    return out
+
+
 def fused_all_gather_bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -354,9 +546,7 @@ def fused_all_gather_bmm_fp8(
     world_size = group.world_size
 
     if (
-        not hasattr(torch.ops, "_C")
-        or not hasattr(torch.ops._C, "fused_all_gather_bmm_fp8")
-        or A.ndim != 2
+        A.ndim != 2
         or B.ndim != 2
         or A.shape[1] != B.shape[0]
         or A_scale.numel() != 1
@@ -381,23 +571,28 @@ def fused_all_gather_bmm_fp8(
 
     reg_buffer = ca_comm.buffer_ptrs[rank]
     reg_buffer_sz_bytes = ca_comm.max_size
-    a_bytes = A.numel() * A.element_size()
-    if reg_buffer_sz_bytes < a_bytes:
+    bytes_per_input_row = A.shape[1] * A.element_size()
+    if (
+        _select_double_buffer_chunk_rows(
+            reg_buffer_sz_bytes, bytes_per_input_row, A.shape[0]
+        )
+        <= 0
+    ):
         return _fallback_all_gather_bmm_fp8(
             A, B, A_scale, B_scale, out_dtype, backend, group
         )
 
-    return torch.ops._C.fused_all_gather_bmm_fp8(
+    return _python_fused_all_gather_bmm_fp8(
         A,
         B,
         A_scale,
         B_scale,
         out_dtype,
-        ca_comm._ptr,
-        reg_buffer,
-        reg_buffer_sz_bytes,
-        rank,
-        world_size,
+        backend,
+        custom_ar_ptr=ca_comm._ptr,
+        reg_buffer=reg_buffer,
+        reg_buffer_sz_bytes=reg_buffer_sz_bytes,
+        world_size=world_size,
     )
 
 
@@ -415,6 +610,130 @@ def _fallback_bmm_fp8_reduce_scatter(
     )
     mm_out = bmm_out.view(A.shape[0], B.shape[1])
     return group._reduce_scatter_out_place(mm_out, 0)
+
+
+def _python_fused_bmm_fp8_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    backend: str,
+    *,
+    custom_ar_ptr: int,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    m = A.shape[0]
+    n = B.shape[1]
+    elem_size = torch.empty((), dtype=out_dtype, device=A.device).element_size()
+    bytes_per_row = n * elem_size
+    chunk_rows = _select_double_buffer_chunk_rows(
+        reg_buffer_sz_bytes,
+        bytes_per_row,
+        m,
+        world_size=world_size,
+        align_to_world_size=True,
+    )
+    if chunk_rows <= 0:
+        raise RuntimeError("reg_buffer is too small for Python fused reduce_scatter")
+
+    ws = _get_python_fused_rs_workspace(
+        device=A.device,
+        n=n,
+        chunk_rows=chunk_rows,
+        out_dtype=out_dtype,
+    )
+    out = torch.empty((m // world_size, n), dtype=out_dtype, device=A.device)
+    slot_bytes = chunk_rows * bytes_per_row
+    caller_stream = torch.cuda.current_stream(device=A.device)
+    ws.comm_stream.wait_stream(caller_stream)
+    ws.compute_stream.wait_stream(caller_stream)
+
+    owned_rows = m // world_size
+    owned_start = rank * owned_rows
+    owned_end = owned_start + owned_rows
+    temp_slots: list[torch.Tensor | None] = [None, None]
+    tile_idx = 0
+
+    for row_start in range(0, m, chunk_rows):
+        slot = tile_idx % 2
+        rows = min(chunk_rows, m - row_start)
+        if tile_idx >= 2:
+            ws.compute_stream.wait_event(ws.rs_done[slot])
+
+        with torch.cuda.stream(ws.compute_stream):
+            temp_slots[slot] = torch.ops.vllm.bmm_fp8.default(
+                A.narrow(0, row_start, rows).unsqueeze(0),
+                B.unsqueeze(0),
+                A_scale,
+                B_scale,
+                out_dtype,
+                backend,
+            ).view(rows, n)
+            ws.gemm_done[slot].record(ws.compute_stream)
+
+        if tile_idx > 0:
+            prev_slot = (tile_idx - 1) % 2
+            prev_row_start = row_start - chunk_rows
+            prev_rows = min(chunk_rows, m - prev_row_start)
+            prev_temp_chunk = temp_slots[prev_slot]
+            assert prev_temp_chunk is not None
+            prev_reduced_chunk = ws.reduced_slots[prev_slot].narrow(0, 0, prev_rows)
+            reg_buffer_slot = reg_buffer + prev_slot * slot_bytes
+            with torch.cuda.stream(ws.comm_stream):
+                ws.comm_stream.wait_event(ws.gemm_done[prev_slot])
+                ops.all_reduce(
+                    custom_ar_ptr,
+                    prev_temp_chunk,
+                    prev_reduced_chunk,
+                    reg_buffer_slot,
+                    prev_rows * bytes_per_row,
+                )
+                copy_start = max(prev_row_start, owned_start)
+                copy_end = min(prev_row_start + prev_rows, owned_end)
+                if copy_start < copy_end:
+                    copy_rows = copy_end - copy_start
+                    src_offset = copy_start - prev_row_start
+                    dst_offset = copy_start - owned_start
+                    src_chunk = prev_reduced_chunk.narrow(0, src_offset, copy_rows)
+                    dst_chunk = out.narrow(0, dst_offset, copy_rows)
+                    dst_chunk.copy_(src_chunk, non_blocking=True)
+                ws.rs_done[prev_slot].record(ws.comm_stream)
+
+        tile_idx += 1
+
+    last_slot = (tile_idx - 1) % 2
+    last_row_start = (tile_idx - 1) * chunk_rows
+    last_rows = min(chunk_rows, m - last_row_start)
+    last_temp_chunk = temp_slots[last_slot]
+    assert last_temp_chunk is not None
+    last_reduced_chunk = ws.reduced_slots[last_slot].narrow(0, 0, last_rows)
+    reg_buffer_slot = reg_buffer + last_slot * slot_bytes
+    with torch.cuda.stream(ws.comm_stream):
+        ws.comm_stream.wait_event(ws.gemm_done[last_slot])
+        ops.all_reduce(
+            custom_ar_ptr,
+            last_temp_chunk,
+            last_reduced_chunk,
+            reg_buffer_slot,
+            last_rows * bytes_per_row,
+        )
+        copy_start = max(last_row_start, owned_start)
+        copy_end = min(last_row_start + last_rows, owned_end)
+        if copy_start < copy_end:
+            copy_rows = copy_end - copy_start
+            src_offset = copy_start - last_row_start
+            dst_offset = copy_start - owned_start
+            src_chunk = last_reduced_chunk.narrow(0, src_offset, copy_rows)
+            dst_chunk = out.narrow(0, dst_offset, copy_rows)
+            dst_chunk.copy_(src_chunk, non_blocking=True)
+        ws.rs_done[last_slot].record(ws.comm_stream)
+
+    caller_stream.wait_event(ws.rs_done[last_slot])
+    return out
 
 
 def fused_bmm_fp8_reduce_scatter(
@@ -461,22 +780,32 @@ def fused_bmm_fp8_reduce_scatter(
     reg_buffer = ca_comm.buffer_ptrs[rank]
     reg_buffer_sz_bytes = ca_comm.max_size
     row_bytes = B.shape[1] * torch.empty((), dtype=out_dtype).element_size()
-    if reg_buffer_sz_bytes < row_bytes * world_size:
+    if (
+        _select_double_buffer_chunk_rows(
+            reg_buffer_sz_bytes,
+            row_bytes,
+            A.shape[0],
+            world_size=world_size,
+            align_to_world_size=True,
+        )
+        <= 0
+    ):
         return _fallback_bmm_fp8_reduce_scatter(
             A, B, A_scale, B_scale, out_dtype, backend, group
         )
 
-    return torch.ops._C.fused_bmm_fp8_reduce_scatter(
+    return _python_fused_bmm_fp8_reduce_scatter(
         A,
         B,
         A_scale,
         B_scale,
         out_dtype,
-        ca_comm._ptr,
-        reg_buffer,
-        reg_buffer_sz_bytes,
-        rank,
-        world_size,
+        backend,
+        custom_ar_ptr=ca_comm._ptr,
+        reg_buffer=reg_buffer,
+        reg_buffer_sz_bytes=reg_buffer_sz_bytes,
+        rank=rank,
+        world_size=world_size,
     )
 
 
