@@ -143,9 +143,6 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 if self.pass_config.fuse_gemm_comms:
                     self.passes += [AsyncTPPass(config)]
 
-            if self.pass_config.fuse_allreduce_rms:
-                self.passes += [AllReduceFusionPass(config)]
-
             if self.pass_config.fuse_minimax_qk_norm:
                 self.passes += [MiniMaxQKNormPass(config)]
 
