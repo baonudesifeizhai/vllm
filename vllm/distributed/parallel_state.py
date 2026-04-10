@@ -51,6 +51,7 @@ from vllm.distributed.utils import (
     get_cached_tcp_store_client,
 )
 from vllm.logger import init_logger
+from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm_out
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
@@ -259,6 +260,270 @@ def patched_fused_scaled_matmul_reduce_scatter(
     )
 
 
+def _get_fake_collective_world_size(group_name: str) -> int:
+    group_ref = _groups.get(group_name)
+    if group_ref is not None:
+        group = group_ref()
+        if group is not None:
+            return group.world_size
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_world_size()
+    return 1
+
+
+def _resolve_symm_mem_group_name(group_name: str) -> str:
+    group_ref = _groups.get(group_name)
+    if group_ref is None:
+        return group_name
+    group = group_ref()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return getattr(group.device_group, "group_name", group_name)
+
+
+def _flashinfer_scaled_mm_out(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    scale_result: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    use_fast_accum: bool = False,
+) -> None:
+    if bias is not None:
+        raise NotImplementedError("FlashInfer symm_mem adapter does not support bias")
+    if scale_result is not None:
+        raise NotImplementedError(
+            "FlashInfer symm_mem adapter does not support result scaling"
+        )
+    if use_fast_accum:
+        raise NotImplementedError(
+            "FlashInfer symm_mem adapter does not support use_fast_accum"
+        )
+    if A.ndim != 2 or B.ndim != 2 or out.ndim != 2:
+        raise ValueError("FlashInfer symm_mem adapter expects 2D inputs and output")
+    if scale_a.numel() != 1 or scale_b.numel() != 1:
+        raise ValueError(
+            "FlashInfer symm_mem adapter only supports tensor-wise FP8 scales"
+        )
+
+    flashinfer_scaled_fp8_mm_out(
+        A,
+        B,
+        scale_a,
+        scale_b,
+        out=out,
+        out_dtype=out_dtype or out.dtype,
+    )
+
+
+def _should_use_flashinfer_multimem_all_gather_scaled_matmul(
+    A_shard: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    gather_dim: int,
+    group_name: str,
+) -> bool:
+    return (
+        A_scale.numel() == 1
+        and B_scale.numel() == 1
+        and gather_dim == 0
+        and torch.distributed._symmetric_memory._should_use_multimem_all_gather_matmul(
+            A_shard,
+            gather_dim,
+            group_name,
+            False,
+        )
+    )
+
+
+def _flashinfer_multimem_all_gather_scaled_matmul(
+    A_shard: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    group_name: str,
+    out_dtype: torch.dtype | None,
+) -> torch.Tensor:
+    world_size = _get_fake_collective_world_size(group_name)
+    A_shape = torch.Size((A_shard.shape[0] * world_size, *A_shard.shape[1:]))
+    symm_mem = torch.distributed._symmetric_memory.get_symm_mem_workspace(
+        group_name,
+        A_shape.numel() * A_shard.element_size(),
+    )
+    A = symm_mem.get_buffer(symm_mem.rank, A_shape, A_shard.dtype)
+    torch.ops.symm_mem.multimem_all_gather_out(A_shard, group_name, A)
+    out = A.new_empty((A.shape[0], B.shape[1]), dtype=out_dtype or torch.bfloat16)
+    _flashinfer_scaled_mm_out(
+        A,
+        B,
+        scale_a=A_scale,
+        scale_b=B_scale,
+        out=out,
+        out_dtype=out_dtype,
+    )
+    return out
+
+
+def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    reduce_op: str,
+    orig_scatter_dim: int,
+    scatter_dim_after_maybe_reshape: int,
+    group_name: str,
+    output_shape: list[int],
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    world_size = _get_fake_collective_world_size(group_name)
+    result_shape = list(output_shape)
+    result_shape[orig_scatter_dim] //= world_size
+    return torch.empty(
+        result_shape,
+        dtype=out_dtype or torch.bfloat16,
+        device=A.device,
+    )
+
+
+def fused_flashinfer_scaled_matmul_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    reduce_op: str,
+    orig_scatter_dim: int,
+    scatter_dim_after_maybe_reshape: int,
+    group_name: str,
+    output_shape: list[int],
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if orig_scatter_dim != 0 or scatter_dim_after_maybe_reshape != 0:
+        raise NotImplementedError(
+            "FlashInfer symm_mem adapter currently only supports scatter_dim=0"
+        )
+    symm_mem_mod = torch.distributed._symmetric_memory
+    resolved_group_name = _resolve_symm_mem_group_name(group_name)
+    kwargs = {
+        "scale_b": B_scale,
+        "bias": None,
+        "scale_result": None,
+        "out_dtype": out_dtype,
+        "use_fast_accum": False,
+    }
+    if (
+        A_scale.numel() == 1
+        and B_scale.numel() == 1
+        and symm_mem_mod._should_use_fused_scaled_matmul_reduce_scatter_native(
+            A,
+            B,
+            orig_scatter_dim,
+            scatter_dim_after_maybe_reshape,
+            resolved_group_name,
+        )
+    ):
+        return symm_mem_mod._fused_scaled_matmul_reduce_scatter_native(
+            mm_out_op=_flashinfer_scaled_mm_out,
+            A=A,
+            B=B,
+            A_scale=A_scale,
+            reduce_op=reduce_op,
+            orig_scatter_dim=orig_scatter_dim,
+            group_name=resolved_group_name,
+            output_shape=output_shape,
+            kwargs=kwargs,
+            out_dtype=out_dtype,
+        )
+    return symm_mem_mod._fused_scaled_matmul_reduce_scatter_impl(
+        mm_out_op=_flashinfer_scaled_mm_out,
+        A=A,
+        B=B,
+        A_scale=A_scale,
+        kwargs=kwargs,
+        out_dtype=out_dtype,
+        reduce_op=reduce_op,
+        orig_scatter_dim=orig_scatter_dim,
+        scatter_dim_after_maybe_reshape=scatter_dim_after_maybe_reshape,
+        group_name=resolved_group_name,
+        output_shape=output_shape,
+    )
+
+
+def fused_all_gather_flashinfer_scaled_matmul_fake(
+    A_shard: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    gather_dim: int,
+    group_name: str,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    world_size = _get_fake_collective_world_size(group_name)
+    output_shape = list(A_shard.shape)
+    output_shape[gather_dim] *= world_size
+    output_shape[-1] = B.shape[1]
+    return torch.empty(
+        output_shape,
+        dtype=out_dtype or torch.bfloat16,
+        device=A_shard.device,
+    )
+
+
+def fused_all_gather_flashinfer_scaled_matmul(
+    A_shard: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    gather_dim: int,
+    group_name: str,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    if gather_dim != 0:
+        raise NotImplementedError(
+            "FlashInfer symm_mem adapter currently only supports gather_dim=0"
+        )
+    resolved_group_name = _resolve_symm_mem_group_name(group_name)
+    if _should_use_flashinfer_multimem_all_gather_scaled_matmul(
+        A_shard,
+        A_scale,
+        B_scale,
+        gather_dim,
+        resolved_group_name,
+    ):
+        return _flashinfer_multimem_all_gather_scaled_matmul(
+            A_shard,
+            B,
+            A_scale,
+            B_scale,
+            resolved_group_name,
+            out_dtype,
+        )
+    _, outputs = torch.distributed._symmetric_memory._fused_all_gather_matmul_impl(
+        mm_out_op=_flashinfer_scaled_mm_out,
+        A_shard=A_shard,
+        Bs=[B],
+        A_scale=A_scale,
+        kwargs_list=[
+            {
+                "scale_b": B_scale,
+                "bias": None,
+                "scale_result": None,
+                "out_dtype": out_dtype,
+                "use_fast_accum": False,
+            }
+        ],
+        out_dtypes=[out_dtype],
+        gather_dim=gather_dim,
+        group_name=resolved_group_name,
+        return_A=False,
+    )
+    return outputs[0]
+
+
 direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
@@ -284,6 +549,18 @@ direct_register_custom_op(
     op_name="patched_fused_scaled_matmul_reduce_scatter",
     op_func=patched_fused_scaled_matmul_reduce_scatter,
     fake_impl=patched_fused_scaled_matmul_reduce_scatter_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_flashinfer_scaled_matmul_reduce_scatter",
+    op_func=fused_flashinfer_scaled_matmul_reduce_scatter,
+    fake_impl=fused_flashinfer_scaled_matmul_reduce_scatter_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_all_gather_flashinfer_scaled_matmul",
+    op_func=fused_all_gather_flashinfer_scaled_matmul,
+    fake_impl=fused_all_gather_flashinfer_scaled_matmul_fake,
 )
 
 

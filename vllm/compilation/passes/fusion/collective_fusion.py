@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import suppress
+
 import torch
 import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
@@ -18,6 +20,9 @@ from vllm.platforms import current_platform
 
 from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+from .flashinfer_collective_fusion import (
+    rewrite_flashinfer_bmm_fp8_collective_fusion,
+)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -376,11 +381,22 @@ class AsyncTPPass(VllmPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
 
+        self.min_token_num = None
+        if config.model_config is not None:
+            pass_config = config.compilation_config.pass_config
+            self.min_token_num = pass_config.sp_min_token_num
+            if self.min_token_num is not None:
+                max_batched = config.scheduler_config.max_num_batched_tokens
+                if max_batched is not None:
+                    self.min_token_num = min(self.min_token_num, max_batched)
+
         # Enable symmetric memory for the TP process group
-        enable_symm_mem_for_group(get_tp_group().device_group.group_name)
+        tp_device_group_name = get_tp_group().device_group.group_name
+        enable_symm_mem_for_group(tp_device_group_name)
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="async_tp_pass"
         )
+        self.enable_flashinfer_bmm_fp8_rewrite = False
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
@@ -402,22 +418,39 @@ class AsyncTPPass(VllmPatternMatcherPass):
             AllGatherCutlassScaledMMPattern(self.model_dtype, self.device).register(
                 self.patterns
             )
+            with suppress(ImportError):
+                import vllm.utils.flashinfer  # noqa: F401
+            self.enable_flashinfer_bmm_fp8_rewrite = hasattr(torch.ops.vllm, "bmm_fp8")
 
         self.dump_patterns(config, self.patterns)
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
-        # This pass is applied on top of the sequence parallelism pass.
-        # It inherits the same applicability condition as `SequenceParallelismPass`.
-        # See `SequenceParallelismPass.is_applicable` for more details.
+        # AsyncTP is a follow-up optimization on top of sequence parallelism,
+        # so keep its range gate aligned with SequenceParallelismPass.
+        if self.min_token_num is None:
+            return False
+
         if (
-            not self.compilation_config.splitting_ops
-            or self.compilation_config.use_inductor_graph_partition
+            not self.compilation_config.use_inductor_graph_partition
+            and self.compilation_config.splitting_ops
         ):
-            return True
+            tp_size = get_tensor_model_parallel_world_size()
+            if not compile_range.is_single_size() or compile_range.end % tp_size != 0:
+                return False
+
+        if compile_range.start < self.min_token_num:
+            return False
+
         tp_size = get_tensor_model_parallel_world_size()
-        return bool(compile_range.is_single_size() and compile_range.end % tp_size == 0)
+        return bool(
+            self.compilation_config.use_inductor_graph_partition
+            or not self.compilation_config.splitting_ops
+            or (compile_range.is_single_size() and compile_range.end % tp_size == 0)
+        )
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
         self.matched_count = self.patterns.apply(graph)
+        if self.enable_flashinfer_bmm_fp8_rewrite:
+            self.matched_count += rewrite_flashinfer_bmm_fp8_collective_fusion(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
