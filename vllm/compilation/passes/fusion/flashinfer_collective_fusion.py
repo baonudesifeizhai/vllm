@@ -44,71 +44,67 @@ def _strip_view_like(node: fx.Node) -> fx.Node:
     return node
 
 
-def _walk_reachable_users(start_nodes: list[fx.Node]) -> list[fx.Node]:
-    worklist = list(start_nodes)
-    visited: set[fx.Node] = set()
-    reachable: list[fx.Node] = []
-
-    while worklist:
-        user = worklist.pop()
-        if user in visited:
-            continue
-        visited.add(user)
-        reachable.append(user)
-
-        if _is_passthrough(user):
-            worklist.extend(user.users)
-
-    return reachable
+@dataclass(frozen=True)
+class _UserPathState:
+    node: fx.Node
+    saw_slice_scatter: bool = False
 
 
-def _walk_reachable_users_with_slice_scatter_state(
+def _walk_user_paths(
     start_nodes: list[fx.Node],
-) -> list[tuple[fx.Node, bool]]:
-    worklist: list[tuple[fx.Node, bool]] = [(user, False) for user in start_nodes]
-    visited: set[tuple[fx.Node, bool]] = set()
-    reachable: list[tuple[fx.Node, bool]] = []
+    *,
+    track_slice_scatter: bool = False,
+) -> list[_UserPathState]:
+    worklist = [_UserPathState(node=user) for user in start_nodes]
+    visited: set[_UserPathState] = set()
+    reachable: list[_UserPathState] = []
 
     while worklist:
-        user, saw_slice_scatter = worklist.pop()
-        state = (user, saw_slice_scatter)
+        state = worklist.pop()
         if state in visited:
             continue
         visited.add(state)
         reachable.append(state)
 
-        if _is_passthrough(user):
-            worklist.extend((child, saw_slice_scatter) for child in user.users)
+        if _is_passthrough(state.node):
+            worklist.extend(
+                _UserPathState(
+                    node=child,
+                    saw_slice_scatter=state.saw_slice_scatter,
+                )
+                for child in state.node.users
+            )
             continue
 
-        if is_func(user, torch.ops.aten.slice_scatter.default):
-            worklist.extend((child, True) for child in user.users)
+        if track_slice_scatter and is_func(
+            state.node, torch.ops.aten.slice_scatter.default
+        ):
+            worklist.extend(
+                _UserPathState(node=child, saw_slice_scatter=True)
+                for child in state.node.users
+            )
 
     return reachable
 
 
-def _collect_first_passthrough_matches(
-    start_nodes: list[fx.Node],
-    predicate,
-) -> list[fx.Node]:
+def _find_passthrough_targets(start_nodes: list[fx.Node], predicate) -> list[fx.Node]:
     worklist = list(start_nodes)
     visited: set[fx.Node] = set()
     matches: list[fx.Node] = []
 
     while worklist:
-        user = worklist.pop()
-        if user in visited:
+        node = worklist.pop()
+        if node in visited:
             continue
-        visited.add(user)
+        visited.add(node)
 
-        if not _is_passthrough(user):
+        if not _is_passthrough(node):
+            continue
+        if predicate(node):
+            matches.append(node)
             continue
 
-        if predicate(user):
-            matches.append(user)
-            continue
-
-        worklist.extend(user.users)
+        worklist.extend(node.users)
 
     return matches
 
@@ -279,12 +275,6 @@ class _FP8CollectiveGemmMatch:
     group_name: str
 
 
-@dataclass
-class _MatchedCollectiveUser:
-    node: fx.Node
-    collective: _CollectiveOp
-
-
 class _FlashInferCollectiveFusionRewriter:
     def __init__(self, graph: fx.Graph) -> None:
         self.graph = graph
@@ -317,15 +307,13 @@ class _FlashInferCollectiveFusionRewriter:
     def _find_reduce_scatter_user(
         self,
         bmm_node: fx.Node,
-    ) -> _MatchedCollectiveUser | None:
-        rs_matches: list[_MatchedCollectiveUser] = []
+    ) -> tuple[fx.Node, _CollectiveOp] | None:
+        rs_matches: list[tuple[fx.Node, _CollectiveOp]] = []
 
-        for user in _walk_reachable_users(list(bmm_node.users)):
-            parsed_rs = _parse_reduce_scatter(user)
+        for state in _walk_user_paths(list(bmm_node.users)):
+            parsed_rs = _parse_reduce_scatter(state.node)
             if parsed_rs is not None:
-                rs_matches.append(
-                    _MatchedCollectiveUser(node=user, collective=parsed_rs)
-                )
+                rs_matches.append((state.node, parsed_rs))
 
         if len(rs_matches) == 1:
             return rs_matches[0]
@@ -345,57 +333,40 @@ class _FlashInferCollectiveFusionRewriter:
 
     def _classify_qkv_branch(self, node: fx.Node) -> str | None:
         if any(
-            self._is_qkv_split(user) for user in _walk_reachable_users(list(node.users))
+            self._is_qkv_split(state.node)
+            for state in _walk_user_paths(list(node.users))
         ):
             return "direct"
         if any(
-            saw_slice_scatter and self._is_qkv_split(user)
-            for user, saw_slice_scatter in (
-                _walk_reachable_users_with_slice_scatter_state(list(node.users))
-            )
+            state.saw_slice_scatter and self._is_qkv_split(state.node)
+            for state in _walk_user_paths(list(node.users), track_slice_scatter=True)
         ):
             return "rotary"
         return None
 
-    def _find_ag_qkv_replace_targets(self, bmm_node: fx.Node) -> list[fx.Node] | None:
+    def _match_ag_targets(self, bmm_node: fx.Node) -> list[fx.Node] | None:
         replace_targets = [
             user
             for user in bmm_node.users
             if _is_passthrough(user) and _node_ndim(user) == 2
         ]
-        if len(replace_targets) != 2:
-            return None
+        if len(replace_targets) == 2:
+            if _node_shape(replace_targets[0]) != _node_shape(replace_targets[1]):
+                return None
 
-        if _node_shape(replace_targets[0]) != _node_shape(replace_targets[1]):
-            return None
+            branch_kinds = {self._classify_qkv_branch(node) for node in replace_targets}
+            if branch_kinds == {"direct", "rotary"}:
+                return replace_targets
 
-        branch_kinds = [self._classify_qkv_branch(node) for node in replace_targets]
-        if set(branch_kinds) == {"direct", "rotary"}:
-            return replace_targets
-        return None
-
-    def _find_ag_single_replace_target(self, bmm_node: fx.Node) -> fx.Node | None:
-        replace_targets = _collect_first_passthrough_matches(
+        replace_targets = _find_passthrough_targets(
             list(bmm_node.users),
             lambda node: _node_ndim(node) == 2,
         )
-
         if not replace_targets and _node_ndim(bmm_node) == 2:
             replace_targets = [bmm_node]
-
-        if len(replace_targets) != 1:
-            return None
-        return replace_targets[0]
-
-    def _find_ag_replace_targets(self, bmm_node: fx.Node) -> list[fx.Node] | None:
-        qkv_targets = self._find_ag_qkv_replace_targets(bmm_node)
-        if qkv_targets is not None:
-            return qkv_targets
-
-        target = self._find_ag_single_replace_target(bmm_node)
-        if target is None:
-            return None
-        return [target]
+        if len(replace_targets) == 1:
+            return replace_targets
+        return None
 
     def _first_node_in_graph(self, nodes: list[fx.Node]) -> fx.Node:
         return min(nodes, key=self._node_order.__getitem__)
@@ -408,13 +379,14 @@ class _FlashInferCollectiveFusionRewriter:
         rs_match = self._find_reduce_scatter_user(bmm_node)
         if rs_match is None:
             return None
+        rs_node, collective = rs_match
 
-        parsed_group_name = _parse_collective_group_name(rs_match.collective)
+        parsed_group_name = _parse_collective_group_name(collective)
         if parsed_group_name is None:
             return None
 
         return _FP8CollectiveGemmMatch(
-            replace_nodes=[rs_match.node],
+            replace_nodes=[rs_node],
             a_2d=parsed_bmm.a_2d,
             b_2d=parsed_bmm.b_2d,
             a_scale=parsed_bmm.a_scale,
@@ -437,7 +409,7 @@ class _FlashInferCollectiveFusionRewriter:
         if parsed_group_name is None:
             return None
 
-        targets = self._find_ag_replace_targets(bmm_node)
+        targets = self._match_ag_targets(bmm_node)
         if targets is None:
             return None
 
