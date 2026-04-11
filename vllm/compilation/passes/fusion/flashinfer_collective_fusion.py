@@ -4,12 +4,18 @@
 from dataclasses import dataclass
 
 import torch
+import torch._inductor.pattern_matcher as pm
 import torch.fx as fx
+from torch._inductor.pattern_matcher import PatternMatcherPass
 from torch.fx.experimental.symbolic_shapes import statically_known_true
+
+from vllm.distributed import get_tp_group
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 
 from ..fx_utils import is_func
 
 FLASHINFER_BMM_FP8_MIN_M = 64
+FLASHINFER_BMM_FP8_DTYPE = torch.float8_e4m3fn
 VIEW_LIKE_OPS = (
     torch.ops.aten.view.default,
     torch.ops.aten.reshape.default,
@@ -87,28 +93,6 @@ def _walk_user_paths(
     return reachable
 
 
-def _find_passthrough_targets(start_nodes: list[fx.Node], predicate) -> list[fx.Node]:
-    worklist = list(start_nodes)
-    visited: set[fx.Node] = set()
-    matches: list[fx.Node] = []
-
-    while worklist:
-        node = worklist.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-
-        if not _is_passthrough(node):
-            continue
-        if predicate(node):
-            matches.append(node)
-            continue
-
-        worklist.extend(node.users)
-
-    return matches
-
-
 def _node_shape(node: fx.Node) -> list[object] | None:
     val = node.meta.get("val")
     if hasattr(val, "shape"):
@@ -146,10 +130,27 @@ def _passes_min_m(node: fx.Node) -> bool:
     return not _dim_is_statically_lt(gemm_m, FLASHINFER_BMM_FP8_MIN_M)
 
 
+def _passes_min_m_after_reduce_scatter(node: fx.Node, world_size: int) -> bool:
+    gemm_m = _node_first_dim(node)
+    if gemm_m is None or not isinstance(gemm_m, int | torch.SymInt):
+        return True
+    return not _dim_is_statically_lt(gemm_m, FLASHINFER_BMM_FP8_MIN_M * world_size)
+
+
 def _copy_replacement_meta(src: fx.Node, dst: fx.Node) -> None:
     dst.meta = {
         key: value for key, value in src.meta.items() if key != "eager_input_vals"
     }
+
+
+def _arg_numel_is_one(arg: object) -> bool:
+    if isinstance(arg, torch.Tensor):
+        return arg.numel() == 1
+    if isinstance(arg, fx.Node):
+        val = arg.meta.get("val")
+        if hasattr(val, "numel"):
+            return val.numel() == 1
+    return False
 
 
 def _unwrap_bmm_fp8_arg_to_2d(arg: object) -> fx.Node | None:
@@ -215,12 +216,6 @@ def _parse_collective_op(
     )
 
 
-def _parse_reduce_scatter(
-    node: fx.Node,
-) -> _CollectiveOp | None:
-    return _parse_collective_op(node, torch.ops.vllm.reduce_scatter.default)
-
-
 def _parse_all_gather(
     node: fx.Node,
 ) -> _CollectiveOp | None:
@@ -264,6 +259,282 @@ def _parse_bmm_fp8(
     )
 
 
+def _flashinfer_bmm_fp8_extra_check(match: pm.Match) -> bool:
+    for node in match.nodes:
+        if not is_func(node, torch.ops.vllm.bmm_fp8.default):
+            continue
+        parsed = _parse_bmm_fp8(node)
+        return (
+            parsed is not None
+            and parsed.backend == "auto"
+            and _arg_numel_is_one(parsed.a_scale)
+            and _arg_numel_is_one(parsed.b_scale)
+        )
+    return False
+
+
+def _find_match_node(match: pm.Match, op) -> fx.Node | None:
+    for node in match.nodes:
+        if is_func(node, op):
+            return node
+    return None
+
+
+def _get_match_bmm_fp8(match: pm.Match) -> _BmmFp8Op | None:
+    node = _find_match_node(match, torch.ops.vllm.bmm_fp8.default)
+    if node is None:
+        return None
+    return _parse_bmm_fp8(node)
+
+
+def _is_qkv_split(node: fx.Node) -> bool:
+    if not is_func(node, torch.ops.aten.split_with_sizes.default):
+        return False
+
+    split_sizes = _get_node_arg(node, "split_sizes", 1)
+    dim = _get_node_arg(node, "dim", 2)
+    return (
+        isinstance(split_sizes, (list, tuple))
+        and len(split_sizes) == 3
+        and dim in (-1, 1)
+    )
+
+
+def _classify_qkv_branch(node: fx.Node) -> str | None:
+    if any(_is_qkv_split(state.node) for state in _walk_user_paths(list(node.users))):
+        return "direct"
+    if any(
+        state.saw_slice_scatter and _is_qkv_split(state.node)
+        for state in _walk_user_paths(list(node.users), track_slice_scatter=True)
+    ):
+        return "rotary"
+    return None
+
+
+class _FlashInferCollectivePatternBase:
+    def __init__(self, dtype: torch.dtype, device: str | None) -> None:
+        self.dtype = dtype
+        self.device = device
+        self.tp = get_tp_group()
+        self.tp_size = get_tensor_model_parallel_world_size()
+
+    def empty_fp8(self, *shape: int) -> torch.Tensor:
+        return torch.empty(*shape, dtype=FLASHINFER_BMM_FP8_DTYPE, device=self.device)
+
+    def empty_fp32_scalar(self) -> torch.Tensor:
+        return torch.empty([], dtype=torch.float32, device=self.device)
+
+
+class FlashInferBMMFP8ReduceScatterPattern(_FlashInferCollectivePatternBase):
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [
+            self.empty_fp8(128, 16),
+            self.empty_fp8(16, 16),
+            self.empty_fp32_scalar(),
+            self.empty_fp32_scalar(),
+        ]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            a_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            a = torch.ops.aten.unsqueeze.default(a_2d, 0)
+            b = torch.ops.aten.unsqueeze.default(b_2d, 0)
+            bmm = torch.ops.vllm.bmm_fp8.default(
+                a, b, a_scale, b_scale, self.dtype, "auto"
+            )
+            output = torch.ops.aten.view.default(bmm, [a_2d.shape[0], b_2d.shape[1]])
+            return torch.ops.vllm.reduce_scatter.default(
+                output, 0, self.tp_size, self.tp.unique_name
+            )
+
+        def replacement(
+            a_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            output_shape = [a_2d.shape[0], b_2d.shape[1]]
+            return torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default(
+                a_2d,
+                b_2d,
+                a_scale,
+                b_scale,
+                "sum",
+                0,
+                0,
+                self.tp.unique_name,
+                output_shape,
+                self.dtype,
+            )
+
+        def extra_check(match: pm.Match) -> bool:
+            parsed = _get_match_bmm_fp8(match)
+            if parsed is None:
+                return False
+            return _flashinfer_bmm_fp8_extra_check(match) and (
+                _passes_min_m_after_reduce_scatter(parsed.a_2d, self.tp_size)
+            )
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=extra_check,
+        )
+
+
+class FlashInferAllGatherBMMFP8Pattern(_FlashInferCollectivePatternBase):
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [
+            self.empty_fp8(128, 16),
+            self.empty_fp8(16, 16),
+            self.empty_fp32_scalar(),
+            self.empty_fp32_scalar(),
+        ]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            a_shard_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            gathered = torch.ops.vllm.all_gather.default(
+                a_shard_2d, 0, self.tp_size, self.tp.unique_name
+            )
+            a = torch.ops.aten.unsqueeze.default(gathered, 0)
+            b = torch.ops.aten.unsqueeze.default(b_2d, 0)
+            bmm = torch.ops.vllm.bmm_fp8.default(
+                a, b, a_scale, b_scale, self.dtype, "auto"
+            )
+            return torch.ops.aten.view.default(bmm, [gathered.shape[0], b_2d.shape[1]])
+
+        def replacement(
+            a_shard_2d: torch.Tensor,
+            b_2d: torch.Tensor,
+            a_scale: torch.Tensor,
+            b_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default(
+                a_shard_2d,
+                b_2d,
+                a_scale,
+                b_scale,
+                0,
+                self.tp.unique_name,
+                self.dtype,
+            )
+
+        def extra_check(match: pm.Match) -> bool:
+            parsed = _get_match_bmm_fp8(match)
+            if parsed is None:
+                return False
+            return _flashinfer_bmm_fp8_extra_check(match) and _passes_min_m(parsed.a_2d)
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+            extra_check=extra_check,
+        )
+
+
+class FlashInferAllGatherBMMFP8QKVPattern(_FlashInferCollectivePatternBase):
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        pattern = pm.CallFunction(
+            torch.ops.aten.split_with_sizes.default,
+            pm.CallFunction(
+                torch.ops.aten.view.default,
+                pm.CallFunction(
+                    torch.ops.vllm.bmm_fp8.default,
+                    pm.CallFunction(
+                        torch.ops.aten.unsqueeze.default,
+                        pm.CallFunction(
+                            torch.ops.vllm.all_gather.default,
+                            pm.KeywordArg("a_shard_2d"),
+                            0,
+                            self.tp_size,
+                            self.tp.unique_name,
+                        ),
+                        0,
+                    ),
+                    pm.CallFunction(
+                        torch.ops.aten.unsqueeze.default,
+                        pm.KeywordArg("b_2d"),
+                        0,
+                    ),
+                    pm.KeywordArg("a_scale"),
+                    pm.KeywordArg("b_scale"),
+                    self.dtype,
+                    "auto",
+                    _users=pm.MULTIPLE,
+                ),
+                pm.Ignored(),
+                _users=pm.MULTIPLE,
+            ),
+            pm.Ignored(),
+            pm.Ignored(),
+            _users=pm.MULTIPLE,
+        )
+
+        def extra_check(match: pm.Match) -> bool:
+            if not _flashinfer_bmm_fp8_extra_check(match):
+                return False
+
+            split_node = _find_match_node(
+                match, torch.ops.aten.split_with_sizes.default
+            )
+            if split_node is None:
+                return False
+
+            ag_match = _match_ag_bmm_from_split(split_node)
+            return ag_match is not None and _passes_min_m(ag_match.replace_nodes[0])
+
+        @pm.register_graph_pattern(
+            pattern,
+            pass_dict=pm_pass,
+            extra_check=extra_check,
+        )
+        def handler(
+            match: pm.Match,
+            a_shard_2d: fx.Node,
+            b_2d: fx.Node,
+            a_scale: object,
+            b_scale: object,
+        ) -> None:
+            del a_shard_2d, b_2d, a_scale, b_scale
+            split_node = _find_match_node(
+                match, torch.ops.aten.split_with_sizes.default
+            )
+            if split_node is None:
+                return
+
+            ag_match = _match_ag_bmm_from_split(split_node)
+            if ag_match is None or not _passes_min_m(ag_match.replace_nodes[0]):
+                return
+
+            _lower_ag_bmm(match.graph, ag_match)
+            match.erase_nodes()
+
+
+def register_flashinfer_bmm_fp8_collective_patterns(
+    pm_pass: PatternMatcherPass,
+    dtype: torch.dtype,
+    device: str | None,
+) -> None:
+    FlashInferBMMFP8ReduceScatterPattern(dtype, device).register(pm_pass)
+    FlashInferAllGatherBMMFP8Pattern(dtype, device).register(pm_pass)
+    FlashInferAllGatherBMMFP8QKVPattern(dtype, device).register(pm_pass)
+
+
 @dataclass
 class _FP8CollectiveGemmMatch:
     replace_nodes: list[fx.Node]
@@ -275,205 +546,89 @@ class _FP8CollectiveGemmMatch:
     group_name: str
 
 
-class _FlashInferCollectiveFusionRewriter:
-    def __init__(self, graph: fx.Graph) -> None:
-        self.graph = graph
-        self._node_order = {node: index for index, node in enumerate(graph.nodes)}
-
-    def run(self) -> int:
-        replaced = 0
-        for node in list(self.graph.nodes):
-            if not is_func(node, torch.ops.vllm.bmm_fp8.default):
-                continue
-
-            rs_match = self._match_bmm_rs(node)
-            if rs_match is not None and _passes_min_m(rs_match.replace_nodes[0]):
-                self._lower_bmm_rs(rs_match)
-                replaced += 1
-                continue
-
-            ag_match = self._match_ag_bmm(node)
-            if ag_match is None or not _passes_min_m(ag_match.replace_nodes[0]):
-                continue
-
-            self._lower_ag_bmm(ag_match)
-            replaced += 1
-
-        if replaced:
-            self.graph.eliminate_dead_code()
-            self.graph.lint()
-        return replaced
-
-    def _find_reduce_scatter_user(
-        self,
-        bmm_node: fx.Node,
-    ) -> tuple[fx.Node, _CollectiveOp] | None:
-        rs_matches: list[tuple[fx.Node, _CollectiveOp]] = []
-
-        for state in _walk_user_paths(list(bmm_node.users)):
-            parsed_rs = _parse_reduce_scatter(state.node)
-            if parsed_rs is not None:
-                rs_matches.append((state.node, parsed_rs))
-
-        if len(rs_matches) == 1:
-            return rs_matches[0]
+def _match_ag_bmm_from_split(
+    split_node: fx.Node,
+) -> _FP8CollectiveGemmMatch | None:
+    if not _is_qkv_split(split_node):
         return None
 
-    def _is_qkv_split(self, node: fx.Node) -> bool:
-        if not is_func(node, torch.ops.aten.split_with_sizes.default):
-            return False
-
-        split_sizes = _get_node_arg(node, "split_sizes", 1)
-        dim = _get_node_arg(node, "dim", 2)
-        return (
-            isinstance(split_sizes, (list, tuple))
-            and len(split_sizes) == 3
-            and dim in (-1, 1)
-        )
-
-    def _classify_qkv_branch(self, node: fx.Node) -> str | None:
-        if any(
-            self._is_qkv_split(state.node)
-            for state in _walk_user_paths(list(node.users))
-        ):
-            return "direct"
-        if any(
-            state.saw_slice_scatter and self._is_qkv_split(state.node)
-            for state in _walk_user_paths(list(node.users), track_slice_scatter=True)
-        ):
-            return "rotary"
+    split_input = _get_node_arg(split_node, "self", 0)
+    if (
+        not isinstance(split_input, fx.Node)
+        or not _is_passthrough(split_input)
+        or _node_ndim(split_input) != 2
+    ):
         return None
 
-    def _match_ag_targets(self, bmm_node: fx.Node) -> list[fx.Node] | None:
-        replace_targets = [
-            user
-            for user in bmm_node.users
-            if _is_passthrough(user) and _node_ndim(user) == 2
-        ]
-        if len(replace_targets) == 2:
-            if _node_shape(replace_targets[0]) != _node_shape(replace_targets[1]):
-                return None
-
-            branch_kinds = {self._classify_qkv_branch(node) for node in replace_targets}
-            if branch_kinds == {"direct", "rotary"}:
-                return replace_targets
-
-        replace_targets = _find_passthrough_targets(
-            list(bmm_node.users),
-            lambda node: _node_ndim(node) == 2,
-        )
-        if not replace_targets and _node_ndim(bmm_node) == 2:
-            replace_targets = [bmm_node]
-        if len(replace_targets) == 1:
-            return replace_targets
+    bmm_node = _strip_view_like(split_input)
+    parsed_bmm = _parse_bmm_fp8(bmm_node)
+    if parsed_bmm is None:
         return None
 
-    def _first_node_in_graph(self, nodes: list[fx.Node]) -> fx.Node:
-        return min(nodes, key=self._node_order.__getitem__)
+    ag_node = _strip_view_like(parsed_bmm.a_2d)
+    parsed_ag = _parse_all_gather(ag_node)
+    if parsed_ag is None:
+        return None
 
-    def _match_bmm_rs(self, bmm_node: fx.Node) -> _FP8CollectiveGemmMatch | None:
-        parsed_bmm = _parse_bmm_fp8(bmm_node)
-        if parsed_bmm is None:
+    parsed_group_name = _parse_collective_group_name(parsed_ag)
+    if parsed_group_name is None:
+        return None
+
+    replace_nodes = [split_input]
+    sibling_targets = [
+        user
+        for user in bmm_node.users
+        if user is not split_input
+        and _is_passthrough(user)
+        and _node_ndim(user) == 2
+        and _node_shape(user) == _node_shape(split_input)
+    ]
+    if sibling_targets:
+        if len(sibling_targets) != 1:
             return None
 
-        rs_match = self._find_reduce_scatter_user(bmm_node)
-        if rs_match is None:
+        branch_kinds = {
+            _classify_qkv_branch(split_input),
+            _classify_qkv_branch(sibling_targets[0]),
+        }
+        if branch_kinds != {"direct", "rotary"}:
             return None
-        rs_node, collective = rs_match
+        replace_nodes.append(sibling_targets[0])
 
-        parsed_group_name = _parse_collective_group_name(collective)
-        if parsed_group_name is None:
-            return None
+    return _FP8CollectiveGemmMatch(
+        replace_nodes=replace_nodes,
+        a_2d=parsed_ag.input_node,
+        b_2d=parsed_bmm.b_2d,
+        a_scale=parsed_bmm.a_scale,
+        b_scale=parsed_bmm.b_scale,
+        out_dtype=parsed_bmm.out_dtype,
+        group_name=parsed_group_name,
+    )
 
-        return _FP8CollectiveGemmMatch(
-            replace_nodes=[rs_node],
-            a_2d=parsed_bmm.a_2d,
-            b_2d=parsed_bmm.b_2d,
-            a_scale=parsed_bmm.a_scale,
-            b_scale=parsed_bmm.b_scale,
-            out_dtype=parsed_bmm.out_dtype,
-            group_name=parsed_group_name,
+
+def _first_node_in_graph(graph: fx.Graph, nodes: list[fx.Node]) -> fx.Node:
+    node_order = {node: index for index, node in enumerate(graph.nodes)}
+    return min(nodes, key=node_order.__getitem__)
+
+
+def _lower_ag_bmm(graph: fx.Graph, match: _FP8CollectiveGemmMatch) -> None:
+    replace_node = _first_node_in_graph(graph, match.replace_nodes)
+    with graph.inserting_before(replace_node):
+        replacement = graph.call_function(
+            torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default,
+            args=(
+                match.a_2d,
+                match.b_2d,
+                match.a_scale,
+                match.b_scale,
+                0,
+                match.group_name,
+                match.out_dtype,
+            ),
         )
 
-    def _match_ag_bmm(self, bmm_node: fx.Node) -> _FP8CollectiveGemmMatch | None:
-        parsed_bmm = _parse_bmm_fp8(bmm_node)
-        if parsed_bmm is None:
-            return None
-
-        ag_node = _strip_view_like(parsed_bmm.a_2d)
-        parsed_ag = _parse_all_gather(ag_node)
-        if parsed_ag is None:
-            return None
-
-        parsed_group_name = _parse_collective_group_name(parsed_ag)
-        if parsed_group_name is None:
-            return None
-
-        targets = self._match_ag_targets(bmm_node)
-        if targets is None:
-            return None
-
-        return _FP8CollectiveGemmMatch(
-            replace_nodes=targets,
-            a_2d=parsed_ag.input_node,
-            b_2d=parsed_bmm.b_2d,
-            a_scale=parsed_bmm.a_scale,
-            b_scale=parsed_bmm.b_scale,
-            out_dtype=parsed_bmm.out_dtype,
-            group_name=parsed_group_name,
-        )
-
-    def _lower_bmm_rs(self, match: _FP8CollectiveGemmMatch) -> None:
-        replace_node = match.replace_nodes[0]
-        a_shape = _node_shape(match.a_2d)
-        b_shape = _node_shape(match.b_2d)
-        if a_shape is None or b_shape is None:
-            return
-        output_shape = [a_shape[0], b_shape[1]]
-
-        with self.graph.inserting_before(replace_node):
-            replacement = self.graph.call_function(
-                torch.ops.vllm.fused_flashinfer_scaled_matmul_reduce_scatter.default,
-                args=(
-                    match.a_2d,
-                    match.b_2d,
-                    match.a_scale,
-                    match.b_scale,
-                    "sum",
-                    0,
-                    0,
-                    match.group_name,
-                    output_shape,
-                    match.out_dtype,
-                ),
-            )
-
-        _copy_replacement_meta(replace_node, replacement)
-        replace_node.replace_all_uses_with(replacement)
-        self.graph.erase_node(replace_node)
-
-    def _lower_ag_bmm(self, match: _FP8CollectiveGemmMatch) -> None:
-        replace_node = self._first_node_in_graph(match.replace_nodes)
-        with self.graph.inserting_before(replace_node):
-            replacement = self.graph.call_function(
-                torch.ops.vllm.fused_all_gather_flashinfer_scaled_matmul.default,
-                args=(
-                    match.a_2d,
-                    match.b_2d,
-                    match.a_scale,
-                    match.b_scale,
-                    0,
-                    match.group_name,
-                    match.out_dtype,
-                ),
-            )
-
-        _copy_replacement_meta(replace_node, replacement)
-        for node in match.replace_nodes:
-            node.replace_all_uses_with(replacement)
-        for node in match.replace_nodes:
-            self.graph.erase_node(node)
-
-
-def rewrite_flashinfer_bmm_fp8_collective_fusion(graph: fx.Graph) -> int:
-    return _FlashInferCollectiveFusionRewriter(graph).run()
+    _copy_replacement_meta(replace_node, replacement)
+    for node in match.replace_nodes:
+        node.replace_all_uses_with(replacement)
+    for node in match.replace_nodes:
+        graph.erase_node(node)

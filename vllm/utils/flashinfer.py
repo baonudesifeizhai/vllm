@@ -542,38 +542,6 @@ if has_flashinfer():
             A.shape[0], A.shape[1], B.shape[2], dtype=dtype, device=A.device
         )
 
-    def _bmm_fp8_out(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        backend: str,
-        out: torch.Tensor,
-    ) -> None:
-        from flashinfer import bmm_fp8 as bmm_fp8_
-
-        bmm_fp8_(A, B, A_scale, B_scale, dtype, out, backend)
-        return None
-
-    def _bmm_fp8_out_fake(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        backend: str,
-        out: torch.Tensor,
-    ) -> None:
-        return None
-
-    direct_register_custom_op(
-        op_name="bmm_fp8_out",
-        op_func=_bmm_fp8_out,
-        mutates_args=["out"],
-        fake_impl=_bmm_fp8_out_fake,
-    )
-
     @torch.library.custom_op(
         "vllm::flashinfer_nvfp4_quantize",
         mutates_args=[],
@@ -761,17 +729,20 @@ def flashinfer_scaled_fp8_mm_out(
     assert scale_a.numel() == 1 and scale_b.numel() == 1
     assert a.dtype == torch.float8_e4m3fn and b.dtype == torch.float8_e4m3fn
     assert out.device.type == "cuda"
+    assert a.is_contiguous()
 
-    torch.ops.vllm.bmm_fp8_out(
-        a.contiguous().unsqueeze(0),
+    from flashinfer import bmm_fp8 as bmm_fp8_
+
+    bmm_fp8_(
+        a.unsqueeze(0),
         # FlashInfer expects the weight in the same column-major view layout
         # consumed by flashinfer_scaled_fp8_mm, so keep the transposed view.
         b.unsqueeze(0),
-        scale_a.contiguous(),
-        scale_b.contiguous(),
+        scale_a,
+        scale_b,
         out_dtype or out.dtype,
-        "auto",
         out.unsqueeze(0),
+        "auto",
     )
     return out
 

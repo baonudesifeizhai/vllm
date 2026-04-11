@@ -293,16 +293,13 @@ def _flashinfer_scaled_mm_out(
     out_dtype: torch.dtype | None = None,
     use_fast_accum: bool = False,
 ) -> None:
-    if bias is not None:
-        raise NotImplementedError("FlashInfer symm_mem adapter does not support bias")
-    if scale_result is not None:
-        raise NotImplementedError(
-            "FlashInfer symm_mem adapter does not support result scaling"
-        )
-    if use_fast_accum:
-        raise NotImplementedError(
-            "FlashInfer symm_mem adapter does not support use_fast_accum"
-        )
+    assert bias is None, "FlashInfer symm_mem adapter does not support bias"
+    assert scale_result is None, (
+        "FlashInfer symm_mem adapter does not support result scaling"
+    )
+    assert not use_fast_accum, (
+        "FlashInfer symm_mem adapter does not support use_fast_accum"
+    )
     if A.ndim != 2 or B.ndim != 2 or out.ndim != 2:
         raise ValueError("FlashInfer symm_mem adapter expects 2D inputs and output")
     if scale_a.numel() != 1 or scale_b.numel() != 1:
