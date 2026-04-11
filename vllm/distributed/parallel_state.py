@@ -317,54 +317,6 @@ def _flashinfer_scaled_mm_out(
     )
 
 
-def _should_use_flashinfer_multimem_all_gather_scaled_matmul(
-    A_shard: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    gather_dim: int,
-    group_name: str,
-) -> bool:
-    return (
-        A_scale.numel() == 1
-        and B_scale.numel() == 1
-        and gather_dim == 0
-        and torch.distributed._symmetric_memory._should_use_multimem_all_gather_matmul(
-            A_shard,
-            gather_dim,
-            group_name,
-            False,
-        )
-    )
-
-
-def _flashinfer_multimem_all_gather_scaled_matmul(
-    A_shard: torch.Tensor,
-    B: torch.Tensor,
-    A_scale: torch.Tensor,
-    B_scale: torch.Tensor,
-    group_name: str,
-    out_dtype: torch.dtype | None,
-) -> torch.Tensor:
-    world_size = _get_fake_collective_world_size(group_name)
-    A_shape = torch.Size((A_shard.shape[0] * world_size, *A_shard.shape[1:]))
-    symm_mem = torch.distributed._symmetric_memory.get_symm_mem_workspace(
-        group_name,
-        A_shape.numel() * A_shard.element_size(),
-    )
-    A = symm_mem.get_buffer(symm_mem.rank, A_shape, A_shard.dtype)
-    torch.ops.symm_mem.multimem_all_gather_out(A_shard, group_name, A)
-    out = A.new_empty((A.shape[0], B.shape[1]), dtype=out_dtype or torch.bfloat16)
-    _flashinfer_scaled_mm_out(
-        A,
-        B,
-        scale_a=A_scale,
-        scale_b=B_scale,
-        out=out,
-        out_dtype=out_dtype,
-    )
-    return out
-
-
 def fused_flashinfer_scaled_matmul_reduce_scatter_fake(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -484,21 +436,6 @@ def fused_all_gather_flashinfer_scaled_matmul(
             "FlashInfer symm_mem adapter currently only supports gather_dim=0"
         )
     resolved_group_name = _resolve_symm_mem_group_name(group_name)
-    if _should_use_flashinfer_multimem_all_gather_scaled_matmul(
-        A_shard,
-        A_scale,
-        B_scale,
-        gather_dim,
-        resolved_group_name,
-    ):
-        return _flashinfer_multimem_all_gather_scaled_matmul(
-            A_shard,
-            B,
-            A_scale,
-            B_scale,
-            resolved_group_name,
-            out_dtype,
-        )
     _, outputs = torch.distributed._symmetric_memory._fused_all_gather_matmul_impl(
         mm_out_op=_flashinfer_scaled_mm_out,
         A_shard=A_shard,
