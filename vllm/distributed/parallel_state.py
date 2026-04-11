@@ -51,7 +51,6 @@ from vllm.distributed.utils import (
     get_cached_tcp_store_client,
 )
 from vllm.logger import init_logger
-from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm_out
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.network_utils import get_distributed_init_method
 from vllm.utils.system_utils import suppress_stdout
@@ -293,6 +292,10 @@ def _flashinfer_scaled_mm_out(
     out_dtype: torch.dtype | None = None,
     use_fast_accum: bool = False,
 ) -> None:
+    # Import lazily to avoid a circular import during module initialization
+    # when docs or other tooling import `parallel_state` without FlashInfer.
+    from vllm.utils.flashinfer import flashinfer_scaled_fp8_mm_out
+
     assert bias is None, "FlashInfer symm_mem adapter does not support bias"
     assert scale_result is None, (
         "FlashInfer symm_mem adapter does not support result scaling"
