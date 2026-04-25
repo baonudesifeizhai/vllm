@@ -11,6 +11,7 @@ import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
+    PerTensorTorchFP8ScaledMMLinearKernel,
     init_fp8_linear_kernel,
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
@@ -505,6 +506,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            force_kernel=PerTensorTorchFP8ScaledMMLinearKernel,
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
