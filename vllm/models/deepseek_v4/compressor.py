@@ -272,9 +272,7 @@ class DeepseekCompressor(nn.Module):
                 self._quant_block = MXFP4_BLOCK_SIZE
                 self._token_stride = self.head_dim // 2
                 self._scale_dim = self.head_dim // MXFP4_BLOCK_SIZE
-                self._pcp_finalize_kernel = (
-                    _dsv4_pcp_finalize_indexer_mxfp4_attn_kernel
-                )
+                self._pcp_finalize_kernel = _dsv4_pcp_finalize_indexer_mxfp4_attn_kernel
             else:
                 self._quant_block = 128
                 self._token_stride = self.head_dim
