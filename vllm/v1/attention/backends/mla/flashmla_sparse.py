@@ -46,6 +46,7 @@ from vllm.v1.attention.ops.flashmla import (
     get_mla_metadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.worker.cp_utils import get_total_cp_world_size_and_rank
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -229,6 +230,9 @@ class FlashMLASparseMetadata(AttentionMetadata):
     c128a_decode_topk_lens: torch.Tensor | None = None
     # Prefill: local topk indices (used by combine_topk_swa_indices).
     c128a_prefill_topk_indices: torch.Tensor | None = None
+    total_cp_world_size: int = 1
+    total_cp_rank: int = 0
+    cp_kv_cache_interleave_size: int = 1
 
 
 def get_prefill_workspace_size(max_model_len: int):
@@ -258,6 +262,10 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
         self.device = device
+        self.total_cp_world_size, self.total_cp_rank = (
+            get_total_cp_world_size_and_rank()
+        )
+        self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
 
         # Classify single-token queries (plus num_speculative_tokens via
         # supports_spec_as_decode=True) as decodes; longer queries go to
@@ -591,6 +599,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 common_attn_metadata.block_table_tensor.clamp(min=0),
                 int(self.kv_cache_spec.storage_block_size),
                 self.compress_ratio,
+                total_cp_world_size=self.total_cp_world_size,
+                total_cp_rank=self.total_cp_rank,
+                cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
                 out=self.compressed_slot_mapping_buffer,
             )
 
@@ -631,6 +642,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             topk_tokens=self.topk_tokens,
             fp8_extra_metadata=fp8_extra_metadata,
             fp8_use_mixed_batch=fp8_use_mixed_batch,
+            total_cp_world_size=self.total_cp_world_size,
+            total_cp_rank=self.total_cp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             **c128a_fields,
         )
 
@@ -665,6 +679,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             cm.positions[:num_total],
             self.compress_ratio,
             num_decode_tokens,
+            int(cm.query_start_loc_cpu[cm.num_reqs].item()),
             req_id_per_token,
             cm.block_table_tensor[:num_decodes],
             block_size,
@@ -672,6 +687,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             self.c128a_global_decode_buffer,
             self.c128a_decode_lens_buffer,
             self.c128a_prefill_buffer,
+            total_cp_world_size=self.total_cp_world_size,
+            total_cp_rank=self.total_cp_rank,
+            cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
             max_compressed_tokens=self.c128a_max_compressed,
         )
 
@@ -1033,6 +1051,7 @@ def build_c128a_topk_metadata(
     positions: torch.Tensor,
     compress_ratio: int,
     num_decode_tokens: int,
+    num_query_tokens: int,
     token_to_req_indices: torch.Tensor,
     block_table: torch.Tensor,
     block_size: int,
@@ -1040,6 +1059,9 @@ def build_c128a_topk_metadata(
     global_decode_buffer: torch.Tensor,
     decode_lens_buffer: torch.Tensor,
     prefill_buffer: torch.Tensor,
+    total_cp_world_size: int = 1,
+    total_cp_rank: int = 0,
+    cp_kv_cache_interleave_size: int = 1,
     max_compressed_tokens: int = 8192,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Single kernel for all C128A tokens (decode + prefill).
@@ -1070,11 +1092,15 @@ def build_c128a_topk_metadata(
         compress_ratio,
         max_compressed_tokens,
         num_decode_tokens,
+        num_query_tokens,
         token_to_req_indices,
         block_table,
         block_table.stride(0),
         block_size,
         slot_mapping,
+        total_cp_world_size,
+        total_cp_rank,
+        cp_kv_cache_interleave_size,
         BLOCK_SIZE=1024,
     )
     return global_decode, decode_lens, prefill_local
@@ -1094,11 +1120,15 @@ def _build_c128a_topk_metadata_kernel(
     compress_ratio,
     max_compressed_tokens,
     num_decode_tokens,
+    num_query_tokens,
     token_to_req_indices_ptr,
     block_table_ptr,
     block_table_stride,
     block_size,
     slot_mapping_ptr,
+    total_cp_world_size,
+    total_cp_rank,
+    cp_kv_cache_interleave_size,
     BLOCK_SIZE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
@@ -1109,28 +1139,49 @@ def _build_c128a_topk_metadata_kernel(
 
     if is_decode:
         # --- Decode: block-table lookup → global slot ids + count ---
-        is_valid_token = tl.load(slot_mapping_ptr + token_idx) >= 0
+        slot_is_valid = tl.load(slot_mapping_ptr + token_idx) >= 0
+        is_valid_token = tl.where(
+            total_cp_world_size > 1,
+            token_idx < num_query_tokens,
+            slot_is_valid,
+        )
         req_idx = tl.load(token_to_req_indices_ptr + token_idx)
         count = tl.zeros((), dtype=tl.int32)
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
+            tl.store(
+                global_decode_ptr + token_idx * global_decode_stride + offset,
+                -1,
+                mask=mask,
+            )
             is_valid = offset < num_compressed
 
-            block_indices = offset // block_size
+            virtual_block_size = block_size * total_cp_world_size
+            block_indices = offset // virtual_block_size
             block_numbers = tl.load(
                 block_table_ptr + req_idx * block_table_stride + block_indices,
                 mask=mask & is_valid,
             )
-            block_offsets = offset % block_size
-            slot_ids = block_numbers * block_size + block_offsets
-            slot_ids = tl.where(is_valid, slot_ids, -1)
-            tl.store(
-                global_decode_ptr + token_idx * global_decode_stride + offset,
-                slot_ids,
-                mask=mask,
+            virtual_block_offsets = offset - block_indices * virtual_block_size
+            is_local = (
+                virtual_block_offsets // cp_kv_cache_interleave_size
+            ) % total_cp_world_size == total_cp_rank
+            local_block_offsets = (
+                virtual_block_offsets
+                // (total_cp_world_size * cp_kv_cache_interleave_size)
+            ) * cp_kv_cache_interleave_size + (
+                virtual_block_offsets % cp_kv_cache_interleave_size
             )
-            count += tl.sum(is_valid.to(tl.int32), axis=0)
+            slot_ids = block_numbers * block_size + local_block_offsets
+            is_valid_local = is_valid & is_local
+            local_rank = count + tl.cumsum(is_valid_local.to(tl.int32), 0) - 1
+            tl.store(
+                global_decode_ptr + token_idx * global_decode_stride + local_rank,
+                slot_ids,
+                mask=mask & is_valid_local,
+            )
+            count += tl.sum(is_valid_local.to(tl.int32), axis=0)
 
         tl.store(
             decode_lens_ptr + token_idx,
@@ -1139,11 +1190,27 @@ def _build_c128a_topk_metadata_kernel(
     else:
         # --- Prefill: write local indices ---
         pfx_idx = token_idx - num_decode_tokens
+        count = tl.zeros((), dtype=tl.int32)
         for i in range(0, max_compressed_tokens, BLOCK_SIZE):
             offset = i + tl.arange(0, BLOCK_SIZE)
             mask = offset < max_compressed_tokens
             tl.store(
                 prefill_local_ptr + pfx_idx * prefill_local_stride + offset,
-                tl.where(offset < num_compressed, offset, -1),
+                -1,
                 mask=mask,
             )
+            is_valid = offset < num_compressed
+            is_local = (
+                (offset // cp_kv_cache_interleave_size) % total_cp_world_size
+            ) == total_cp_rank
+            local_offsets = (
+                offset // (total_cp_world_size * cp_kv_cache_interleave_size)
+            ) * cp_kv_cache_interleave_size + (offset % cp_kv_cache_interleave_size)
+            is_valid_local = is_valid & is_local
+            local_rank = count + tl.cumsum(is_valid_local.to(tl.int32), 0) - 1
+            tl.store(
+                prefill_local_ptr + pfx_idx * prefill_local_stride + local_rank,
+                local_offsets,
+                mask=mask & is_valid_local,
+            )
+            count += tl.sum(is_valid_local.to(tl.int32), axis=0)
