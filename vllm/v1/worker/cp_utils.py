@@ -37,18 +37,13 @@ def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
     allow_deepseek_v4_pcp = _is_deepseek_v4_megamoe_pcp_config(vllm_config)
     if allow_deepseek_v4_pcp:
-        if (
-            vllm_config.cache_config.enable_prefix_caching
-            or vllm_config.kv_transfer_config is not None
-        ):
+        if vllm_config.kv_transfer_config is not None:
             raise ValueError(
-                "Experimental DeepSeek V4 MegaMoE PCP does not support prefix "
-                "caching or KV transfer yet. Disable prefix caching with "
-                "--no-enable-prefix-caching."
+                "Experimental DeepSeek V4 MegaMoE PCP does not support KV transfer yet."
             )
         logger.warning_once(
             "Allowing experimental DeepSeek V4 MegaMoE PCP attention path. "
-            "Prefix caching and KV transfer are disabled for this path."
+            "KV transfer is disabled for this path."
         )
     if pcp_size * dcp_size > 1:
         layer_type = cast(type[Any], AttentionLayerBase)

@@ -646,20 +646,32 @@ def resolve_kv_cache_block_sizes(
             )
         logger.warning_once(
             "Allowing experimental DeepSeek V4 MegaMoE hybrid KV cache groups "
-            "with prefill context parallelism. Prefix caching and KV transfer "
-            "must remain disabled for this experimental path."
+            "with prefill context parallelism. KV transfer must remain disabled "
+            "for this experimental path."
         )
 
     if is_dsv4_pcp:
         connector_enabled = vllm_config.kv_transfer_config is not None
-        if cache_config.enable_prefix_caching or connector_enabled:
+        if connector_enabled:
             raise ValueError(
-                "Experimental DeepSeek V4 MegaMoE PCP does not support prefix "
-                "caching or KV transfer yet. Disable prefix caching with "
-                "--no-enable-prefix-caching."
+                "Experimental DeepSeek V4 MegaMoE PCP does not support KV transfer yet."
             )
-        scheduler_block_size = math.lcm(*(bs * pcp for bs in group_block_sizes))
-        return scheduler_block_size, scheduler_block_size
+        effective_block_sizes = [bs * pcp for bs in group_block_sizes]
+        scheduler_block_size = math.lcm(*effective_block_sizes)
+        if not cache_config.enable_prefix_caching:
+            return scheduler_block_size, scheduler_block_size
+
+        requested = cache_config.hash_block_size
+        hash_block_size = (
+            requested if requested is not None else math.gcd(*effective_block_sizes)
+        )
+        if any(bs % hash_block_size != 0 for bs in effective_block_sizes):
+            raise ValueError(
+                f"Invalid hash_block_size={hash_block_size}; all DeepSeek V4 "
+                f"PCP KV cache group block sizes must be divisible by it. "
+                f"Got effective group block sizes={effective_block_sizes}."
+            )
+        return scheduler_block_size, hash_block_size
 
     scheduler_block_size = math.lcm(*group_block_sizes)
 

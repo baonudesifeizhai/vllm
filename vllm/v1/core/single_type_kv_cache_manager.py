@@ -561,12 +561,20 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             "SlidingWindowManager can only be used for sliding window groups"
         )
         assert dcp_world_size == 1, "DCP not support sliding window attn now."
-        assert pcp_world_size == 1, "PCP not support sliding window attn now."
+        allow_mla_pcp = pcp_world_size > 1 and isinstance(
+            kv_cache_spec, SlidingWindowMLASpec
+        )
+        assert pcp_world_size == 1 or allow_mla_pcp, (
+            "PCP not support sliding window attn now."
+        )
 
         # The number of contiguous blocks needed for prefix cache hit.
         # -1 since the input token itself is also included in the window
+        block_size = kv_cache_spec.block_size
+        if dcp_world_size * pcp_world_size > 1:
+            block_size *= dcp_world_size * pcp_world_size
         sliding_window_contiguous_blocks = cdiv(
-            kv_cache_spec.sliding_window - 1, kv_cache_spec.block_size
+            kv_cache_spec.sliding_window - 1, block_size
         )
         if use_eagle:
             # Need to drop the last matched block if eagle is enabled. For
@@ -580,12 +588,11 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
         # O(max_num_blocks / sliding_window_contiguous_blocks +
         # sliding_window_contiguous_blocks),
         # which is good for low cache hit rate scenarios.
-        max_num_blocks = max_length // kv_cache_spec.block_size
+        max_num_blocks = max_length // block_size
         computed_blocks = tuple(
             [block_pool.null_block] * max_num_blocks
             for _ in range(len(kv_cache_group_ids))
         )
-        block_size = kv_cache_spec.block_size
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
