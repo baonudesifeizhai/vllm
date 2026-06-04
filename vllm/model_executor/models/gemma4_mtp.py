@@ -19,7 +19,6 @@ Checkpoint layout (``gemma4_assistant``)::
     masked_embedding.token_ordering -- token-to-centroid mapping buffer
 """
 
-import os
 from collections.abc import Iterable
 
 import torch
@@ -27,7 +26,6 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -41,14 +39,6 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm.model_executor.layers.quantization.online.base import (
-    OnlineQuantizationConfig,
-)
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    kFp8Static128BlockSym,
-    kFp8StaticTensorSym,
-    kMxfp8Dynamic,
-)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -66,35 +56,6 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
-
-
-def _get_gemma4_mtp_assistant_quant_config() -> QuantizationConfig | None:
-    quant = os.environ.get("VLLM_GEMMA4_MTP_ASSISTANT_QUANT", "").lower()
-    if quant in ("", "0", "false", "none", "off"):
-        return None
-
-    quant_key_by_name = {
-        "mxfp8": kMxfp8Dynamic,
-        "fp8_per_block": kFp8Static128BlockSym,
-        "fp8_per_tensor": kFp8StaticTensorSym,
-    }
-    if quant not in quant_key_by_name:
-        raise ValueError(
-            "Unsupported VLLM_GEMMA4_MTP_ASSISTANT_QUANT="
-            f"{quant!r}. Expected one of {sorted(quant_key_by_name)}."
-        )
-
-    logger.info_once("Using %s online quantization for Gemma4 MTP assistant.", quant)
-    return OnlineQuantizationConfig(
-        args=QuantizationConfigArgs(
-            linear=QuantSpec(weight=quant_key_by_name[quant]),
-        )
-    )
-
-
-def _should_compile_gemma4_mtp(_: VllmConfig) -> bool:
-    quant = os.environ.get("VLLM_GEMMA4_MTP_ASSISTANT_QUANT", "").lower()
-    return quant in ("", "0", "false", "none", "off")
 
 
 class Gemma4MTPMaskedEmbedder(nn.Module):
@@ -202,7 +163,6 @@ class Gemma4MTPAttention(nn.Module):
         max_position_embeddings: int,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        linear_quant_config: QuantizationConfig | None = None,
         attn_logits_soft_cap: float | None = None,
         prefix: str = "",
     ) -> None:
@@ -223,14 +183,14 @@ class Gemma4MTPAttention(nn.Module):
             hidden_size,
             self.total_num_heads * self.head_dim,
             bias=config.attention_bias,
-            quant_config=linear_quant_config,
+            quant_config=None,
             prefix=f"{prefix}.q_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=config.attention_bias,
-            quant_config=linear_quant_config,
+            quant_config=None,
             prefix=f"{prefix}.o_proj",
         )
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -305,7 +265,6 @@ class Gemma4MTPDecoderLayer(nn.Module):
         config,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        linear_quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -329,7 +288,6 @@ class Gemma4MTPDecoderLayer(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
-            linear_quant_config=linear_quant_config,
             attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
             prefix=f"{prefix}.self_attn",
         )
@@ -339,7 +297,7 @@ class Gemma4MTPDecoderLayer(nn.Module):
             hidden_size=self.hidden_size,
             intermediate_size=text_config.intermediate_size,
             hidden_activation=text_config.hidden_activation,
-            quant_config=linear_quant_config,
+            quant_config=None,
             prefix=f"{prefix}.mlp",
         )
 
@@ -400,7 +358,6 @@ class Gemma4MultiTokenPredictor(nn.Module):
         )
         self.vocab_size = text_config.vocab_size
         self.num_mtp_layers = text_config.num_hidden_layers
-        assistant_quant_config = _get_gemma4_mtp_assistant_quant_config()
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
@@ -412,7 +369,6 @@ class Gemma4MultiTokenPredictor(nn.Module):
             self.hidden_size,
             bias=False,
             gather_output=True,
-            quant_config=assistant_quant_config,
             prefix=f"{prefix}.pre_projection",
         )
 
@@ -421,7 +377,6 @@ class Gemma4MultiTokenPredictor(nn.Module):
             self.backbone_hidden_size,
             bias=False,
             input_is_parallel=False,
-            quant_config=assistant_quant_config,
             prefix=f"{prefix}.post_projection",
         )
 
@@ -430,7 +385,6 @@ class Gemma4MultiTokenPredictor(nn.Module):
                 text_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
-                linear_quant_config=assistant_quant_config,
                 prefix=f"{prefix}.layers.{idx}",
             )
             for idx in range(self.num_mtp_layers)
@@ -523,7 +477,7 @@ class Gemma4MultiTokenPredictor(nn.Module):
         return draft_hidden_states, backbone_hidden_states
 
 
-@support_torch_compile(enable_if=_should_compile_gemma4_mtp)
+@support_torch_compile
 class Gemma4MTP(nn.Module):
     """Gemma4 Multi-Token Prediction model for speculative decoding.
 
