@@ -19,6 +19,7 @@ Checkpoint layout (``gemma4_assistant``)::
     masked_embedding.token_ordering -- token-to-centroid mapping buffer
 """
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -48,6 +49,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .gemma4 import Gemma4MLP, _get_text_config
+from .gemma4_mtp_ops import gemma4_mtp_q_norm_rope
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -215,6 +217,13 @@ class Gemma4MTPAttention(nn.Module):
             rope_parameters=rope_parameters,
             is_neox_style=True,
         )
+        self.use_fused_q_norm_rope = (
+            os.environ.get("VLLM_GEMMA4_MTP_FUSED_QNORM_ROPE") == "1"
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+        )
+        if self.use_fused_q_norm_rope:
+            logger.info_once("Using fused Gemma4 MTP Q RMSNorm + RoPE.")
 
         # kv_sharing_target_layer_name is set after model construction
         # by Gemma4Proposer._setup_gemma4_kv_sharing().
@@ -239,11 +248,31 @@ class Gemma4MTPAttention(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.q_proj(hidden_states)
 
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-        q = self.q_norm(q)
-        q = q.flatten(-2, -1)
+        if (
+            self.use_fused_q_norm_rope
+            and q.is_cuda
+            and q.ndim == 2
+            and q.is_contiguous()
+            and positions.ndim == 1
+            and positions.is_contiguous()
+            and self.q_norm.weight.data.is_contiguous()
+        ):
+            cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(q)
+            q = gemma4_mtp_q_norm_rope(
+                q,
+                positions,
+                self.q_norm.weight.data,
+                cos_sin_cache,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.head_dim,
+            )
+        else:
+            q = q.unflatten(-1, (self.num_heads, self.head_dim))
+            q = self.q_norm(q)
+            q = q.flatten(-2, -1)
 
-        q, _ = self.rotary_emb(positions, q, None)
+            q, _ = self.rotary_emb(positions, q, None)
 
         # Attention reads K/V from the target's cache via KV sharing;
         # these dummy tensors are never consumed but required by the API.
