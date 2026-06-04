@@ -19,12 +19,14 @@ Checkpoint layout (``gemma4_assistant``)::
     masked_embedding.token_ordering -- token-to-centroid mapping buffer
 """
 
-import os
 from collections.abc import Iterable
 
 import torch
 from torch import nn
+from torch._higher_order_ops.auto_functionalize import auto_functionalized
 
+from vllm import _custom_ops as ops  # noqa: F401
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -49,7 +51,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .gemma4 import Gemma4MLP, _get_text_config
-from .gemma4_mtp_ops import gemma4_mtp_q_norm_rope
 from .utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -218,12 +219,13 @@ class Gemma4MTPAttention(nn.Module):
             is_neox_style=True,
         )
         self.use_fused_q_norm_rope = (
-            os.environ.get("VLLM_GEMMA4_MTP_FUSED_QNORM_ROPE") == "1"
-            and self.rotary_emb.is_neox_style
-            and self.rotary_emb.rotary_dim == self.head_dim
+            envs.VLLM_GEMMA4_MTP_FUSED_QNORM_ROPE
+            and self.rotary_emb.rotary_dim <= self.head_dim
         )
         if self.use_fused_q_norm_rope:
-            logger.info_once("Using fused Gemma4 MTP Q RMSNorm + RoPE.")
+            logger.info_once(
+                "Using vLLM fused_qk_norm_rope for Gemma4 MTP Q RMSNorm + RoPE."
+            )
 
         # kv_sharing_target_layer_name is set after model construction
         # by Gemma4Proposer._setup_gemma4_kv_sharing().
@@ -248,25 +250,39 @@ class Gemma4MTPAttention(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.q_proj(hidden_states)
 
-        if (
+        q_weight = self.q_norm.weight.data
+        use_fused_q_norm_rope = (
             self.use_fused_q_norm_rope
             and q.is_cuda
             and q.ndim == 2
             and q.is_contiguous()
+            and q.dtype == q_weight.dtype
             and positions.ndim == 1
             and positions.is_contiguous()
-            and self.q_norm.weight.data.is_contiguous()
-        ):
+            and positions.dtype == torch.long
+            and q_weight.is_contiguous()
+        )
+        if use_fused_q_norm_rope:
             cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(q)
-            q = gemma4_mtp_q_norm_rope(
-                q,
-                positions,
-                self.q_norm.weight.data,
-                cos_sin_cache,
-                self.q_norm.variance_epsilon,
-                self.num_heads,
-                self.head_dim,
+            use_fused_q_norm_rope = cos_sin_cache.is_contiguous()
+
+        if use_fused_q_norm_rope:
+            result = auto_functionalized(
+                torch.ops._C.fused_qk_norm_rope.default,
+                qkv=q,
+                num_heads_q=self.num_heads,
+                num_heads_k=0,
+                num_heads_v=0,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+                q_weight=q_weight,
+                k_weight=q_weight,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=self.rotary_emb.is_neox_style,
+                position_ids=positions,
+                forced_token_heads_per_warp=-1,
             )
+            q = result[1]
         else:
             q = q.unflatten(-1, (self.num_heads, self.head_dim))
             q = self.q_norm(q)
