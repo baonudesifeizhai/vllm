@@ -220,6 +220,7 @@ class Gemma4MTPAttention(nn.Module):
         )
         self.use_fused_q_norm_rope = (
             envs.VLLM_GEMMA4_MTP_FUSED_QNORM_ROPE
+            and self.head_dim in (64, 128, 256)
             and self.rotary_emb.rotary_dim <= self.head_dim
         )
         if self.use_fused_q_norm_rope:
