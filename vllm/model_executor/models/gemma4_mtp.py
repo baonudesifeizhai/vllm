@@ -92,6 +92,11 @@ def _get_gemma4_mtp_assistant_quant_config() -> QuantizationConfig | None:
     )
 
 
+def _should_compile_gemma4_mtp(_: VllmConfig) -> bool:
+    quant = os.environ.get("VLLM_GEMMA4_MTP_ASSISTANT_QUANT", "").lower()
+    return quant in ("", "0", "false", "none", "off")
+
+
 class Gemma4MTPMaskedEmbedder(nn.Module):
     """Sparse logit computation via centroid-based vocabulary masking.
 
@@ -518,7 +523,7 @@ class Gemma4MultiTokenPredictor(nn.Module):
         return draft_hidden_states, backbone_hidden_states
 
 
-@support_torch_compile
+@support_torch_compile(enable_if=_should_compile_gemma4_mtp)
 class Gemma4MTP(nn.Module):
     """Gemma4 Multi-Token Prediction model for speculative decoding.
 
